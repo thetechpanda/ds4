@@ -540,12 +540,15 @@ root, and bash commands start there. If an interactive tool call targets
 another directory, ds4-agent asks before adding another root, offering the
 exact target directory, its parent, or the next parent up, plus deny. If no
 answer arrives in 30 seconds, it selects the exact target directory. On macOS,
-bash is also run through the system sandbox so filesystem access outside the
-current roots is denied. On non-Darwin builds, bash currently uses the first
-workspace as its cwd but is otherwise best-effort; file tools are still jailed
-by canonical path checks. The prompt shows the first workspace root. Use
-`/workspace` to list roots, `/workspace +/path/to` to add a root, and
-`/workspace -/path/to` to remove one.
+bash is also run through the system sandbox (`sandbox-exec`) so filesystem
+access outside the current roots is denied. If `sandbox-exec` is unavailable
+or the generated profile is rejected, the tool fails with an error by default.
+Pass `--no-strict-sandbox` to fall back to unsandboxed bash instead. On
+non-Darwin builds,
+bash currently uses the first workspace as its cwd but is otherwise best-effort;
+file tools are still jailed by canonical path checks. The prompt shows the first
+workspace root. Use `/workspace` to list roots, `/workspace +/path/to` to add a
+root, and `/workspace -/path/to` to remove one.
 
 However while the system already works, there is a lot of work to do
 in order to make it ready for prime time. When finally the agent will reach

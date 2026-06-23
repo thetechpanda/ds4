@@ -76,6 +76,7 @@ typedef struct {
     char temp_directory[PATH_MAX];
     const char *recover_session;
     bool non_interactive;
+    bool strict_sandbox;
 } agent_config;
 
 typedef enum {
@@ -587,6 +588,7 @@ static agent_config parse_options(int argc, char **argv) {
             .min_p = DS4_DEFAULT_MIN_P,
             .think_mode = DS4_THINK_HIGH,
         },
+        .strict_sandbox = true,
     };
     if (!getcwd(c.launch_working_directory, sizeof(c.launch_working_directory))) {
         fprintf(stderr, "ds4-agent: failed to get current working directory: %s\n",
@@ -625,8 +627,8 @@ static agent_config parse_options(int argc, char **argv) {
             c.gen.prompt = need_arg(&i, argc, argv, arg);
         } else if (!strcmp(arg, "--non-interactive")) {
             c.non_interactive = true;
-        } else if (!strcmp(arg, "--recover")) {
-            c.recover_session = need_arg(&i, argc, argv, arg);
+        } else if (!strcmp(arg, "--no-strict-sandbox")) {
+            c.strict_sandbox = false;
         } else if (!strcmp(arg, "-sys") || !strcmp(arg, "--system")) {
             c.gen.system = need_arg(&i, argc, argv, arg);
         } else if (!strcmp(arg, "--trace")) {
@@ -8114,6 +8116,12 @@ static char *agent_bash_job_tool_result(agent_worker *w, agent_bash_job *job,
 
 #ifdef __APPLE__
     if (!stop && agent_bash_should_retry_without_sandbox(job)) {
+        if (w->cfg->strict_sandbox) {
+            agent_buf fail = {0};
+            agent_buf_puts(&fail,
+                "Tool error: bash filesystem sandbox failed and --strict-sandbox is enabled\n");
+            return agent_buf_take(&fail);
+        }
         char retry_err[160] = {0};
         char *retry_cmd = xstrdup(job->cmd ? job->cmd : "");
         int retry_timeout = (int)job->timeout_sec;
