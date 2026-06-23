@@ -74,6 +74,7 @@ typedef struct {
     agent_path_list working_directory_args;
     agent_path_list working_directories;
     char temp_directory[PATH_MAX];
+    const char *recover_session;
     bool non_interactive;
 } agent_config;
 
@@ -624,6 +625,8 @@ static agent_config parse_options(int argc, char **argv) {
             c.gen.prompt = need_arg(&i, argc, argv, arg);
         } else if (!strcmp(arg, "--non-interactive")) {
             c.non_interactive = true;
+        } else if (!strcmp(arg, "--recover")) {
+            c.recover_session = need_arg(&i, argc, argv, arg);
         } else if (!strcmp(arg, "-sys") || !strcmp(arg, "--system")) {
             c.gen.system = need_arg(&i, argc, argv, arg);
         } else if (!strcmp(arg, "--trace")) {
@@ -5546,6 +5549,80 @@ static bool agent_worker_strip_session(agent_worker *w, const char *prefix,
     return ok;
 }
 
+/* Load a saved session during worker initialization instead of creating a fresh
+ * system prompt session.  Unlike agent_worker_switch_session, this works before
+ * the worker is marked initialized and does not require an idle worker. */
+static bool agent_worker_recover_session(agent_worker *w, const char *prefix,
+                                         char *err, size_t err_len) {
+    char sha[41];
+    char *path = NULL;
+    if (!agent_worker_find_session(w, prefix, sha, &path, err, err_len))
+        return false;
+
+    bool stripped = false;
+    ds4_kvstore_entry entry = {0};
+    if (ds4_kvstore_read_entry_file(path, sha, &entry)) {
+        stripped = entry.payload_bytes == 0;
+        ds4_kvstore_entry_free(&entry);
+    }
+
+    ds4_tokens loaded = {0};
+    agent_kv_session_meta meta = {0};
+    bool ok = agent_kv_load_path(w, path, sha, NULL, 0, &loaded, &meta,
+                                 err, err_len);
+    if (ok) {
+        ds4_tokens_free(&w->transcript);
+        w->transcript = loaded;
+        free(w->session_title);
+        w->session_title = meta.title ? xstrdup(meta.title) : xstrdup("(no user prompt)");
+        w->session_created_at = meta.created_at ? meta.created_at : (uint64_t)time(NULL);
+        memcpy(w->session_sha, sha, sizeof(w->session_sha));
+        free(w->legacy_session_path_to_delete);
+        w->legacy_session_path_to_delete = meta.legacy_identity ? xstrdup(path) : NULL;
+        agent_worker_note_system_prompt_seen(w);
+        w->datetime_context_injected = true;
+        pthread_mutex_lock(&w->mu);
+        w->user_activity = true;
+        w->session_dirty = false;
+        w->status.state = AGENT_WORKER_IDLE;
+        w->status.ctx_used = w->transcript.len;
+        w->status.ctx_size = w->cfg->gen.ctx_size;
+        w->status.prefill_tps = 0.0;
+        w->status.greedy_sampling = false;
+        w->status.error[0] = '\0';
+        agent_wake_locked(w);
+        pthread_mutex_unlock(&w->mu);
+        agent_trace(w, "recovered session %.8s (%d tokens%s)",
+                    sha, w->transcript.len, stripped ? ", rebuilt from text" : "");
+        /* Show recent conversation history like agent_worker_switch_session does,
+         * but without the worker_is_idle check since we are still initializing. */
+        {
+            size_t text_len = 0;
+            char *text = ds4_kvstore_render_tokens_text(w->engine, &w->transcript,
+                                                        &text_len);
+            if (text) {
+                agent_history_render_text(w, text, text_len, AGENT_HISTORY_DEFAULT_TURNS);
+                free(text);
+            }
+        }
+        /* Print the recovery banner in magenta so the user knows which session
+         * was restored and can use /switch or /list later. */
+        {
+            bool color = isatty(STDOUT_FILENO) != 0;
+            if (color) agent_publish(w, "\x1b[35m", 5);
+            agent_publishf(w, "recovered session %.8s (%d tokens%s)\n",
+                           sha, w->transcript.len,
+                           stripped ? ", rebuilt from text" : "");
+            if (color) agent_publish(w, "\x1b[0m", 4);
+        }
+    } else {
+        ds4_tokens_free(&loaded);
+    }
+    agent_kv_session_meta_free(&meta);
+    free(path);
+    return ok;
+}
+
 /* Load a saved session KV into the live transcript and optionally replay recent
  * history for the human. */
 static bool agent_worker_switch_session(agent_worker *w, const char *prefix,
@@ -9015,8 +9092,14 @@ static void *worker_main(void *arg) {
                 w->cfg->engine.model_path ? w->cfg->engine.model_path : "",
                 w->cfg->gen.trace_path ? w->cfg->gen.trace_path : "");
     char init_err[160] = {0};
-    if (!agent_worker_wait_distributed_route(w, init_err, sizeof(init_err)) ||
-        !agent_worker_reset_to_sysprompt(w, init_err, sizeof(init_err))) {
+    if (!agent_worker_wait_distributed_route(w, init_err, sizeof(init_err))) {
+        agent_set_error(w, init_err[0] ? init_err : "failed to initialize distributed route");
+    } else if (w->cfg->recover_session && w->cfg->recover_session[0]) {
+        if (!agent_worker_recover_session(w, w->cfg->recover_session,
+                                          init_err, sizeof(init_err))) {
+            agent_set_error(w, init_err[0] ? init_err : "failed to recover session");
+        }
+    } else if (!agent_worker_reset_to_sysprompt(w, init_err, sizeof(init_err))) {
         agent_set_error(w, init_err[0] ? init_err : "failed to initialize system prompt");
     }
     agent_trace_tokens(w, "initial_system_prompt", &w->transcript, 0);
