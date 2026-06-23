@@ -282,6 +282,7 @@ static void print_agent_specific(FILE *fp, const help_colors *c) {
     opt(fp, c, "--trace FILE", "Write prompt, token, and DSML debug trace.");
     opt(fp, c, "--chdir DIR", "Change working directory before loading runtime assets.");
     opt(fp, c, "--working-directory DIR", "Add a jailed workspace root. Repeatable; defaults to the launch directory.");
+    opt(fp, c, "--temp-directory DIR", "Temporary file directory (default: /tmp).");
     fputc('\n', fp);
 }
 

@@ -73,6 +73,7 @@ typedef struct {
     char launch_working_directory[PATH_MAX];
     agent_path_list working_directory_args;
     agent_path_list working_directories;
+    char temp_directory[PATH_MAX];
     bool non_interactive;
 } agent_config;
 
@@ -164,6 +165,7 @@ typedef struct {
     agent_bash_job *bash_jobs;
     int next_bash_job_id;
     agent_path_list working_directories;
+    agent_path_list auto_allowed_paths;
     bool raw_mode_needs_restore;
 } agent_worker;
 
@@ -590,6 +592,7 @@ static agent_config parse_options(int argc, char **argv) {
                 strerror(errno));
         exit(2);
     }
+    snprintf(c.temp_directory, sizeof(c.temp_directory), "/tmp");
 
     bool steering_scale_set = false;
     for (int i = 1; i < argc; i++) {
@@ -666,6 +669,9 @@ static agent_config parse_options(int argc, char **argv) {
         } else if (!strcmp(arg, "--working-directory")) {
             agent_path_list_append(&c.working_directory_args,
                                    need_arg(&i, argc, argv, arg));
+        } else if (!strcmp(arg, "--temp-directory")) {
+            snprintf(c.temp_directory, sizeof(c.temp_directory), "%s",
+                     need_arg(&i, argc, argv, arg));
         } else if (!strcmp(arg, "--quality")) {
             c.engine.quality = true;
         } else if (!strcmp(arg, "--ssd-streaming")) {
@@ -5951,6 +5957,10 @@ static char *agent_resolve_tool_path(agent_worker *w, const char *path,
         agent_resolve_existing_candidate(base, path, resolved, requested_dir,
                                          err, err_len);
     if (!ok) return NULL;
+    /* Auto-allowed paths (e.g. files created by the agent's own tools) bypass
+     * workspace root checks. */
+    if (agent_path_list_contains(&w->auto_allowed_paths, resolved))
+        return xstrdup(resolved);
     if (agent_path_is_under_any_root(roots, resolved))
         return xstrdup(resolved);
     if (!agent_request_working_directory(w, path, requested_dir, err, err_len))
@@ -5960,7 +5970,7 @@ static char *agent_resolve_tool_path(agent_worker *w, const char *path,
                  path);
         return NULL;
     }
-    return ok ? xstrdup(resolved) : NULL;
+    return xstrdup(resolved);
 }
 
 static int agent_read_file_bytes(const char *path, char **data, size_t *len,
@@ -6237,6 +6247,9 @@ static char *agent_tool_write(agent_worker *w, const agent_tool_call *call) {
         free(file_path);
         return agent_buf_take(&b);
     }
+    /* Allow subsequent reads of this file without workspace approval. */
+    if (!agent_path_list_contains(&w->auto_allowed_paths, file_path))
+        agent_path_list_append(&w->auto_allowed_paths, file_path);
     char msg[PATH_MAX + 160];
     snprintf(msg, sizeof(msg), "Wrote %zu bytes to %s\n", len, file_path);
     free(file_path);
@@ -7207,11 +7220,13 @@ static char *agent_string_head(const char *s, int max_lines, size_t max_bytes,
     return xstrndup(s, used);
 }
 
-static bool agent_write_temp_text(const char *prefix, const char *text,
+static bool agent_write_temp_text(const char *temp_dir, const char *prefix,
+                                  const char *text,
                                   char *path, size_t path_len,
                                   char *err, size_t err_len) {
     char tmpl[PATH_MAX];
-    snprintf(tmpl, sizeof(tmpl), "/tmp/%s_XXXXXX", prefix);
+    snprintf(tmpl, sizeof(tmpl), "%s/%s_XXXXXX", temp_dir ? temp_dir : "/tmp",
+             prefix);
     int fd = mkstemp(tmpl);
     if (fd < 0) {
         snprintf(err, err_len, "failed to create temporary file: %s", strerror(errno));
@@ -7272,8 +7287,8 @@ static char *agent_tool_visit_page(agent_worker *w, const agent_tool_call *call)
     }
 
     char path[PATH_MAX];
-    if (!agent_write_temp_text("ds4_agent_web", md, path, sizeof(path),
-                               err, sizeof(err)))
+    if (!agent_write_temp_text(w->cfg->temp_directory, "ds4_agent_web", md,
+                               path, sizeof(path), err, sizeof(err)))
     {
         free(md);
         agent_buf b = {0};
@@ -7282,7 +7297,9 @@ static char *agent_tool_visit_page(agent_worker *w, const agent_tool_call *call)
         agent_buf_puts(&b, "\n");
         return agent_buf_take(&b);
     }
-
+    /* Allow the agent to read rendered page files without workspace approval. */
+    if (!agent_path_list_contains(&w->auto_allowed_paths, path))
+        agent_path_list_append(&w->auto_allowed_paths, path);
     int total_lines = agent_count_lines(md);
     int shown_lines = 0;
     bool byte_limited = false;
@@ -7543,7 +7560,8 @@ static void agent_sbpl_quote(agent_buf *b, const char *s) {
 }
 
 static char *agent_bash_sandbox_profile(const agent_path_list *roots,
-                                        const char *developer_dir) {
+                                        const char *developer_dir,
+                                        const char *temp_dir) {
     agent_buf b = {0};
     agent_buf_puts(&b,
         "(version 1)\n"
@@ -7565,6 +7583,11 @@ static char *agent_bash_sandbox_profile(const agent_path_list *roots,
         "  (literal \"/dev/zero\")\n"
         "  (literal \"/dev/random\")\n"
         "  (literal \"/dev/urandom\")");
+    if (temp_dir && temp_dir[0]) {
+        agent_buf_puts(&b, "\n  (literal ");
+        agent_sbpl_quote(&b, temp_dir);
+        agent_buf_puts(&b, ")");
+    }
     if (developer_dir && developer_dir[0]) {
         agent_buf_puts(&b, "\n  (subpath ");
         agent_sbpl_quote(&b, developer_dir);
@@ -7580,15 +7603,17 @@ static char *agent_bash_sandbox_profile(const agent_path_list *roots,
 }
 
 static void agent_bash_prepare_sandbox_env(const char *working_dir,
-                                           const char *developer_dir) {
+                                           const char *developer_dir,
+                                           const char *temp_dir) {
     if (!working_dir || !working_dir[0]) return;
 
-    /* Keep command-local config and temp files inside the approved workspace so
-     * common developer tools do not abort on blocked HOME/TMP lookups. */
+    /* Keep command-local config inside the approved workspace so common
+     * developer tools do not abort on blocked HOME lookups.  Temp files go
+     * to the configured temp directory so they are accessible. */
     setenv("HOME", working_dir, 1);
-    setenv("TMPDIR", working_dir, 1);
-    setenv("TMP", working_dir, 1);
-    setenv("TEMP", working_dir, 1);
+    setenv("TMPDIR", temp_dir && temp_dir[0] ? temp_dir : working_dir, 1);
+    setenv("TMP", temp_dir && temp_dir[0] ? temp_dir : working_dir, 1);
+    setenv("TEMP", temp_dir && temp_dir[0] ? temp_dir : working_dir, 1);
     setenv("XDG_CONFIG_HOME", working_dir, 1);
     setenv("XDG_CACHE_HOME", working_dir, 1);
     setenv("TERM", "dumb", 1);
@@ -7615,7 +7640,9 @@ static void agent_bash_prepare_sandbox_env(const char *working_dir,
 static agent_bash_job *agent_bash_start_mode(agent_worker *w, const char *cmd,
                                              int timeout_sec, bool use_sandbox,
                                              char *err, size_t err_len) {
-    char tmp_path[] = "/tmp/ds4_agent_output_XXXXXX";
+    char tmp_path[PATH_MAX];
+    snprintf(tmp_path, sizeof(tmp_path), "%s/ds4_agent_output_XXXXXX",
+             w->cfg->temp_directory);
     int tmpfd = mkstemp(tmp_path);
     if (tmpfd < 0) {
         snprintf(err, err_len, "failed to create temporary output file: %s", strerror(errno));
@@ -7629,7 +7656,8 @@ static agent_bash_job *agent_bash_start_mode(agent_worker *w, const char *cmd,
     if (!agent_detect_apple_developer_dir(developer_dir))
         developer_dir[0] = '\0';
     char *sandbox_profile = (use_sandbox && working_dir) ?
-        agent_bash_sandbox_profile(sandbox_roots, developer_dir) : NULL;
+        agent_bash_sandbox_profile(sandbox_roots, developer_dir,
+                                   w->cfg->temp_directory) : NULL;
 #endif
 
     int pipefd[2];
@@ -7675,7 +7703,8 @@ static agent_bash_job *agent_bash_start_mode(agent_worker *w, const char *cmd,
         close(pipefd[1]);
         if (working_dir && chdir(working_dir) != 0) _exit(126);
 #ifdef __APPLE__
-        agent_bash_prepare_sandbox_env(working_dir, developer_dir);
+        agent_bash_prepare_sandbox_env(working_dir, developer_dir,
+                                       w->cfg->temp_directory);
         if (sandbox_profile) {
             execl("/usr/bin/sandbox-exec", "sandbox-exec", "-p",
                   sandbox_profile, "/bin/sh", "-c", cmd ? cmd : "",
@@ -7703,6 +7732,9 @@ static agent_bash_job *agent_bash_start_mode(agent_worker *w, const char *cmd,
     job->pipe_fd = pipefd[0];
     job->tmp_fd = tmpfd;
     snprintf(job->path, sizeof(job->path), "%s", tmp_path);
+    /* Allow the agent to read bash output files without workspace approval. */
+    if (!agent_path_list_contains(&w->auto_allowed_paths, tmp_path))
+        agent_path_list_append(&w->auto_allowed_paths, tmp_path);
     job->cmd = xstrdup(cmd);
     job->start_time = now_sec();
     job->timeout_sec = timeout_sec;
@@ -10458,6 +10490,7 @@ static void agent_worker_free(agent_worker *w) {
     free(w->legacy_session_path_to_delete);
     free(w->queued_user_drain_text);
     agent_path_list_free(&w->working_directories);
+    agent_path_list_free(&w->auto_allowed_paths);
     if (w->wake_fd[0] >= 0) close(w->wake_fd[0]);
     if (w->wake_fd[1] >= 0) close(w->wake_fd[1]);
     if (w->trace) fclose(w->trace);
