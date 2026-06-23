@@ -5585,8 +5585,6 @@ static bool agent_worker_recover_session(agent_worker *w, const char *prefix,
         w->user_activity = true;
         w->session_dirty = false;
         w->status.state = AGENT_WORKER_IDLE;
-        w->status.ctx_used = w->transcript.len;
-        w->status.ctx_size = w->cfg->gen.ctx_size;
         w->status.prefill_tps = 0.0;
         w->status.greedy_sampling = false;
         w->status.error[0] = '\0';
