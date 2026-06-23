@@ -61,9 +61,18 @@ typedef struct {
 } agent_generation_options;
 
 typedef struct {
+    char **v;
+    int len;
+    int cap;
+} agent_path_list;
+
+typedef struct {
     ds4_engine_options engine;
     agent_generation_options gen;
     const char *chdir_path;
+    char launch_working_directory[PATH_MAX];
+    agent_path_list working_directory_args;
+    agent_path_list working_directories;
     bool non_interactive;
 } agent_config;
 
@@ -91,6 +100,7 @@ typedef struct {
     int ctx_size;
     int power_percent;
     char error[256];
+    char workspace[PATH_MAX];
 } agent_status;
 
 typedef struct agent_bash_job agent_bash_job;
@@ -135,6 +145,14 @@ typedef struct {
     bool web_approval_result;
     char web_approval_message[256];
     char web_approval_error[160];
+    bool path_approval_pending;
+    bool path_approval_answered;
+    bool path_approval_result;
+    char path_approval_message[PATH_MAX + 256];
+    char path_approval_options[3][PATH_MAX];
+    int path_approval_option_count;
+    char path_approval_choice[PATH_MAX];
+    char path_approval_error[160];
     bool queued_user_drain_pending;
     bool queued_user_drain_answered;
     char *queued_user_drain_text;
@@ -145,10 +163,12 @@ typedef struct {
     bool more_valid;
     agent_bash_job *bash_jobs;
     int next_bash_job_id;
+    agent_path_list working_directories;
     bool raw_mode_needs_restore;
 } agent_worker;
 
 static unsigned agent_next_prefill_label(void);
+static const agent_path_list *agent_working_directories(const agent_worker *w);
 
 typedef struct agent_tail_capture {
     char *buf;
@@ -371,6 +391,43 @@ static void *xrealloc(void *ptr, size_t n) {
     return p;
 }
 
+static void agent_path_list_append(agent_path_list *list, const char *path) {
+    if (list->len == list->cap) {
+        list->cap = list->cap ? list->cap * 2 : 4;
+        list->v = xrealloc(list->v, (size_t)list->cap * sizeof(list->v[0]));
+    }
+    list->v[list->len++] = xstrdup(path ? path : "");
+}
+
+static bool agent_path_list_contains(const agent_path_list *list, const char *path) {
+    if (!list || !path) return false;
+    for (int i = 0; i < list->len; i++) {
+        if (list->v[i] && !strcmp(list->v[i], path)) return true;
+    }
+    return false;
+}
+
+static bool agent_path_list_remove(agent_path_list *list, const char *path) {
+    if (!list || !path) return false;
+    for (int i = 0; i < list->len; i++) {
+        if (!list->v[i] || strcmp(list->v[i], path)) continue;
+        free(list->v[i]);
+        for (int j = i + 1; j < list->len; j++)
+            list->v[j - 1] = list->v[j];
+        list->len--;
+        if (list->len >= 0) list->v[list->len] = NULL;
+        return true;
+    }
+    return false;
+}
+
+static void agent_path_list_free(agent_path_list *list) {
+    if (!list) return;
+    for (int i = 0; i < list->len; i++) free(list->v[i]);
+    free(list->v);
+    memset(list, 0, sizeof(*list));
+}
+
 static void write_all(int fd, const char *p, size_t n) {
     while (n) {
         ssize_t wr = write(fd, p, n);
@@ -450,7 +507,8 @@ static bool agent_slash_command_known(const char *cmd) {
            agent_slash_command_with_args(cmd, "/switch") ||
            agent_slash_command_with_args(cmd, "/del") ||
            agent_slash_command_with_args(cmd, "/strip") ||
-           agent_slash_command_with_args(cmd, "/history");
+           agent_slash_command_with_args(cmd, "/history") ||
+           agent_slash_command_with_args(cmd, "/workspace");
 }
 
 static uint64_t parse_u64(const char *s, const char *opt) {
@@ -527,6 +585,11 @@ static agent_config parse_options(int argc, char **argv) {
             .think_mode = DS4_THINK_HIGH,
         },
     };
+    if (!getcwd(c.launch_working_directory, sizeof(c.launch_working_directory))) {
+        fprintf(stderr, "ds4-agent: failed to get current working directory: %s\n",
+                strerror(errno));
+        exit(2);
+    }
 
     bool steering_scale_set = false;
     for (int i = 1; i < argc; i++) {
@@ -600,6 +663,9 @@ static agent_config parse_options(int argc, char **argv) {
             c.engine.n_threads = parse_int(need_arg(&i, argc, argv, arg), arg);
         } else if (!strcmp(arg, "--chdir")) {
             c.chdir_path = need_arg(&i, argc, argv, arg);
+        } else if (!strcmp(arg, "--working-directory")) {
+            agent_path_list_append(&c.working_directory_args,
+                                   need_arg(&i, argc, argv, arg));
         } else if (!strcmp(arg, "--quality")) {
             c.engine.quality = true;
         } else if (!strcmp(arg, "--ssd-streaming")) {
@@ -678,6 +744,58 @@ static agent_config parse_options(int argc, char **argv) {
     return c;
 }
 
+static bool agent_resolve_working_directory_arg(const char *path,
+                                                char out[PATH_MAX],
+                                                char *err, size_t err_len) {
+    if (!path || !path[0]) {
+        snprintf(err, err_len, "working directory path is empty");
+        return false;
+    }
+    if (!realpath(path, out)) {
+        snprintf(err, err_len, "failed to resolve working directory %s: %s",
+                 path, strerror(errno));
+        return false;
+    }
+    struct stat st;
+    if (stat(out, &st) != 0) {
+        snprintf(err, err_len, "failed to stat working directory %s: %s",
+                 out, strerror(errno));
+        return false;
+    }
+    if (!S_ISDIR(st.st_mode)) {
+        snprintf(err, err_len, "working directory is not a directory: %s",
+                 out);
+        return false;
+    }
+    return true;
+}
+
+static bool agent_config_resolve_working_directory(agent_config *cfg,
+                                                   char *err, size_t err_len) {
+    if (!cfg) return true;
+    if (cfg->working_directory_args.len == 0) {
+        if (!cfg->launch_working_directory[0]) {
+            snprintf(err, err_len,
+                     "failed to determine launch working directory");
+            return false;
+        }
+        if (!agent_path_list_contains(&cfg->working_directories,
+                                      cfg->launch_working_directory))
+            agent_path_list_append(&cfg->working_directories,
+                                   cfg->launch_working_directory);
+        return true;
+    }
+    for (int i = 0; i < cfg->working_directory_args.len; i++) {
+        const char *arg = cfg->working_directory_args.v[i];
+        char resolved[PATH_MAX];
+        if (!agent_resolve_working_directory_arg(arg, resolved, err, err_len))
+            return false;
+        if (!agent_path_list_contains(&cfg->working_directories, resolved))
+            agent_path_list_append(&cfg->working_directories, resolved);
+    }
+    return true;
+}
+
 static void log_context_memory(ds4_backend backend,
                                int         ctx_size,
                                uint32_t    prefill_chunk) {
@@ -722,7 +840,12 @@ static const char agent_tools_prompt_intro[] =
     "more defaults to the next 500 lines. "
     "The read result also reports continue_offset=N, which is the next start_line if you need to jump manually. "
     "If the user explicitly asks you to read a complete file into context, call read with whole=true. "
-    "A whole-file read may fail if the result would not fit the current context; then explain that and use chunks.\n\n";
+    "A whole-file read may fail if the result would not fit the current context; then explain that and use chunks.\n\n"
+    "Local file tools are limited to the configured working directories. "
+    "If none were passed on startup, the launch directory is the initial workspace. "
+    "Relative paths resolve from the first configured workspace. "
+    "Paths outside the current workspaces require user approval before the agent adds a new working directory. "
+    "Bash commands start in the first workspace.\n\n";
 
 static const char agent_tools_prompt_edit_line[] =
     "## Editing files\n\n"
@@ -1046,6 +1169,17 @@ static void agent_worker_maybe_append_system_prompt_reminder(agent_worker *w) {
                 w->transcript.len);
     ds4_tokenize_rendered_chat(w->engine, reminder, &w->transcript);
     free(reminder);
+
+    const agent_path_list *roots = agent_working_directories(w);
+    if (roots) {
+        char msg[PATH_MAX + 192];
+        snprintf(msg, sizeof(msg),
+                 "\nConfigured ds4-agent working directory reminder: %s. "
+                 "Local file tools check all configured working directories; "
+                 "bash starts from the first one.",
+                 roots->v[0]);
+        ds4_tokenize_text(w->engine, msg, &w->transcript);
+    }
 
     const char *extra = w->cfg->gen.system;
     if (extra && extra[0]) {
@@ -3994,6 +4128,16 @@ static void agent_worker_build_system_tokens(agent_worker *w, ds4_tokens *out) {
         effective_think_mode(w->cfg) == DS4_THINK_MAX)
         ds4_chat_append_max_effort_prefix(w->engine, out);
     agent_append_system_prompt(w->engine, out, w->cfg->gen.system);
+    const agent_path_list *roots = agent_working_directories(w);
+    if (roots) {
+        char msg[PATH_MAX + 192];
+        snprintf(msg, sizeof(msg),
+                 "Configured ds4-agent working directory: %s. "
+                 "Local file tools check all configured working directories; "
+                 "bash starts from the first one.",
+                 roots->v[0]);
+        ds4_chat_append_message(w->engine, out, "system", msg);
+    }
 }
 
 static void agent_publish_system_status(agent_worker *w, const char *msg) {
@@ -4096,6 +4240,43 @@ static void worker_answer_web_approval(agent_worker *w, bool allow,
         snprintf(w->web_approval_error, sizeof(w->web_approval_error),
                  "%s", deny_error && deny_error[0] ? deny_error :
                  "user denied Chrome browser start");
+    pthread_cond_signal(&w->cond);
+    agent_wake_locked(w);
+    pthread_mutex_unlock(&w->mu);
+}
+
+static bool worker_take_path_approval_request(agent_worker *w,
+                                              char *message, size_t message_len,
+                                              char options[3][PATH_MAX],
+                                              int *option_count) {
+    pthread_mutex_lock(&w->mu);
+    bool pending = w->path_approval_pending;
+    if (pending) {
+        snprintf(message, message_len, "%s", w->path_approval_message);
+        if (option_count) *option_count = w->path_approval_option_count;
+        for (int i = 0; i < w->path_approval_option_count && i < 3; i++)
+            snprintf(options[i], PATH_MAX, "%s", w->path_approval_options[i]);
+        w->path_approval_pending = false;
+    } else if (option_count) {
+        *option_count = 0;
+    }
+    pthread_mutex_unlock(&w->mu);
+    return pending;
+}
+
+static void worker_answer_path_approval(agent_worker *w, bool allow,
+                                        const char *choice,
+                                        const char *deny_error) {
+    pthread_mutex_lock(&w->mu);
+    w->path_approval_result = allow;
+    w->path_approval_answered = true;
+    if (allow)
+        snprintf(w->path_approval_choice, sizeof(w->path_approval_choice),
+                 "%s", choice ? choice : "");
+    if (!allow)
+        snprintf(w->path_approval_error, sizeof(w->path_approval_error),
+                 "%s", deny_error && deny_error[0] ? deny_error :
+                 "user denied working directory add");
     pthread_cond_signal(&w->cond);
     agent_wake_locked(w);
     pthread_mutex_unlock(&w->mu);
@@ -5469,6 +5650,11 @@ static bool agent_parse_bool_default(const char *s, bool def) {
 #define AGENT_COMPACT_TAIL_CAP_TOKENS 50000
 #define AGENT_COMPACT_SUMMARY_MAX_TOKENS 4096
 
+typedef enum {
+    AGENT_PATH_EXISTING,
+    AGENT_PATH_PARENT
+} agent_path_resolution;
+
 typedef struct {
     size_t start;
     size_t content_end;
@@ -5514,6 +5700,267 @@ static void agent_split_lines(const char *data, size_t len, agent_line_spans *sp
             .end = pos,
         });
     }
+}
+
+static const agent_path_list *agent_working_directories(const agent_worker *w) {
+    if (!w || w->working_directories.len <= 0) return NULL;
+    return &w->working_directories;
+}
+
+static const char *agent_primary_working_directory(const agent_worker *w) {
+    const agent_path_list *roots = agent_working_directories(w);
+    return roots && roots->len > 0 ? roots->v[0] : NULL;
+}
+
+static bool agent_path_is_under_root(const char *root, const char *path) {
+    if (!root || !root[0] || !path || !path[0]) return false;
+    size_t n = strlen(root);
+    if (!strcmp(root, "/")) return path[0] == '/';
+    return !strcmp(root, path) || (!strncmp(root, path, n) && path[n] == '/');
+}
+
+static bool agent_path_is_under_any_root(const agent_path_list *roots,
+                                         const char *path) {
+    if (!roots || !path) return false;
+    for (int i = 0; i < roots->len; i++) {
+        if (agent_path_is_under_root(roots->v[i], path)) return true;
+    }
+    return false;
+}
+
+static bool agent_path_parent(const char *path, char parent[PATH_MAX]) {
+    if (!path || !path[0]) return false;
+    snprintf(parent, PATH_MAX, "%s", path);
+    size_t len = strlen(parent);
+    while (len > 1 && parent[len - 1] == '/') parent[--len] = '\0';
+    char *slash = strrchr(parent, '/');
+    if (!slash) return false;
+    if (slash == parent) slash[1] = '\0';
+    else *slash = '\0';
+    return true;
+}
+
+static bool agent_join_path(char *dst, size_t dst_len,
+                            const char *base, const char *path,
+                            char *err, size_t err_len) {
+    int n;
+    if (path && path[0] == '/') {
+        n = snprintf(dst, dst_len, "%s", path);
+    } else if (!base || !base[0] || !strcmp(base, "/")) {
+        n = snprintf(dst, dst_len, "/%s", path ? path : "");
+    } else {
+        n = snprintf(dst, dst_len, "%s/%s", base, path ? path : "");
+    }
+    if (n < 0 || (size_t)n >= dst_len) {
+        snprintf(err, err_len, "path is too long");
+        return false;
+    }
+    return true;
+}
+
+static bool agent_resolve_existing_candidate(const char *base, const char *path,
+                                             char out[PATH_MAX],
+                                             char root_out[PATH_MAX],
+                                             char *err, size_t err_len) {
+    char candidate[PATH_MAX];
+    if (!agent_join_path(candidate, sizeof(candidate), base, path, err, err_len))
+        return false;
+    if (!realpath(candidate, out)) {
+        snprintf(err, err_len, "resolve %s: %s", path, strerror(errno));
+        return false;
+    }
+
+    struct stat st;
+    char dir[PATH_MAX];
+    if (stat(out, &st) == 0 && S_ISDIR(st.st_mode)) {
+        snprintf(dir, sizeof(dir), "%s", out);
+    } else {
+        snprintf(dir, sizeof(dir), "%s", out);
+        char *slash = strrchr(dir, '/');
+        if (slash) {
+            if (slash == dir) slash[1] = '\0';
+            else *slash = '\0';
+        } else {
+            snprintf(dir, sizeof(dir), ".");
+        }
+    }
+    if (!realpath(dir, root_out)) {
+        snprintf(err, err_len, "resolve directory for %s: %s",
+                 path, strerror(errno));
+        return false;
+    }
+    return true;
+}
+
+static bool agent_resolve_parent_candidate(const char *base, const char *path,
+                                           char out[PATH_MAX],
+                                           char root_out[PATH_MAX],
+                                           char *err, size_t err_len) {
+    char candidate[PATH_MAX];
+    if (!agent_join_path(candidate, sizeof(candidate), base, path, err, err_len))
+        return false;
+
+    char existing[PATH_MAX];
+    if (realpath(candidate, existing)) {
+        snprintf(out, PATH_MAX, "%s", existing);
+        struct stat st;
+        if (stat(existing, &st) == 0 && S_ISDIR(st.st_mode)) {
+            snprintf(root_out, PATH_MAX, "%s", existing);
+        } else {
+            char parent[PATH_MAX];
+            snprintf(parent, sizeof(parent), "%s", existing);
+            char *slash = strrchr(parent, '/');
+            if (slash) {
+                if (slash == parent) slash[1] = '\0';
+                else *slash = '\0';
+            } else {
+                snprintf(parent, sizeof(parent), ".");
+            }
+            if (!realpath(parent, root_out)) {
+                snprintf(err, err_len, "resolve parent for %s: %s",
+                         path, strerror(errno));
+                return false;
+            }
+        }
+        return true;
+    }
+    if (errno != ENOENT && errno != ENOTDIR) {
+        snprintf(err, err_len, "resolve %s: %s", path, strerror(errno));
+        return false;
+    }
+
+    char parent[PATH_MAX];
+    snprintf(parent, sizeof(parent), "%s", candidate);
+    size_t len = strlen(parent);
+    while (len > 1 && parent[len - 1] == '/') parent[--len] = '\0';
+    char *slash = strrchr(parent, '/');
+    const char *leaf = slash ? slash + 1 : parent;
+    if (!leaf[0] || !strcmp(leaf, ".") || !strcmp(leaf, "..")) {
+        snprintf(err, err_len, "invalid path: %s", path);
+        return false;
+    }
+    if (slash) {
+        if (slash == parent) slash[1] = '\0';
+        else *slash = '\0';
+    } else {
+        snprintf(parent, sizeof(parent), ".");
+    }
+
+    char resolved_parent[PATH_MAX];
+    if (!realpath(parent, resolved_parent)) {
+        snprintf(err, err_len, "resolve parent for %s: %s", path, strerror(errno));
+        return false;
+    }
+    snprintf(root_out, PATH_MAX, "%s", resolved_parent);
+    if (!strcmp(resolved_parent, "/")) {
+        int n = snprintf(out, PATH_MAX, "/%s", leaf);
+        if (n < 0 || n >= PATH_MAX) {
+            snprintf(err, err_len, "path is too long");
+            return false;
+        }
+    } else {
+        int n = snprintf(out, PATH_MAX, "%s/%s", resolved_parent, leaf);
+        if (n < 0 || n >= PATH_MAX) {
+            snprintf(err, err_len, "path is too long");
+            return false;
+        }
+    }
+    return true;
+}
+
+static bool agent_request_working_directory(agent_worker *w,
+                                            const char *path,
+                                            const char *dir,
+                                            char *err, size_t err_len) {
+    if (!w || !w->cfg || w->cfg->non_interactive) {
+        snprintf(err, err_len,
+                 "path is outside configured working directories: %s", path);
+        return false;
+    }
+
+    pthread_mutex_lock(&w->mu);
+    w->path_approval_pending = true;
+    w->path_approval_answered = false;
+    w->path_approval_result = false;
+    w->path_approval_option_count = 0;
+    w->path_approval_choice[0] = '\0';
+    w->path_approval_error[0] = '\0';
+    snprintf(w->path_approval_message, sizeof(w->path_approval_message),
+             "Tool path %s is outside the current working directories. "
+             "Choose a directory to allow, or deny:", path);
+    char opt[PATH_MAX];
+    snprintf(opt, sizeof(opt), "%s", dir);
+    for (int i = 0; i < 3 && opt[0]; i++) {
+        bool dup = false;
+        for (int j = 0; j < w->path_approval_option_count; j++) {
+            if (!strcmp(w->path_approval_options[j], opt)) {
+                dup = true;
+                break;
+            }
+        }
+        if (!dup) {
+            snprintf(w->path_approval_options[w->path_approval_option_count++],
+                     PATH_MAX, "%s", opt);
+        }
+        char parent[PATH_MAX];
+        if (!agent_path_parent(opt, parent) || !strcmp(parent, opt)) break;
+        snprintf(opt, sizeof(opt), "%s", parent);
+    }
+    agent_wake_locked(w);
+    while (!w->stop && !w->interrupt && !w->path_approval_answered)
+        pthread_cond_wait(&w->cond, &w->mu);
+    bool ok = w->path_approval_result;
+    if (!w->path_approval_answered && (w->stop || w->interrupt)) {
+        ok = false;
+        w->path_approval_pending = false;
+        snprintf(w->path_approval_error, sizeof(w->path_approval_error),
+                 "interrupted");
+    }
+    if (!ok) {
+        snprintf(err, err_len, "%s",
+                 w->path_approval_error[0] ? w->path_approval_error :
+                 "user denied working directory add");
+    }
+    pthread_mutex_unlock(&w->mu);
+    if (!ok) return false;
+
+    const char *chosen = w->path_approval_choice[0] ? w->path_approval_choice : dir;
+    /* Tool execution is worker-owned, so root checks and root-list mutation are
+     * serialized here.  The UI thread only supplies the selected approval
+     * scope or deny result above. */
+    if (!agent_path_list_contains(&w->working_directories, chosen))
+        agent_path_list_append(&w->working_directories, chosen);
+    return true;
+}
+
+static char *agent_resolve_tool_path(agent_worker *w, const char *path,
+                                     agent_path_resolution mode,
+                                     char *err, size_t err_len) {
+    if (!path || !path[0]) {
+        snprintf(err, err_len, "path is empty");
+        return NULL;
+    }
+    const agent_path_list *roots = agent_working_directories(w);
+    if (!roots) return xstrdup(path);
+    const char *base = agent_primary_working_directory(w);
+    char resolved[PATH_MAX];
+    char requested_dir[PATH_MAX];
+    bool ok = mode == AGENT_PATH_PARENT ?
+        agent_resolve_parent_candidate(base, path, resolved, requested_dir,
+                                       err, err_len) :
+        agent_resolve_existing_candidate(base, path, resolved, requested_dir,
+                                         err, err_len);
+    if (!ok) return NULL;
+    if (agent_path_is_under_any_root(roots, resolved))
+        return xstrdup(resolved);
+    if (!agent_request_working_directory(w, path, requested_dir, err, err_len))
+        return NULL;
+    if (!agent_path_is_under_any_root(agent_working_directories(w), resolved)) {
+        snprintf(err, err_len, "path is still outside working directories: %s",
+                 path);
+        return NULL;
+    }
+    return ok ? xstrdup(resolved) : NULL;
 }
 
 static int agent_read_file_bytes(const char *path, char **data, size_t *len,
@@ -5658,11 +6105,21 @@ static char *agent_read_range(agent_worker *w, const char *path, int start_line,
     char *data = NULL;
     size_t len = 0;
     if (!path || !path[0]) return xstrdup("Tool error: read requires path\n");
-    if (agent_read_file_bytes(path, &data, &len, err, sizeof(err)) != 0) {
+    char *file_path = agent_resolve_tool_path(w, path, AGENT_PATH_EXISTING,
+                                              err, sizeof(err));
+    if (!file_path) {
         agent_buf b = {0};
         agent_buf_puts(&b, "Tool error: ");
         agent_buf_puts(&b, err);
         agent_buf_puts(&b, "\n");
+        return agent_buf_take(&b);
+    }
+    if (agent_read_file_bytes(file_path, &data, &len, err, sizeof(err)) != 0) {
+        agent_buf b = {0};
+        agent_buf_puts(&b, "Tool error: ");
+        agent_buf_puts(&b, err);
+        agent_buf_puts(&b, "\n");
+        free(file_path);
         return agent_buf_take(&b);
     }
 
@@ -5700,11 +6157,11 @@ static char *agent_read_range(agent_worker *w, const char *path, int start_line,
             snprintf(hdr, sizeof(hdr),
                      "%s: lines %d-%d of %d; continue_offset=%d; "
                      "call more with count=%d to read the next chunk\n",
-                     path, spans.len ? start_idx + 1 : 0, end_idx, spans.len,
+                     file_path, spans.len ? start_idx + 1 : 0, end_idx, spans.len,
                      end_idx + 1, max_lines > 0 ? max_lines : AGENT_READ_DEFAULT_LINES);
         } else {
             snprintf(hdr, sizeof(hdr), "%s: lines %d-%d of %d\n",
-                     path, spans.len ? start_idx + 1 : 0, end_idx, spans.len);
+                     file_path, spans.len ? start_idx + 1 : 0, end_idx, spans.len);
         }
         agent_buf_puts(&out, hdr);
         for (int i = start_idx; i < end_idx; i++) {
@@ -5717,11 +6174,12 @@ static char *agent_read_range(agent_worker *w, const char *path, int start_line,
         }
     }
     if (set_more) {
-        if (end_idx < spans.len) agent_worker_set_more(w, path, end_idx + 1, bare);
+        if (end_idx < spans.len) agent_worker_set_more(w, file_path, end_idx + 1, bare);
         else agent_worker_set_more(w, NULL, 0, false);
     }
     agent_line_spans_free(&spans);
     free(data);
+    free(file_path);
     return agent_buf_take(&out);
 }
 
@@ -5745,17 +6203,27 @@ static char *agent_tool_more(agent_worker *w, const agent_tool_call *call) {
 }
 
 static char *agent_tool_write(agent_worker *w, const agent_tool_call *call) {
-    (void)w;
     const char *path = agent_tool_arg_value(call, "path");
     const char *content = agent_tool_arg_value(call, "content");
     if (!path || !path[0]) return xstrdup("Tool error: write requires path\n");
     if (!content) return xstrdup("Tool error: write requires content\n");
-    FILE *fp = fopen(path, "wb");
+    char err[256];
+    char *file_path = agent_resolve_tool_path(w, path, AGENT_PATH_PARENT,
+                                              err, sizeof(err));
+    if (!file_path) {
+        agent_buf b = {0};
+        agent_buf_puts(&b, "Tool error: ");
+        agent_buf_puts(&b, err);
+        agent_buf_puts(&b, "\n");
+        return agent_buf_take(&b);
+    }
+    FILE *fp = fopen(file_path, "wb");
     if (!fp) {
         agent_buf b = {0};
         agent_buf_puts(&b, "Tool error: open for write failed: ");
         agent_buf_puts(&b, strerror(errno));
         agent_buf_puts(&b, "\n");
+        free(file_path);
         return agent_buf_take(&b);
     }
     size_t len = strlen(content);
@@ -5766,34 +6234,47 @@ static char *agent_tool_write(agent_worker *w, const agent_tool_call *call) {
         agent_buf_puts(&b, "Tool error: write failed: ");
         agent_buf_puts(&b, strerror(errno));
         agent_buf_puts(&b, "\n");
+        free(file_path);
         return agent_buf_take(&b);
     }
     char msg[PATH_MAX + 160];
-    snprintf(msg, sizeof(msg), "Wrote %zu bytes to %s\n", len, path);
+    snprintf(msg, sizeof(msg), "Wrote %zu bytes to %s\n", len, file_path);
+    free(file_path);
     return xstrdup(msg);
 }
 
-static char *agent_tool_list(const agent_tool_call *call) {
+static char *agent_tool_list(agent_worker *w, const agent_tool_call *call) {
     const char *path = agent_tool_arg_value(call, "path");
     if (!path || !path[0]) path = ".";
-    DIR *dir = opendir(path);
+    char err[256];
+    char *dir_path = agent_resolve_tool_path(w, path, AGENT_PATH_EXISTING,
+                                             err, sizeof(err));
+    if (!dir_path) {
+        agent_buf b = {0};
+        agent_buf_puts(&b, "Tool error: ");
+        agent_buf_puts(&b, err);
+        agent_buf_puts(&b, "\n");
+        return agent_buf_take(&b);
+    }
+    DIR *dir = opendir(dir_path);
     if (!dir) {
         agent_buf b = {0};
         agent_buf_puts(&b, "Tool error: opendir failed: ");
         agent_buf_puts(&b, strerror(errno));
         agent_buf_puts(&b, "\n");
+        free(dir_path);
         return agent_buf_take(&b);
     }
     agent_buf out = {0};
     char hdr[PATH_MAX + 64];
-    snprintf(hdr, sizeof(hdr), "%s:\n", path);
+    snprintf(hdr, sizeof(hdr), "%s:\n", dir_path);
     agent_buf_puts(&out, hdr);
     struct dirent *de;
     int shown = 0;
     while ((de = readdir(dir)) != NULL && shown < 300) {
         if (!strcmp(de->d_name, ".") || !strcmp(de->d_name, "..")) continue;
         char full[PATH_MAX];
-        snprintf(full, sizeof(full), "%s/%s", path, de->d_name);
+        snprintf(full, sizeof(full), "%s/%s", dir_path, de->d_name);
         struct stat st;
         if (lstat(full, &st) != 0) continue;
         char type = S_ISDIR(st.st_mode) ? 'd' :
@@ -5807,6 +6288,7 @@ static char *agent_tool_list(const agent_tool_call *call) {
     }
     if (de) agent_buf_puts(&out, "... more entries omitted ...\n");
     closedir(dir);
+    free(dir_path);
     return agent_buf_take(&out);
 }
 
@@ -6033,7 +6515,8 @@ static bool agent_edit_old_ready_for_upto(const char *old, size_t old_len) {
  * anchor.  The next sampled token is inspected before eval: if it would keep
  * writing old text rather than close the parameter, the caller evaluates a
  * complete "[upto]" marker line instead. */
-static bool agent_edit_upto_forcer_should_replace(agent_edit_upto_forcer *forcer,
+static bool agent_edit_upto_forcer_should_replace(agent_worker *w,
+                                                  agent_edit_upto_forcer *forcer,
                                                   agent_dsml_parser *p,
                                                   const char *next_text,
                                                   size_t next_len) {
@@ -6066,12 +6549,19 @@ static bool agent_edit_upto_forcer_should_replace(agent_edit_upto_forcer *forcer
     char err[256];
     char *data = NULL;
     size_t len = 0;
-    if (agent_read_file_bytes(path, &data, &len, err, sizeof(err)) != 0)
+    char *file_path = agent_resolve_tool_path(w, path, AGENT_PATH_EXISTING,
+                                              err, sizeof(err));
+    if (!file_path)
         return false;
+    if (agent_read_file_bytes(file_path, &data, &len, err, sizeof(err)) != 0) {
+        free(file_path);
+        return false;
+    }
 
     const char *match = NULL;
     bool unique = agent_find_unique(data, len, old, old_len, &match,
                                     "old prefix", err, sizeof(err));
+    free(file_path);
     free(data);
     if (unique) {
         forcer->done = true;
@@ -6194,15 +6684,182 @@ static void test_agent_edit_upto_requires_tail_after_newline_strip(void) {
     AGENT_TEST_ASSERT(strstr(err, "must include a unique tail anchor") != NULL);
 }
 
+static void test_agent_working_directory_path_resolution(void) {
+    char root_tmpl[] = "/tmp/ds4_agent_jail_root_XXXXXX";
+    char outside_tmpl[] = "/tmp/ds4_agent_jail_out_XXXXXX";
+    char *root_tmp = mkdtemp(root_tmpl);
+    char *outside_tmp = mkdtemp(outside_tmpl);
+    AGENT_TEST_ASSERT(root_tmp != NULL);
+    AGENT_TEST_ASSERT(outside_tmp != NULL);
+    if (!root_tmp || !outside_tmp) return;
+
+    char root[PATH_MAX];
+    char outside[PATH_MAX];
+    AGENT_TEST_ASSERT(realpath(root_tmp, root) != NULL);
+    AGENT_TEST_ASSERT(realpath(outside_tmp, outside) != NULL);
+
+    char inside_file[PATH_MAX];
+    char outside_file[PATH_MAX];
+    snprintf(inside_file, sizeof(inside_file), "%s/file.txt", root);
+    snprintf(outside_file, sizeof(outside_file), "%s/file.txt", outside);
+    char err[256] = {0};
+    AGENT_TEST_ASSERT(agent_write_file_bytes(inside_file, "inside\n", 7,
+                                             err, sizeof(err)) == 0);
+    AGENT_TEST_ASSERT(agent_write_file_bytes(outside_file, "outside\n", 8,
+                                             err, sizeof(err)) == 0);
+
+    agent_config cfg = {.non_interactive = true};
+    agent_worker w = {.cfg = &cfg};
+    agent_path_list_append(&w.working_directories, root);
+
+    char *resolved = agent_resolve_tool_path(&w, "file.txt",
+                                             AGENT_PATH_EXISTING,
+                                             err, sizeof(err));
+    AGENT_TEST_ASSERT(resolved != NULL && !strcmp(resolved, inside_file));
+    free(resolved);
+    resolved = agent_resolve_tool_path(&w, inside_file,
+                                       AGENT_PATH_EXISTING,
+                                       err, sizeof(err));
+    AGENT_TEST_ASSERT(resolved != NULL && !strcmp(resolved, inside_file));
+    free(resolved);
+    resolved = agent_resolve_tool_path(&w, outside_file,
+                                       AGENT_PATH_EXISTING,
+                                       err, sizeof(err));
+    AGENT_TEST_ASSERT(resolved == NULL);
+    free(resolved);
+
+    char link_path[PATH_MAX];
+    snprintf(link_path, sizeof(link_path), "%s/link-out", root);
+    AGENT_TEST_ASSERT(symlink(outside_file, link_path) == 0);
+    resolved = agent_resolve_tool_path(&w, "link-out",
+                                       AGENT_PATH_EXISTING,
+                                       err, sizeof(err));
+    AGENT_TEST_ASSERT(resolved == NULL);
+    free(resolved);
+
+    agent_path_list_append(&w.working_directories, outside);
+    resolved = agent_resolve_tool_path(&w, outside_file,
+                                       AGENT_PATH_EXISTING,
+                                       err, sizeof(err));
+    AGENT_TEST_ASSERT(resolved != NULL && !strcmp(resolved, outside_file));
+    free(resolved);
+
+    resolved = agent_resolve_tool_path(&w, "new.txt",
+                                       AGENT_PATH_PARENT,
+                                       err, sizeof(err));
+    AGENT_TEST_ASSERT(resolved != NULL && agent_path_is_under_root(root, resolved));
+    free(resolved);
+    char outside_new[PATH_MAX];
+    snprintf(outside_new, sizeof(outside_new), "%s/new.txt", outside);
+    resolved = agent_resolve_tool_path(&w, outside_new,
+                                       AGENT_PATH_PARENT,
+                                       err, sizeof(err));
+    AGENT_TEST_ASSERT(resolved != NULL && agent_path_is_under_root(outside, resolved));
+    free(resolved);
+
+    unlink(link_path);
+    unlink(inside_file);
+    unlink(outside_file);
+    agent_path_list_free(&w.working_directories);
+    rmdir(root);
+    rmdir(outside);
+}
+
+static void test_agent_working_directory_file_tools(void) {
+    char root_tmpl[] = "/tmp/ds4_agent_tool_root_XXXXXX";
+    char outside_tmpl[] = "/tmp/ds4_agent_tool_out_XXXXXX";
+    char *root_tmp = mkdtemp(root_tmpl);
+    char *outside_tmp = mkdtemp(outside_tmpl);
+    AGENT_TEST_ASSERT(root_tmp != NULL);
+    AGENT_TEST_ASSERT(outside_tmp != NULL);
+    if (!root_tmp || !outside_tmp) return;
+
+    agent_config cfg = {.non_interactive = true};
+    agent_worker w = {.cfg = &cfg};
+    char root[PATH_MAX];
+    AGENT_TEST_ASSERT(realpath(root_tmp, root) != NULL);
+    agent_path_list_append(&w.working_directories, root);
+
+    agent_tool_arg write_args[] = {
+        {.name = "path", .value = "created.txt", .is_string = true},
+        {.name = "content", .value = "hello\n", .is_string = true},
+    };
+    agent_tool_call write_call = {
+        .name = "write",
+        .args = write_args,
+        .argc = 2,
+    };
+    char *write_result = agent_tool_write(&w, &write_call);
+    AGENT_TEST_ASSERT(strstr(write_result, "Wrote 6 bytes") != NULL);
+    free(write_result);
+
+    agent_tool_arg read_args[] = {
+        {.name = "path", .value = "created.txt", .is_string = true},
+    };
+    agent_tool_call read_call = {
+        .name = "read",
+        .args = read_args,
+        .argc = 1,
+    };
+    char *read_result = agent_tool_read(&w, &read_call);
+    AGENT_TEST_ASSERT(strstr(read_result, "hello") != NULL);
+    free(read_result);
+
+    char outside[PATH_MAX];
+    AGENT_TEST_ASSERT(realpath(outside_tmp, outside) != NULL);
+    char outside_file[PATH_MAX];
+    snprintf(outside_file, sizeof(outside_file), "%s/outside.txt", outside);
+    char err[256];
+    AGENT_TEST_ASSERT(agent_write_file_bytes(outside_file, "nope\n", 5,
+                                             err, sizeof(err)) == 0);
+    agent_tool_arg outside_read_args[] = {
+        {.name = "path", .value = outside_file, .is_string = true},
+    };
+    agent_tool_call outside_read_call = {
+        .name = "read",
+        .args = outside_read_args,
+        .argc = 1,
+    };
+    char *outside_result = agent_tool_read(&w, &outside_read_call);
+    AGENT_TEST_ASSERT(strstr(outside_result, "outside configured working directories") != NULL);
+    free(outside_result);
+
+    char created[PATH_MAX];
+    snprintf(created, sizeof(created), "%s/created.txt", root);
+    unlink(created);
+    unlink(outside_file);
+    agent_path_list_free(&w.working_directories);
+    rmdir(root);
+    rmdir(outside);
+}
+
+static void test_agent_default_working_directory_from_launch_cwd(void) {
+    char cwd[PATH_MAX];
+    AGENT_TEST_ASSERT(getcwd(cwd, sizeof(cwd)) != NULL);
+
+    agent_config cfg = {0};
+    snprintf(cfg.launch_working_directory, sizeof(cfg.launch_working_directory),
+             "%s", cwd);
+    char err[256] = {0};
+    AGENT_TEST_ASSERT(agent_config_resolve_working_directory(&cfg, err,
+                                                             sizeof(err)));
+    AGENT_TEST_ASSERT(cfg.working_directories.len == 1);
+    AGENT_TEST_ASSERT(!strcmp(cfg.working_directories.v[0], cwd));
+
+    agent_path_list_free(&cfg.working_directories);
+}
+
 static void ds4_agent_unit_tests_run(void) {
     test_agent_edit_upto_tail_newline_is_not_part_of_anchor();
     test_agent_edit_upto_requires_tail_after_newline_strip();
+    test_agent_working_directory_path_resolution();
+    test_agent_working_directory_file_tools();
+    test_agent_default_working_directory_from_launch_cwd();
 }
 #endif
 
 static bool agent_preflight_edit_old(agent_worker *w, const agent_tool_call *call,
                                      char *err, size_t err_len) {
-    (void)w;
     const char *path = agent_tool_arg_value(call, "path");
     if (!path || !path[0]) return true; /* Cannot preflight until path is known. */
 
@@ -6214,14 +6871,21 @@ static bool agent_preflight_edit_old(agent_worker *w, const agent_tool_call *cal
 
     char *data = NULL;
     size_t len = 0;
-    if (agent_read_file_bytes(path, &data, &len, err, err_len) != 0)
+    char *file_path = agent_resolve_tool_path(w, path, AGENT_PATH_EXISTING,
+                                              err, err_len);
+    if (!file_path)
         return false;
+    if (agent_read_file_bytes(file_path, &data, &len, err, err_len) != 0) {
+        free(file_path);
+        return false;
+    }
 
     const char *match = NULL;
     size_t match_len = 0;
     bool anchored = false;
     bool ok = agent_edit_find_old_span(data, len, old, &match, &match_len,
                                        &anchored, err, err_len);
+    free(file_path);
     free(data);
     return ok;
 }
@@ -6265,7 +6929,6 @@ static char *agent_apply_file_splice(const char *path,
  * unique, and the tail must be unique after that head before the whole span is
  * replaced. */
 static char *agent_tool_edit(agent_worker *w, const agent_tool_call *call) {
-    (void)w;
     const char *path = agent_tool_arg_value(call, "path");
     if (!path || !path[0]) return xstrdup("Tool error: edit requires path\n");
     const char *old = agent_tool_arg_value(call, "old");
@@ -6276,11 +6939,21 @@ static char *agent_tool_edit(agent_worker *w, const agent_tool_call *call) {
     char err[256];
     char *data = NULL;
     size_t len = 0;
-    if (agent_read_file_bytes(path, &data, &len, err, sizeof(err)) != 0) {
+    char *file_path = agent_resolve_tool_path(w, path, AGENT_PATH_EXISTING,
+                                              err, sizeof(err));
+    if (!file_path) {
         agent_buf b = {0};
         agent_buf_puts(&b, "Tool error: ");
         agent_buf_puts(&b, err);
         agent_buf_puts(&b, "\n");
+        return agent_buf_take(&b);
+    }
+    if (agent_read_file_bytes(file_path, &data, &len, err, sizeof(err)) != 0) {
+        agent_buf b = {0};
+        agent_buf_puts(&b, "Tool error: ");
+        agent_buf_puts(&b, err);
+        agent_buf_puts(&b, "\n");
+        free(file_path);
         return agent_buf_take(&b);
     }
 
@@ -6291,6 +6964,7 @@ static char *agent_tool_edit(agent_worker *w, const agent_tool_call *call) {
                                   &anchored, err, sizeof(err)))
     {
         free(data);
+        free(file_path);
         agent_buf b = {0};
         agent_buf_puts(&b, "Tool error: ");
         agent_buf_puts(&b, err);
@@ -6298,11 +6972,12 @@ static char *agent_tool_edit(agent_worker *w, const agent_tool_call *call) {
         return agent_buf_take(&b);
     }
 
-    char *result = agent_apply_file_splice(path, data, len,
+    char *result = agent_apply_file_splice(file_path, data, len,
                                            (size_t)(match - data), match_len,
                                            new_text,
                                            anchored ? "anchored old/new replacement"
                                                     : "old/new replacement");
+    free(file_path);
     free(data);
     return result;
 }
@@ -6435,11 +7110,20 @@ static void agent_search_path(agent_search_ctx *ctx, const char *path, int depth
 
 /* Implement the search tool using either literal matching or POSIX regex. */
 static char *agent_tool_search(agent_worker *w, const agent_tool_call *call) {
-    (void)w;
     const char *query = agent_tool_arg_value(call, "query");
     if (!query || !query[0]) return xstrdup("Tool error: search requires query\n");
     const char *path = agent_tool_arg_value(call, "path");
     if (!path || !path[0]) path = ".";
+    char err[256];
+    char *search_path = agent_resolve_tool_path(w, path, AGENT_PATH_EXISTING,
+                                                err, sizeof(err));
+    if (!search_path) {
+        agent_buf b = {0};
+        agent_buf_puts(&b, "Tool error: ");
+        agent_buf_puts(&b, err);
+        agent_buf_puts(&b, "\n");
+        return agent_buf_take(&b);
+    }
     const char *mode = agent_tool_arg_value(call, "mode");
     agent_search_ctx ctx = {
         .query = query,
@@ -6460,11 +7144,13 @@ static char *agent_tool_search(agent_worker *w, const agent_tool_call *call) {
             agent_buf_puts(&b, "Tool error: invalid regex: ");
             agent_buf_puts(&b, msg);
             agent_buf_puts(&b, "\n");
+            free(search_path);
             return agent_buf_take(&b);
         }
         ctx.regex_ready = true;
     }
-    agent_search_path(&ctx, path, 0);
+    agent_search_path(&ctx, search_path, 0);
+    free(search_path);
     if (ctx.regex_ready) regfree(&ctx.regex);
     if (!ctx.out.ptr) agent_buf_puts(&ctx.out, "No matches\n");
     else {
@@ -6664,6 +7350,8 @@ struct agent_bash_job {
     int exit_status;
     bool running;
     bool timed_out;
+    bool sandboxed;
+    bool sandbox_fallback_used;
     struct agent_bash_job *next;
     agent_worker *worker;  /* back-pointer for terminal state restoration */
 };
@@ -6803,10 +7491,130 @@ static void agent_bash_poll(agent_bash_job *job) {
     }
 }
 
+#ifdef __APPLE__
+static bool agent_detect_apple_developer_dir(char out[PATH_MAX]) {
+    if (!out) return false;
+    out[0] = '\0';
+
+    const char *env = getenv("DEVELOPER_DIR");
+    if (env && env[0]) {
+        struct stat st;
+        if (stat(env, &st) == 0 && S_ISDIR(st.st_mode)) {
+            snprintf(out, PATH_MAX, "%s", env);
+            return true;
+        }
+    }
+
+    FILE *fp = popen("/usr/bin/xcode-select -p 2>/dev/null", "r");
+    if (fp) {
+        char buf[PATH_MAX];
+        if (fgets(buf, sizeof(buf), fp)) {
+            size_t n = strlen(buf);
+            while (n > 0 && (buf[n - 1] == '\n' || buf[n - 1] == '\r'))
+                buf[--n] = '\0';
+            if (buf[0]) {
+                struct stat st;
+                if (stat(buf, &st) == 0 && S_ISDIR(st.st_mode)) {
+                    snprintf(out, PATH_MAX, "%s", buf);
+                    pclose(fp);
+                    return true;
+                }
+            }
+        }
+        pclose(fp);
+    }
+
+    const char *fallback = "/Library/Developer/CommandLineTools";
+    struct stat st;
+    if (stat(fallback, &st) == 0 && S_ISDIR(st.st_mode)) {
+        snprintf(out, PATH_MAX, "%s", fallback);
+        return true;
+    }
+    return false;
+}
+
+static void agent_sbpl_quote(agent_buf *b, const char *s) {
+    agent_buf_append(b, "\"", 1);
+    for (const char *p = s ? s : ""; *p; p++) {
+        if (*p == '\\' || *p == '"') agent_buf_append(b, "\\", 1);
+        agent_buf_append(b, p, 1);
+    }
+    agent_buf_append(b, "\"", 1);
+}
+
+static char *agent_bash_sandbox_profile(const agent_path_list *roots,
+                                        const char *developer_dir) {
+    agent_buf b = {0};
+    agent_buf_puts(&b,
+        "(version 1)\n"
+        "(debug deny)\n"
+        "(allow process*)\n"
+        "(allow signal (target self))\n"
+        "(allow sysctl-read)\n"
+        "(allow file-read-metadata file-test-existence)\n"
+        "(allow file-read* file-map-executable\n"
+        "  (subpath \"/System\")\n"
+        "  (subpath \"/usr\")\n"
+        "  (subpath \"/bin\")\n"
+        "  (subpath \"/sbin\")\n"
+        "  (subpath \"/Library\"))\n"
+        "(allow file-read* file-write* file-test-existence file-ioctl\n"
+        "  (literal \"/tmp\")\n"
+        "  (literal \"/private/tmp\")\n"
+        "  (literal \"/dev/null\")\n"
+        "  (literal \"/dev/zero\")\n"
+        "  (literal \"/dev/random\")\n"
+        "  (literal \"/dev/urandom\")");
+    if (developer_dir && developer_dir[0]) {
+        agent_buf_puts(&b, "\n  (subpath ");
+        agent_sbpl_quote(&b, developer_dir);
+        agent_buf_puts(&b, ")");
+    }
+    for (int i = 0; roots && i < roots->len; i++) {
+        agent_buf_puts(&b, "\n  (subpath ");
+        agent_sbpl_quote(&b, roots->v[i]);
+        agent_buf_puts(&b, ")");
+    }
+    agent_buf_puts(&b, ")\n");
+    return agent_buf_take(&b);
+}
+
+static void agent_bash_prepare_sandbox_env(const char *working_dir,
+                                           const char *developer_dir) {
+    if (!working_dir || !working_dir[0]) return;
+
+    /* Keep command-local config and temp files inside the approved workspace so
+     * common developer tools do not abort on blocked HOME/TMP lookups. */
+    setenv("HOME", working_dir, 1);
+    setenv("TMPDIR", working_dir, 1);
+    setenv("TMP", working_dir, 1);
+    setenv("TEMP", working_dir, 1);
+    setenv("XDG_CONFIG_HOME", working_dir, 1);
+    setenv("XDG_CACHE_HOME", working_dir, 1);
+    setenv("TERM", "dumb", 1);
+    setenv("PAGER", "cat", 1);
+    setenv("GIT_PAGER", "cat", 1);
+
+    /* Git treats permission errors while probing global/system config as
+     * fatal. Point those lookups at in-jail paths instead of blocked ones. */
+    setenv("GIT_CONFIG_NOSYSTEM", "1", 1);
+    setenv("GIT_CONFIG_SYSTEM", "/dev/null", 1);
+    setenv("GIT_CONFIG_GLOBAL", "/dev/null", 1);
+    if (developer_dir && developer_dir[0]) {
+        char git_exec_path[PATH_MAX];
+        setenv("DEVELOPER_DIR", developer_dir, 1);
+        snprintf(git_exec_path, sizeof(git_exec_path),
+                 "%s/usr/libexec/git-core", developer_dir);
+        setenv("GIT_EXEC_PATH", git_exec_path, 1);
+    }
+}
+#endif
+
 /* Spawn a shell command into its own process group so bash_stop/timeout can
  * kill grandchildren created by the shell, not just the /bin/sh wrapper. */
-static agent_bash_job *agent_bash_start(agent_worker *w, const char *cmd,
-                                        int timeout_sec, char *err, size_t err_len) {
+static agent_bash_job *agent_bash_start_mode(agent_worker *w, const char *cmd,
+                                             int timeout_sec, bool use_sandbox,
+                                             char *err, size_t err_len) {
     char tmp_path[] = "/tmp/ds4_agent_output_XXXXXX";
     int tmpfd = mkstemp(tmp_path);
     if (tmpfd < 0) {
@@ -6814,11 +7622,24 @@ static agent_bash_job *agent_bash_start(agent_worker *w, const char *cmd,
         return NULL;
     }
 
+    const char *working_dir = agent_primary_working_directory(w);
+#ifdef __APPLE__
+    const agent_path_list *sandbox_roots = agent_working_directories(w);
+    char developer_dir[PATH_MAX] = {0};
+    if (!agent_detect_apple_developer_dir(developer_dir))
+        developer_dir[0] = '\0';
+    char *sandbox_profile = (use_sandbox && working_dir) ?
+        agent_bash_sandbox_profile(sandbox_roots, developer_dir) : NULL;
+#endif
+
     int pipefd[2];
     if (pipe(pipefd) != 0) {
         snprintf(err, err_len, "failed to create pipe: %s", strerror(errno));
         close(tmpfd);
         unlink(tmp_path);
+#ifdef __APPLE__
+        if (sandbox_profile) free(sandbox_profile);
+#endif
         return NULL;
     }
     pid_t pid = fork();
@@ -6828,6 +7649,9 @@ static agent_bash_job *agent_bash_start(agent_worker *w, const char *cmd,
         close(pipefd[1]);
         close(tmpfd);
         unlink(tmp_path);
+#ifdef __APPLE__
+        if (sandbox_profile) free(sandbox_profile);
+#endif
         return NULL;
     }
     if (pid == 0) {
@@ -6849,10 +7673,23 @@ static agent_bash_job *agent_bash_start(agent_worker *w, const char *cmd,
         dup2(pipefd[1], STDOUT_FILENO);
         dup2(pipefd[1], STDERR_FILENO);
         close(pipefd[1]);
+        if (working_dir && chdir(working_dir) != 0) _exit(126);
+#ifdef __APPLE__
+        agent_bash_prepare_sandbox_env(working_dir, developer_dir);
+        if (sandbox_profile) {
+            execl("/usr/bin/sandbox-exec", "sandbox-exec", "-p",
+                  sandbox_profile, "/bin/sh", "-c", cmd ? cmd : "",
+                  (char *)NULL);
+            _exit(127);
+        }
+#endif
         execl("/bin/sh", "sh", "-c", cmd ? cmd : "", (char *)NULL);
         _exit(127);
     }
 
+#ifdef __APPLE__
+    if (sandbox_profile) free(sandbox_profile);
+#endif
     close(pipefd[1]);
     setpgid(pid, pid);
     int old_flags;
@@ -6871,10 +7708,20 @@ static agent_bash_job *agent_bash_start(agent_worker *w, const char *cmd,
     job->timeout_sec = timeout_sec;
     job->exit_status = -1;
     job->running = true;
+    job->sandboxed = use_sandbox;
     job->worker = w;
     job->next = w->bash_jobs;
     w->bash_jobs = job;
     return job;
+}
+
+static agent_bash_job *agent_bash_start(agent_worker *w, const char *cmd,
+                                        int timeout_sec, char *err, size_t err_len) {
+#ifdef __APPLE__
+    return agent_bash_start_mode(w, cmd, timeout_sec, true, err, err_len);
+#else
+    return agent_bash_start_mode(w, cmd, timeout_sec, false, err, err_len);
+#endif
 }
 
 static void agent_tail_append(agent_buf *b, const char *s, size_t n, size_t max) {
@@ -6980,6 +7827,10 @@ static char *agent_bash_observation(agent_bash_job *job, bool mark_observed) {
         snprintf(line, sizeof(line), "exit_status=%d\n", job->exit_status);
         agent_buf_puts(&out, line);
     }
+    if (job->sandbox_fallback_used) {
+        agent_buf_puts(&out,
+            "note=filesystem sandbox failed to start cleanly; command was retried without it\n");
+    }
 
     if (job->bytes == 0) {
         agent_buf_puts(&out, "<output>\n</output>\n");
@@ -7041,6 +7892,20 @@ static char *agent_bash_observation(agent_bash_job *job, bool mark_observed) {
     return agent_buf_take(&out);
 }
 
+#ifdef __APPLE__
+static bool agent_bash_should_retry_without_sandbox(const agent_bash_job *job) {
+    return job &&
+        job->sandboxed &&
+        !job->sandbox_fallback_used &&
+        !job->running &&
+        !job->timed_out &&
+        job->bytes == 0 &&
+        (job->exit_status == 134 ||
+         job->exit_status == 71 ||
+         job->exit_status == 127);
+}
+#endif
+
 static void agent_bash_publish_observation(agent_worker *w, const char *obs) {
     if (!obs || !obs[0]) return;
     const char *body = NULL;
@@ -7075,6 +7940,28 @@ static void agent_bash_publish_observation(agent_worker *w, const char *obs) {
     if (!body || !body[0]) return;
     const char *end = close ? strstr(body, close) : NULL;
     size_t n = end ? (size_t)(end - body) : strlen(body);
+    if (n == 0) {
+        const char *done = strstr(obs, "status=done");
+        const char *exitp = strstr(obs, "\nexit_status=");
+        if (done && exitp) {
+            int exit_status = atoi(exitp + strlen("\nexit_status="));
+            char msg[96];
+            if (exit_status == 0) {
+                snprintf(msg, sizeof(msg), "[bash completed with no output]\n");
+                agent_publish(w, "\x1b[90m", 5);
+                agent_publish(w, msg, strlen(msg));
+                agent_publish(w, "\x1b[0m", 4);
+            } else {
+                snprintf(msg, sizeof(msg),
+                         "[bash failed with no output, exit_status=%d]\n",
+                         exit_status);
+                agent_publish(w, "\x1b[38;5;208m", 11);
+                agent_publish(w, msg, strlen(msg));
+                agent_publish(w, "\x1b[0m", 4);
+            }
+        }
+        return;
+    }
     if (n) {
         bool failed = strstr(obs, "status=done") && !strstr(obs, "exit_status=0\n");
         if (failed) agent_publish(w, "\x1b[38;5;208m", 11);
@@ -7118,6 +8005,29 @@ static char *agent_bash_job_tool_result(agent_worker *w, agent_bash_job *job,
     if (wait || stop) agent_bash_refresh_for(w, job, refresh_sec);
     else agent_bash_poll(job);
 
+#ifdef __APPLE__
+    if (!stop && agent_bash_should_retry_without_sandbox(job)) {
+        char retry_err[160] = {0};
+        char *retry_cmd = xstrdup(job->cmd ? job->cmd : "");
+        int retry_timeout = (int)job->timeout_sec;
+        agent_bash_remove_job(w, job);
+        job = agent_bash_start_mode(w, retry_cmd, retry_timeout, false,
+                                    retry_err, sizeof(retry_err));
+        free(retry_cmd);
+        if (!job) {
+            agent_buf fail = {0};
+            agent_buf_puts(&fail,
+                "Tool error: bash filesystem sandbox failed, and retry without sandbox failed: ");
+            agent_buf_puts(&fail, retry_err[0] ? retry_err : "unknown error");
+            agent_buf_puts(&fail, "\n");
+            return agent_buf_take(&fail);
+        }
+        job->sandbox_fallback_used = true;
+        if (wait) agent_bash_refresh_for(w, job, refresh_sec);
+        else agent_bash_poll(job);
+    }
+#endif
+
     char *obs = agent_bash_observation(job, true);
     agent_bash_publish_observation(w, obs);
     if (remove_if_done && !job->running) agent_bash_remove_job(w, job);
@@ -7147,7 +8057,7 @@ static char *agent_execute_tool_call(agent_worker *w, const agent_tool_call *cal
     if (!strcmp(call->name, "read")) return agent_tool_read(w, call);
     if (!strcmp(call->name, "more")) return agent_tool_more(w, call);
     if (!strcmp(call->name, "write")) return agent_tool_write(w, call);
-    if (!strcmp(call->name, "list")) return agent_tool_list(call);
+    if (!strcmp(call->name, "list")) return agent_tool_list(w, call);
     if (!strcmp(call->name, "edit")) return agent_tool_edit(w, call);
     if (!strcmp(call->name, "search")) return agent_tool_search(w, call);
     if (!strcmp(call->name, "google_search")) return agent_tool_google_search(w, call);
@@ -7791,7 +8701,7 @@ static int worker_run_turn(agent_worker *w, const char *user_text) {
 
             size_t text_len = 0;
             char *text = ds4_token_text(w->engine, token, &text_len);
-            if (agent_edit_upto_forcer_should_replace(&upto_forcer, &dsml,
+            if (agent_edit_upto_forcer_should_replace(w, &upto_forcer, &dsml,
                                                        text, text_len))
             {
                 agent_trace(w, "edit old auto-upto replaced token=%d text=%.*s",
@@ -8189,6 +9099,12 @@ static int worker_status_power_locked(agent_worker *w) {
     return power > 0 ? power : 100;
 }
 
+static void worker_update_status_workspace_locked(agent_worker *w) {
+    const char *root = w->working_directories.len > 0 ?
+        w->working_directories.v[0] : "";
+    snprintf(w->status.workspace, sizeof(w->status.workspace), "%s", root);
+}
+
 /* Request interruption at the next model/tool polling point. */
 static void worker_interrupt(agent_worker *w) {
     pthread_mutex_lock(&w->mu);
@@ -8229,6 +9145,7 @@ static void worker_consume(agent_worker *w, char **out, size_t *out_len, agent_s
     w->status.ctx_used = w->transcript.len;
     w->status.ctx_size = w->cfg->gen.ctx_size;
     w->status.power_percent = worker_status_power_locked(w);
+    worker_update_status_workspace_locked(w);
     if (status) *status = w->status;
     w->wake_pending = false;
     pthread_mutex_unlock(&w->mu);
@@ -8239,6 +9156,7 @@ static void worker_get_status(agent_worker *w, agent_status *status) {
     w->status.ctx_used = w->transcript.len;
     w->status.ctx_size = w->cfg->gen.ctx_size;
     w->status.power_percent = worker_status_power_locked(w);
+    worker_update_status_workspace_locked(w);
     *status = w->status;
     pthread_mutex_unlock(&w->mu);
 }
@@ -8257,10 +9175,63 @@ static bool worker_is_initialized(agent_worker *w, agent_status *status) {
     w->status.ctx_used = w->transcript.len;
     w->status.ctx_size = w->cfg->gen.ctx_size;
     w->status.power_percent = worker_status_power_locked(w);
+    worker_update_status_workspace_locked(w);
     if (status) *status = w->status;
     bool initialized = w->initialized;
     pthread_mutex_unlock(&w->mu);
     return initialized;
+}
+
+static void agent_worker_print_workspaces(agent_worker *w) {
+    pthread_mutex_lock(&w->mu);
+    if (w->working_directories.len == 0) {
+        pthread_mutex_unlock(&w->mu);
+        printf("no working directories configured\n");
+        return;
+    }
+    printf("working directories:\n");
+    for (int i = 0; i < w->working_directories.len; i++) {
+        printf("%c %d. %s\n", i == 0 ? '*' : ' ', i + 1,
+               w->working_directories.v[i]);
+    }
+    pthread_mutex_unlock(&w->mu);
+}
+
+static bool agent_worker_add_workspace(agent_worker *w, const char *path,
+                                       char *resolved_out, size_t resolved_len,
+                                       char *err, size_t err_len) {
+    char resolved[PATH_MAX];
+    if (!agent_resolve_working_directory_arg(path, resolved, err, err_len))
+        return false;
+    pthread_mutex_lock(&w->mu);
+    bool exists = agent_path_list_contains(&w->working_directories, resolved);
+    if (!exists) {
+        agent_path_list_append(&w->working_directories, resolved);
+        worker_update_status_workspace_locked(w);
+        agent_wake_locked(w);
+    }
+    pthread_mutex_unlock(&w->mu);
+    if (resolved_out) snprintf(resolved_out, resolved_len, "%s", resolved);
+    if (exists) snprintf(err, err_len, "workspace already configured: %s", resolved);
+    return !exists;
+}
+
+static bool agent_worker_remove_workspace(agent_worker *w, const char *path,
+                                          char *removed, size_t removed_len,
+                                          char *err, size_t err_len) {
+    char resolved[PATH_MAX];
+    if (!agent_resolve_working_directory_arg(path, resolved, err, err_len))
+        return false;
+    pthread_mutex_lock(&w->mu);
+    bool ok = agent_path_list_remove(&w->working_directories, resolved);
+    if (ok) {
+        if (removed) snprintf(removed, removed_len, "%s", resolved);
+        worker_update_status_workspace_locked(w);
+        agent_wake_locked(w);
+    }
+    pthread_mutex_unlock(&w->mu);
+    if (!ok) snprintf(err, err_len, "workspace not configured: %s", resolved);
+    return ok;
 }
 
 static bool stdout_is_tty(void) {
@@ -8315,8 +9286,12 @@ static void agent_progress_append(char *buf, size_t len, size_t *pos,
 }
 
 static void build_prompt_text(const agent_status *st, char *buf, size_t len) {
-    (void)st;
-    snprintf(buf, len, "ds4-agent> ");
+    const char *workspace = st && st->workspace[0] ? st->workspace : NULL;
+    if (!workspace) {
+        snprintf(buf, len, "ds4-agent> ");
+        return;
+    }
+    snprintf(buf, len, "ds4-agent %s> ", workspace);
 }
 
 static void agent_progress_bar(int done, int total, double tps,
@@ -9375,6 +10350,7 @@ static void runtime_help(void) {
     puts("  /strip SHA   Strip KV payload; /switch rebuilds it by prefill.");
     puts("  /history [N] Show N recent user turns from the current session.");
     puts("  /power N     Set GPU duty cycle percentage, 1..100.");
+    puts("  /workspace   List workspace roots; +PATH adds, -PATH removes. The first root is the active workspace.");
     puts("  /new         Start a fresh session from the system prompt.");
     puts("  /quit, /exit Exit.");
     puts("  Ctrl+C       Interrupt generation; clear edited text.");
@@ -9427,6 +10403,8 @@ static int agent_worker_init(agent_worker *w, ds4_engine *engine, agent_config *
     pthread_mutex_init(&w->mu, NULL);
     pthread_cond_init(&w->cond, NULL);
     w->status.state = AGENT_WORKER_IDLE;
+    for (int i = 0; i < cfg->working_directories.len; i++)
+        agent_path_list_append(&w->working_directories, cfg->working_directories.v[i]);
     if (pipe(w->wake_fd) != 0) return -1;
     int old_flags;
     set_nonblock(w->wake_fd[0], true, &old_flags);
@@ -9479,6 +10457,7 @@ static void agent_worker_free(agent_worker *w) {
     free(w->session_title);
     free(w->legacy_session_path_to_delete);
     free(w->queued_user_drain_text);
+    agent_path_list_free(&w->working_directories);
     if (w->wake_fd[0] >= 0) close(w->wake_fd[0]);
     if (w->wake_fd[1] >= 0) close(w->wake_fd[1]);
     if (w->trace) fclose(w->trace);
@@ -9564,6 +10543,76 @@ static bool agent_prompt_yes_no_ex(const char *prompt,
         while (*p == ' ' || *p == '\t') p++;
         if (*p == 'y' || *p == 'Y') return true;
         if (*p == 'n' || *p == 'N') return false;
+    }
+}
+
+static bool agent_prompt_working_directory_choice(const char *prompt,
+                                                  char options[3][PATH_MAX],
+                                                  int option_count,
+                                                  char choice[PATH_MAX],
+                                                  bool *timed_out) {
+    char buf[32];
+    const int timeout_sec = 30;
+    double deadline = now_sec() + timeout_sec;
+    if (timed_out) *timed_out = false;
+    if (choice) choice[0] = '\0';
+
+    printf("%s\n", prompt ? prompt : "Choose working directory to allow:");
+    for (int i = 0; i < option_count; i++)
+        printf("  %d) %s\n", i + 1, options[i]);
+    printf("  n) deny\n");
+    fflush(stdout);
+
+    for (;;) {
+        double rem_sec = deadline - now_sec();
+        int rem = rem_sec <= 0.0 ? 0 : (int)(rem_sec + 0.999);
+        printf("\rSelect 1-%d or n/deny [auto-1 in %2ds] ", option_count, rem);
+        fflush(stdout);
+        if (rem_sec <= 0.0) {
+            if (timed_out) *timed_out = true;
+            printf("\n");
+            if (option_count > 0 && choice)
+                snprintf(choice, PATH_MAX, "%s", options[0]);
+            return option_count > 0;
+        }
+
+        struct pollfd pfd = {.fd = STDIN_FILENO, .events = POLLIN};
+        int timeout_ms = rem_sec > 1.0 ? 1000 : (int)(rem_sec * 1000.0) + 1;
+        int rc;
+        do {
+            rc = poll(&pfd, 1, timeout_ms);
+        } while (rc < 0 && errno == EINTR);
+        if (rc == 0) continue;
+        if (rc < 0) {
+            printf("\n");
+            return false;
+        }
+
+        int saved_flags = fcntl(STDIN_FILENO, F_GETFL, 0);
+        if (saved_flags >= 0 && (saved_flags & O_NONBLOCK))
+            fcntl(STDIN_FILENO, F_SETFL, saved_flags & ~O_NONBLOCK);
+        bool got_line = fgets(buf, sizeof(buf), stdin) != NULL;
+        if (saved_flags >= 0 && (saved_flags & O_NONBLOCK))
+            fcntl(STDIN_FILENO, F_SETFL, saved_flags);
+        printf("\n");
+        if (!got_line) return false;
+        char *p = buf;
+        while (*p == ' ' || *p == '\t') p++;
+        if (*p == '\n' || *p == '\0' || *p == 'y' || *p == 'Y') {
+            if (option_count > 0 && choice)
+                snprintf(choice, PATH_MAX, "%s", options[0]);
+            return option_count > 0;
+        }
+        if (*p == 'n' || *p == 'N') return false;
+        if (!strncasecmp(p, "deny", 4)) return false;
+        if (!strncasecmp(p, "none", 4)) return false;
+        if (*p >= '1' && *p <= '3') {
+            int idx = *p - '1';
+            if (idx >= 0 && idx < option_count) {
+                if (choice) snprintf(choice, PATH_MAX, "%s", options[idx]);
+                return true;
+            }
+        }
     }
 }
 
@@ -9943,6 +10992,35 @@ static int run_agent(ds4_engine *engine, agent_config *cfg) {
             continue;
         }
 
+        char path_approval_msg[PATH_MAX + 256];
+        char path_approval_options[3][PATH_MAX];
+        int path_approval_option_count = 0;
+        if (worker_take_path_approval_request(&worker, path_approval_msg,
+                                             sizeof(path_approval_msg),
+                                             path_approval_options,
+                                             &path_approval_option_count))
+        {
+            char *saved_input = NULL;
+            if (editor.active && editor.edit.buf && editor.edit.len)
+                saved_input = xstrndup(editor.edit.buf, editor.edit.len);
+            editor_stop(&editor);
+            editor_restore_terminal_layout(&editor);
+            bool approval_timed_out = false;
+            char approved_dir[PATH_MAX] = {0};
+            bool allow = agent_prompt_working_directory_choice(
+                path_approval_msg, path_approval_options,
+                path_approval_option_count, approved_dir, &approval_timed_out);
+            worker_answer_path_approval(&worker, allow, approved_dir,
+                approval_timed_out ? "working directory approval timed out" : NULL);
+            worker_get_status(&worker, &st);
+            build_prompt_text(&st, prompt, sizeof(prompt));
+            int restart_cols = editor.edit.cols > 0 ? (int)editor.edit.cols : 80;
+            build_footer_text(&st, &queue, restart_cols, statusline, sizeof(statusline));
+            editor_start(&editor, prompt, statusline, saved_input);
+            free(saved_input);
+            continue;
+        }
+
         if (initial_pending && worker_is_idle(&worker)) {
             if (worker_submit(&worker, initial_pending)) {
                 free(initial_pending);
@@ -10048,6 +11126,44 @@ static int run_agent(ds4_engine *engine, agent_config *cfg) {
                             printf("usage: /power <1..100>\n");
                         } else {
                             worker_request_power(&worker, power);
+                        }
+                    }
+                } else if (!strncmp(cmd, "/workspace", 10) &&
+                           (cmd[10] == '\0' || cmd[10] == ' ' || cmd[10] == '\t')) {
+                    if (busy) {
+                        printf("command requires the model to be idle: %s\n", cmd);
+                    } else {
+                        char *arg = cmd + 10;
+                        while (*arg == ' ' || *arg == '\t') arg++;
+                        if (!arg[0]) {
+                            agent_worker_print_workspaces(&worker);
+                        } else if (arg[0] == '+' || arg[0] == '-') {
+                            char op = arg[0];
+                            arg++;
+                            while (*arg == ' ' || *arg == '\t') arg++;
+                            if (!arg[0]) {
+                                printf("usage: /workspace +/path/to or /workspace -/path/to\n");
+                            } else {
+                                char resolved[PATH_MAX] = {0};
+                                char err[PATH_MAX + 160] = {0};
+                                if (op == '+') {
+                                    if (agent_worker_add_workspace(&worker, arg,
+                                                                   resolved, sizeof(resolved),
+                                                                   err, sizeof(err)))
+                                        printf("added workspace %s\n", resolved);
+                                    else
+                                        printf("workspace add failed: %s\n", err);
+                                } else {
+                                    if (agent_worker_remove_workspace(&worker, arg,
+                                                                      resolved, sizeof(resolved),
+                                                                      err, sizeof(err)))
+                                        printf("removed workspace %s\n", resolved);
+                                    else
+                                        printf("workspace remove failed: %s\n", err);
+                                }
+                            }
+                        } else {
+                            printf("usage: /workspace, /workspace +/path/to, /workspace -/path/to\n");
                         }
                     }
                 } else if (cmd[0] == '/' && !agent_slash_command_known(cmd)) {
@@ -10217,6 +11333,11 @@ int main(int argc, char **argv) {
     if (cfg.chdir_path && chdir(cfg.chdir_path) != 0) {
         fprintf(stderr, "ds4-agent: failed to chdir to %s: %s\n",
                 cfg.chdir_path, strerror(errno));
+        return 1;
+    }
+    char wd_err[PATH_MAX + 160];
+    if (!agent_config_resolve_working_directory(&cfg, wd_err, sizeof(wd_err))) {
+        fprintf(stderr, "ds4-agent: %s\n", wd_err);
         return 1;
     }
     ds4_engine *engine = NULL;

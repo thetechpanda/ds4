@@ -281,6 +281,7 @@ static void print_agent_specific(FILE *fp, const help_colors *c) {
     opt(fp, c, "-sys, --system TEXT", "Extra system prompt. Empty disables extra text.");
     opt(fp, c, "--trace FILE", "Write prompt, token, and DSML debug trace.");
     opt(fp, c, "--chdir DIR", "Change working directory before loading runtime assets.");
+    opt(fp, c, "--working-directory DIR", "Add a jailed workspace root. Repeatable; defaults to the launch directory.");
     fputc('\n', fp);
 }
 
@@ -294,6 +295,7 @@ static void print_agent_sessions(FILE *fp, const help_colors *c) {
     opt(fp, c, "/strip ID", "Remove KV payload; the text history can be rebuilt later.");
     opt(fp, c, "/history [N]", "Show N recent user turns from the current session.");
     opt(fp, c, "/power N", "Set GPU duty cycle percentage, 1..100.");
+    opt(fp, c, "/workspace [+-DIR]", "List workspace roots; +DIR adds, -DIR removes. The first root is active.");
     opt(fp, c, "/new", "Start a fresh session from the system prompt.");
     opt(fp, c, "/quit, /exit", "Exit.");
     fputc('\n', fp);
