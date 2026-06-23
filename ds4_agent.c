@@ -9336,14 +9336,25 @@ static bool agent_worker_remove_workspace(agent_worker *w, const char *path,
     if (!agent_resolve_working_directory_arg(path, resolved, err, err_len))
         return false;
     pthread_mutex_lock(&w->mu);
-    bool ok = agent_path_list_remove(&w->working_directories, resolved);
-    if (ok) {
-        if (removed) snprintf(removed, removed_len, "%s", resolved);
-        worker_update_status_workspace_locked(w);
-        agent_wake_locked(w);
+    bool ok = false;
+    /* Never remove the last workspace — doing so disables jail enforcement
+     * and bash sandboxing. */
+    if (w->working_directories.len == 1 &&
+        agent_path_list_contains(&w->working_directories, resolved)) {
+        snprintf(err, err_len, "cannot remove last workspace: %s", resolved);
+    } else {
+        ok = agent_path_list_remove(&w->working_directories, resolved);
+        if (ok) {
+            if (removed) snprintf(removed, removed_len, "%s", resolved);
+            worker_update_status_workspace_locked(w);
+            agent_wake_locked(w);
+        }
     }
     pthread_mutex_unlock(&w->mu);
-    if (!ok) snprintf(err, err_len, "workspace not configured: %s", resolved);
+    if (!ok) {
+        if (!err[0])
+            snprintf(err, err_len, "workspace not configured: %s", resolved);
+    }
     return ok;
 }
 
