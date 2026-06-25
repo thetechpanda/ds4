@@ -411,18 +411,34 @@ static bool agent_path_list_contains(const agent_path_list *list, const char *pa
     return false;
 }
 
-static bool agent_path_list_remove(agent_path_list *list, const char *path) {
+static bool agent_path_list_remove(agent_path_list *list, const char *path,
+                                   bool prefix) {
     if (!list || !path) return false;
-    for (int i = 0; i < list->len; i++) {
-        if (!list->v[i] || strcmp(list->v[i], path)) continue;
-        free(list->v[i]);
-        for (int j = i + 1; j < list->len; j++)
-            list->v[j - 1] = list->v[j];
-        list->len--;
-        if (list->len >= 0) list->v[list->len] = NULL;
-        return true;
+    bool removed = false;
+    size_t plen = prefix ? strlen(path) : 0;
+    for (int i = 0; i < list->len; ) {
+        bool match = false;
+        if (list->v[i]) {
+            if (prefix) {
+                match = strncmp(list->v[i], path, plen) == 0 &&
+                    (list->v[i][plen] == '/' || list->v[i][plen] == '\0');
+            } else {
+                match = strcmp(list->v[i], path) == 0;
+            }
+        }
+        if (match) {
+            free(list->v[i]);
+            for (int j = i + 1; j < list->len; j++)
+                list->v[j - 1] = list->v[j];
+            list->len--;
+            if (list->len >= 0) list->v[list->len] = NULL;
+            removed = true;
+            /* Stay at index i to check the shifted-down entry. */
+            continue;
+        } 
+        i++;
     }
-    return false;
+    return removed;
 }
 
 static void agent_path_list_free(agent_path_list *list) {
@@ -6714,6 +6730,10 @@ static bool agent_edit_find_old_span(const char *data, size_t len,
 #ifdef DS4_AGENT_TEST
 static int agent_test_failures;
 
+static bool agent_worker_remove_workspace(agent_worker *w, const char *path,
+                                          char *removed, size_t removed_len,
+                                          char *err, size_t err_len);
+
 static void agent_test_assert(bool cond, const char *expr,
                               const char *file, int line) {
     if (cond) return;
@@ -6932,11 +6952,111 @@ static void test_agent_default_working_directory_from_launch_cwd(void) {
              "%s", cwd);
     char err[256] = {0};
     AGENT_TEST_ASSERT(agent_config_resolve_working_directory(&cfg, err,
-                                                             sizeof(err)));
+                                                              sizeof(err)));
     AGENT_TEST_ASSERT(cfg.working_directories.len == 1);
     AGENT_TEST_ASSERT(!strcmp(cfg.working_directories.v[0], cwd));
 
     agent_path_list_free(&cfg.working_directories);
+}
+
+static void test_agent_path_list_remove_prefix(void) {
+    agent_path_list list = {0};
+    agent_path_list_append(&list, "/root/a.txt");
+    agent_path_list_append(&list, "/root/sub/b.txt");
+    agent_path_list_append(&list, "/other.txt");
+    agent_path_list_append(&list, "/root");
+    AGENT_TEST_ASSERT(list.len == 4);
+
+    /* Remove all entries with prefix "/root" (including "/root" itself). */
+    bool ok = agent_path_list_remove(&list, "/root", true);
+    AGENT_TEST_ASSERT(ok);
+    AGENT_TEST_ASSERT(list.len == 1);
+    AGENT_TEST_ASSERT(!strcmp(list.v[0], "/other.txt"));
+
+    /* Exact removal still works. */
+    ok = agent_path_list_remove(&list, "/other.txt", false);
+    AGENT_TEST_ASSERT(ok);
+    AGENT_TEST_ASSERT(list.len == 0);
+
+    agent_path_list_free(&list);
+}
+
+static void test_agent_remove_workspace_clears_auto_allowed(void) {
+    char root1_tmpl[] = "/tmp/ds4_agent_test_auto1_XXXXXX";
+    char root2_tmpl[] = "/tmp/ds4_agent_test_auto2_XXXXXX";
+    char *root1_tmp = mkdtemp(root1_tmpl);
+    char *root2_tmp = mkdtemp(root2_tmpl);
+    AGENT_TEST_ASSERT(root1_tmp != NULL);
+    AGENT_TEST_ASSERT(root2_tmp != NULL);
+    if (!root1_tmp || !root2_tmp) return;
+
+    char root1[PATH_MAX], root2[PATH_MAX];
+    AGENT_TEST_ASSERT(realpath(root1_tmp, root1) != NULL);
+    AGENT_TEST_ASSERT(realpath(root2_tmp, root2) != NULL);
+
+    agent_config cfg = {.non_interactive = true};
+    agent_worker w = {.cfg = &cfg};
+    agent_path_list_append(&w.working_directories, root1);
+    agent_path_list_append(&w.working_directories, root2);
+    AGENT_TEST_ASSERT(w.working_directories.len == 2);
+
+    /* Add auto-allowed paths under root1. */
+    char path1[PATH_MAX], path2[PATH_MAX];
+    snprintf(path1, sizeof(path1), "%s/a.txt", root1);
+    snprintf(path2, sizeof(path2), "%s/sub/b.txt", root1);
+    agent_path_list_append(&w.auto_allowed_paths, path1);
+    agent_path_list_append(&w.auto_allowed_paths, path2);
+    AGENT_TEST_ASSERT(w.auto_allowed_paths.len == 2);
+
+    /* Remove root1 — auto-allowed paths under it must be cleared. */
+    char err[256] = {0};
+    char removed[PATH_MAX] = {0};
+    bool ok = agent_worker_remove_workspace(&w, root1, removed, sizeof(removed),
+                                            err, sizeof(err));
+    AGENT_TEST_ASSERT(ok);
+    AGENT_TEST_ASSERT(w.working_directories.len == 1);
+    AGENT_TEST_ASSERT(w.auto_allowed_paths.len == 0);
+    AGENT_TEST_ASSERT(!strcmp(w.working_directories.v[0], root2));
+
+    /* Clean up. */
+    agent_path_list_free(&w.working_directories);
+    agent_path_list_free(&w.auto_allowed_paths);
+    rmdir(root1_tmp);
+    rmdir(root2_tmp);
+}
+
+static void test_agent_remove_auto_allowed_path_directly(void) {
+    char root_tmpl[] = "/tmp/ds4_agent_test_auto2_XXXXXX";
+    char *root_tmp = mkdtemp(root_tmpl);
+    AGENT_TEST_ASSERT(root_tmp != NULL);
+    if (!root_tmp) return;
+
+    char root[PATH_MAX];
+    AGENT_TEST_ASSERT(realpath(root_tmp, root) != NULL);
+
+    agent_config cfg = {.non_interactive = true};
+    agent_worker w = {.cfg = &cfg};
+    agent_path_list_append(&w.working_directories, root);
+
+    /* Add an auto-allowed path that is not a workspace root. */
+    char ap[PATH_MAX];
+    snprintf(ap, sizeof(ap), "%s/x.txt", root);
+    agent_path_list_append(&w.auto_allowed_paths, ap);
+    AGENT_TEST_ASSERT(w.auto_allowed_paths.len == 1);
+
+    /* Remove it via /workspace -<path> — it is not in working_directories,
+     * so the function falls back to auto_allowed_paths. */
+    char err[256] = {0};
+    char removed[PATH_MAX] = {0};
+    bool ok = agent_worker_remove_workspace(&w, ap, removed, sizeof(removed),
+                                            err, sizeof(err));
+    AGENT_TEST_ASSERT(ok);
+    AGENT_TEST_ASSERT(w.auto_allowed_paths.len == 0);
+    AGENT_TEST_ASSERT(w.working_directories.len == 1); /* root still there */
+
+    agent_path_list_free(&w.working_directories);
+    agent_path_list_free(&w.auto_allowed_paths);
+    rmdir(root_tmp);
 }
 
 static void ds4_agent_unit_tests_run(void) {
@@ -6945,6 +7065,9 @@ static void ds4_agent_unit_tests_run(void) {
     test_agent_working_directory_path_resolution();
     test_agent_working_directory_file_tools();
     test_agent_default_working_directory_from_launch_cwd();
+    test_agent_path_list_remove_prefix();
+    test_agent_remove_workspace_clears_auto_allowed();
+    test_agent_remove_auto_allowed_path_directly();
 }
 #endif
 
@@ -9305,15 +9428,23 @@ static bool worker_is_initialized(agent_worker *w, agent_status *status) {
 
 static void agent_worker_print_workspaces(agent_worker *w) {
     pthread_mutex_lock(&w->mu);
-    if (w->working_directories.len == 0) {
+    if (w->working_directories.len == 0 && w->auto_allowed_paths.len == 0) {
         pthread_mutex_unlock(&w->mu);
-        printf("no working directories configured\n");
+        printf("no working directories or auto-allowed paths configured\n");
         return;
     }
-    printf("working directories:\n");
-    for (int i = 0; i < w->working_directories.len; i++) {
-        printf("%c %d. %s\n", i == 0 ? '*' : ' ', i + 1,
-               w->working_directories.v[i]);
+    if (w->working_directories.len > 0) {
+        printf("working directories:\n");
+        for (int i = 0; i < w->working_directories.len; i++) {
+            printf("%c %d. %s\n", i == 0 ? '*' : ' ', i + 1,
+                   w->working_directories.v[i]);
+        }
+    }
+    if (w->auto_allowed_paths.len > 0) {
+        printf("auto-allowed paths (bypass workspace checks):\n");
+        for (int i = 0; i < w->auto_allowed_paths.len; i++) {
+            printf("  %d. %s\n", i + 1, w->auto_allowed_paths.v[i]);
+        }
     }
     pthread_mutex_unlock(&w->mu);
 }
@@ -9341,27 +9472,44 @@ static bool agent_worker_remove_workspace(agent_worker *w, const char *path,
                                           char *removed, size_t removed_len,
                                           char *err, size_t err_len) {
     char resolved[PATH_MAX];
-    if (!agent_resolve_working_directory_arg(path, resolved, err, err_len))
-        return false;
+    bool can_resolve = agent_resolve_working_directory_arg(path, resolved,
+                                                          err, err_len);
     pthread_mutex_lock(&w->mu);
     bool ok = false;
-    /* Never remove the last workspace — doing so disables jail enforcement
-     * and bash sandboxing. */
-    if (w->working_directories.len == 1 &&
-        agent_path_list_contains(&w->working_directories, resolved)) {
-        snprintf(err, err_len, "cannot remove last workspace: %s", resolved);
+    if (can_resolve) {
+        /* Never remove the last workspace — doing so disables jail enforcement
+         * and bash sandboxing. */
+        if (w->working_directories.len == 1 &&
+            agent_path_list_contains(&w->working_directories, resolved)) {
+            snprintf(err, err_len, "cannot remove last workspace: %s", resolved);
+        } else {
+            ok = agent_path_list_remove(&w->working_directories, resolved, false);
+            if (ok) {
+                if (removed) snprintf(removed, removed_len, "%s", resolved);
+                /* Remove any auto-allowed paths that fall under this workspace. */
+                agent_path_list_remove(&w->auto_allowed_paths, resolved, true);
+                worker_update_status_workspace_locked(w);
+                agent_wake_locked(w);
+            } else {
+                /* Not a workspace root; try auto-allowed paths instead. */
+                ok = agent_path_list_remove(&w->auto_allowed_paths, resolved, false);
+                if (ok) {
+                    if (removed) snprintf(removed, removed_len, "%s", resolved);
+                }
+            }
+        }
     } else {
-        ok = agent_path_list_remove(&w->working_directories, resolved);
+        /* Path is not a directory (e.g. a file in auto_allowed_paths).
+         * Try removing it from auto_allowed_paths using the raw path. */
+        ok = agent_path_list_remove(&w->auto_allowed_paths, path, false);
         if (ok) {
-            if (removed) snprintf(removed, removed_len, "%s", resolved);
-            worker_update_status_workspace_locked(w);
-            agent_wake_locked(w);
+            if (removed) snprintf(removed, removed_len, "%s", path);
         }
     }
     pthread_mutex_unlock(&w->mu);
     if (!ok) {
         if (!err[0])
-            snprintf(err, err_len, "workspace not configured: %s", resolved);
+            snprintf(err, err_len, "not configured: %s", path);
     }
     return ok;
 }
