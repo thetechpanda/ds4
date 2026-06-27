@@ -528,6 +528,7 @@ static bool agent_slash_command_known(const char *cmd) {
            !strcmp(cmd, "/save") ||
            !strcmp(cmd, "/compact") ||
            !strcmp(cmd, "/list") ||
+           !strcmp(cmd, "/docker help") ||
            agent_slash_command_with_args(cmd, "/docker create") ||
            agent_slash_command_with_args(cmd, "/docker describe") ||
            agent_slash_command_with_args(cmd, "/docker destroy") ||
@@ -10807,12 +10808,9 @@ static void editor_cancel_input_with_hint(agent_editor *ed,
     editor_write_async(ed, msg, strlen(msg), prompt, status, true);
 }
 
-static void runtime_help(void) {
-    puts("Commands:");
-    puts("  /help        Show this help.");
-    puts("  /save        Save the current session.");
-    puts("  /compact     Compact the current session context now.");
-    puts("  /list        List saved sessions.");
+static void runtime_docker_help_body(void) {
+    puts("  /docker help");
+    puts("               Show Docker sandbox commands.");
     puts("  /docker create IMAGE NAME [COMMAND]");
     puts("               Create a tagged Docker sandbox and switch to it.");
     puts("               Defaults to `sleep infinity` when COMMAND is omitted.");
@@ -10825,6 +10823,15 @@ static void runtime_help(void) {
     puts("  /docker stop [NAME]");
     puts("               Stop one tagged Docker sandbox or all agent sandboxes.");
     puts("  /docker list List Docker containers tagged ds4:sandbox.");
+}
+
+static void runtime_help(void) {
+    puts("Commands:");
+    puts("  /help        Show this help.");
+    puts("  /save        Save the current session.");
+    puts("  /compact     Compact the current session context now.");
+    puts("  /list        List saved sessions.");
+    runtime_docker_help_body();
     puts("  /switch SHA  Load a saved session and show recent history.");
     puts("  /del SHA     Delete a saved session.");
     puts("  /strip SHA   Strip KV payload; /switch rebuilds it by prefill.");
@@ -10838,6 +10845,11 @@ static void runtime_help(void) {
     puts("  Ctrl+X       Edit the first queued prompt.");
     puts("  ESC          Interrupt and send queued prompt immediately.");
     puts("  Ctrl+D       Exit from an empty prompt.");
+}
+
+static void runtime_docker_help(void) {
+    puts("Commands:");
+    runtime_docker_help_body();
 }
 
 static void agent_format_ctx_size(int ctx_size, char *buf, size_t len) {
@@ -12381,6 +12393,8 @@ static int run_agent(ds4_engine *engine, agent_config *cfg) {
                         printf("compaction scheduled at next safe point\n");
                 } else if (!strcmp(cmd, "/list")) {
                     agent_worker_list_sessions(&worker);
+                } else if (!strcmp(cmd, "/docker help")) {
+                    runtime_docker_help();
                 } else if (!strcmp(cmd, "/docker list")) {
                     agent_command_docker_list(&worker);
                 } else if (!strncmp(cmd, "/docker create", 14) &&
