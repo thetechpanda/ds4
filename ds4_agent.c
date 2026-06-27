@@ -114,6 +114,9 @@ typedef struct {
     char error[256];
     char workspace[PATH_MAX];
     char docker_container[256];
+    char writable_workspace_paths[2048];
+    char writable_temp_paths[1024];
+    char writable_auto_paths[2048];
 } agent_status;
 
 typedef struct agent_bash_job agent_bash_job;
@@ -9565,6 +9568,34 @@ static void worker_update_status_docker_locked(agent_worker *w) {
              sizeof(w->status.docker_container), "%s", name);
 }
 
+static void worker_update_status_writable_locked(agent_worker *w) {
+    agent_buf workspace = {0};
+    agent_buf auto_allowed = {0};
+    if (w->working_directories.len > 0) {
+        for (int i = 0; i < w->working_directories.len; i++) {
+            if (i) agent_buf_puts(&workspace, ", ");
+            agent_buf_puts(&workspace, w->working_directories.v[i]);
+        }
+    }
+    if (w->auto_allowed_paths.len > 0) {
+        for (int i = 0; i < w->auto_allowed_paths.len; i++) {
+            if (i) agent_buf_puts(&auto_allowed, ", ");
+            agent_buf_puts(&auto_allowed, w->auto_allowed_paths.v[i]);
+        }
+    }
+    snprintf(w->status.writable_workspace_paths,
+             sizeof(w->status.writable_workspace_paths), "%s",
+             workspace.ptr ? workspace.ptr : "");
+    snprintf(w->status.writable_temp_paths,
+             sizeof(w->status.writable_temp_paths), "%s",
+             (w->cfg && w->cfg->temp_directory[0]) ? w->cfg->temp_directory : "");
+    snprintf(w->status.writable_auto_paths,
+             sizeof(w->status.writable_auto_paths), "%s",
+             auto_allowed.ptr ? auto_allowed.ptr : "");
+    free(workspace.ptr);
+    free(auto_allowed.ptr);
+}
+
 /* Request interruption at the next model/tool polling point. */
 static void worker_interrupt(agent_worker *w) {
     pthread_mutex_lock(&w->mu);
@@ -9607,6 +9638,7 @@ static void worker_consume(agent_worker *w, char **out, size_t *out_len, agent_s
     w->status.power_percent = worker_status_power_locked(w);
     worker_update_status_workspace_locked(w);
     worker_update_status_docker_locked(w);
+    worker_update_status_writable_locked(w);
     if (status) *status = w->status;
     w->wake_pending = false;
     pthread_mutex_unlock(&w->mu);
@@ -9619,6 +9651,7 @@ static void worker_get_status(agent_worker *w, agent_status *status) {
     w->status.power_percent = worker_status_power_locked(w);
     worker_update_status_workspace_locked(w);
     worker_update_status_docker_locked(w);
+    worker_update_status_writable_locked(w);
     *status = w->status;
     pthread_mutex_unlock(&w->mu);
 }
@@ -9638,6 +9671,8 @@ static bool worker_is_initialized(agent_worker *w, agent_status *status) {
     w->status.ctx_size = w->cfg->gen.ctx_size;
     w->status.power_percent = worker_status_power_locked(w);
     worker_update_status_workspace_locked(w);
+    worker_update_status_docker_locked(w);
+    worker_update_status_writable_locked(w);
     if (status) *status = w->status;
     bool initialized = w->initialized;
     pthread_mutex_unlock(&w->mu);
@@ -9777,12 +9812,8 @@ static void agent_progress_append(char *buf, size_t len, size_t *pos,
 }
 
 static void build_prompt_text(const agent_status *st, char *buf, size_t len) {
-    const char *workspace = st && st->workspace[0] ? st->workspace : NULL;
-    if (!workspace) {
-        snprintf(buf, len, "ds4-agent> ");
-        return;
-    }
-    snprintf(buf, len, "ds4-agent %s> ", workspace);
+    (void)st;
+    snprintf(buf, len, "#> ");
 }
 
 static void agent_progress_bar(int done, int total, double tps,
@@ -9968,8 +9999,119 @@ static void agent_prompt_queue_free(agent_prompt_queue *q) {
     memset(q, 0, sizeof(*q));
 }
 
-static bool agent_footer_is_multiline(const char *status) {
-    return status && strchr(status, '\n');
+
+static void build_writable_footer_suffix(const agent_status *st, int cols,
+                                         size_t status_len, char *buf,
+                                         size_t len) {
+    const char *prefix = " | ";
+    const char *workspace_style = "\x1b[38;5;114m";
+    const char *temp_style = "\x1b[38;5;245m";
+    const char *auto_style = "\x1b[38;5;213m";
+    size_t prefix_len = strlen(prefix);
+    const char *workspace = st ? st->writable_workspace_paths : "";
+    const char *temp = st ? st->writable_temp_paths : "";
+    const char *auto_allowed = st ? st->writable_auto_paths : "";
+    if (!workspace[0] && !temp[0] && !auto_allowed[0]) {
+        buf[0] = '\0';
+        return;
+    }
+
+    if (cols < 40) cols = 40;
+    size_t budget = (size_t)cols;
+    if (status_len + prefix_len >= budget) {
+        buf[0] = '\0';
+        return;
+    }
+    budget -= status_len + prefix_len;
+    bool color = stdout_is_tty();
+    agent_buf plain = {0};
+    agent_buf styled = {0};
+    bool first = true;
+
+    if (workspace[0]) {
+        if (!first) {
+            agent_buf_puts(&plain, ", ");
+            if (color) agent_buf_puts(&styled, ", ");
+        }
+        agent_buf_puts(&plain, workspace);
+        if (color) {
+            agent_buf_puts(&styled, workspace_style);
+            agent_buf_puts(&styled, workspace);
+            agent_buf_puts(&styled, AGENT_STATUS_STYLE_START);
+        }
+        first = false;
+    }
+    if (temp[0]) {
+        if (!first) {
+            agent_buf_puts(&plain, ", ");
+            if (color) agent_buf_puts(&styled, ", ");
+        }
+        agent_buf_puts(&plain, temp);
+        if (color) {
+            agent_buf_puts(&styled, temp_style);
+            agent_buf_puts(&styled, temp);
+            agent_buf_puts(&styled, AGENT_STATUS_STYLE_START);
+        }
+        first = false;
+    }
+    if (auto_allowed[0]) {
+        if (!first) {
+            agent_buf_puts(&plain, ", ");
+            if (color) agent_buf_puts(&styled, ", ");
+        }
+        agent_buf_puts(&plain, auto_allowed);
+        if (color) {
+            agent_buf_puts(&styled, auto_style);
+            agent_buf_puts(&styled, auto_allowed);
+            agent_buf_puts(&styled, AGENT_STATUS_STYLE_START);
+        }
+    }
+
+    size_t visible_len = plain.ptr ? strlen(plain.ptr) : 0;
+    bool truncate = visible_len > budget;
+    if (!color) {
+        size_t keep = truncate ? (budget > 4 ? budget - 4 : 1) : visible_len;
+        snprintf(buf, len, "%s%.*s%s", prefix, (int)keep,
+                 plain.ptr ? plain.ptr : "", truncate ? " ..." : "");
+    } else if (!truncate) {
+        snprintf(buf, len, "%s%s", prefix, styled.ptr ? styled.ptr : "");
+    } else {
+        size_t used = 0;
+        size_t pos = 0;
+        int written = snprintf(buf, len, "%s", prefix);
+        if (written < 0) written = 0;
+        if ((size_t)written >= len) written = (int)(len ? len - 1 : 0);
+        used = (size_t)written;
+        if (used >= len) used = len ? len - 1 : 0;
+        const char *src = styled.ptr ? styled.ptr : "";
+        const char *reset = AGENT_STATUS_STYLE_START;
+        while (src[pos] && used + 1 < len && budget > 0) {
+            if ((unsigned char)src[pos] == 0x1b) {
+                size_t esc = pos + 1;
+                while (src[esc] && src[esc] != 'm') esc++;
+                if (src[esc] == 'm') esc++;
+                size_t esc_len = esc - pos;
+                if (used + esc_len >= len) break;
+                memcpy(buf + used, src + pos, esc_len);
+                used += esc_len;
+                pos = esc;
+                continue;
+            }
+            buf[used++] = src[pos++];
+            budget--;
+        }
+        if (used + 4 < len) {
+            memcpy(buf + used, " ...", 4);
+            used += 4;
+        }
+        if (used + strlen(reset) < len) {
+            memcpy(buf + used, reset, strlen(reset));
+            used += strlen(reset);
+        }
+        buf[used] = '\0';
+    }
+    free(plain.ptr);
+    free(styled.ptr);
 }
 
 /* Build the editable footer.  With queued prompts, the footer becomes multiple
@@ -9977,9 +10119,14 @@ static bool agent_footer_is_multiline(const char *status) {
 static void build_footer_text(const agent_status *st, const agent_prompt_queue *queue,
                               int cols, char *buf, size_t len) {
     char status[512];
+    char writable[1024];
+    char footer[1536];
+    bool color = stdout_is_tty();
     build_status_text(st, status, sizeof(status));
+    build_writable_footer_suffix(st, cols, strlen(status), writable, sizeof(writable));
+    snprintf(footer, sizeof(footer), "%s%s", status, writable);
     if (!queue || !queue->len) {
-        snprintf(buf, len, "%s", status);
+        snprintf(buf, len, "%s", footer);
         return;
     }
 
@@ -10015,16 +10162,15 @@ static void build_footer_text(const agent_status *st, const agent_prompt_queue *
     size_t pos = 0, preview_len = strlen(preview);
     for (int row = 0; row < max_rows && pos < preview_len; row++) {
         if (row) agent_buf_puts(&out, "\n");
-        if (stdout_is_tty()) agent_buf_puts(&out, AGENT_QUEUE_STYLE);
+        if (color) agent_buf_puts(&out, AGENT_QUEUE_STYLE);
         size_t part = preview_len - pos;
         if (part > (size_t)cols) part = (size_t)cols;
         agent_buf_append(&out, preview + pos, part);
-        if (stdout_is_tty()) agent_buf_puts(&out, "\x1b[0m");
+        if (color) agent_buf_puts(&out, "\x1b[0m");
         pos += part;
     }
     agent_buf_puts(&out, "\n");
-    if (stdout_is_tty()) agent_buf_puts(&out, AGENT_STATUS_STYLE_START);
-    agent_buf_puts(&out, status);
+    agent_buf_puts(&out, footer);
     snprintf(buf, len, "%s", out.ptr ? out.ptr : "");
     free(preview);
     free(out.ptr);
@@ -10585,8 +10731,7 @@ static int editor_start(agent_editor *ed, const char *prompt,
         free(input);
         return -1;
     }
-    bool embedded_status = agent_footer_is_multiline(ed->status);
-    const char *status_start = stdout_is_tty() && !embedded_status ?
+    const char *status_start = stdout_is_tty() && ed->status[0] ?
         AGENT_STATUS_STYLE_START : "";
     const char *status_end = stdout_is_tty() && ed->status[0] ?
         AGENT_STATUS_STYLE_END : "";
@@ -10693,8 +10838,7 @@ static void editor_update_prompt(agent_editor *ed, const char *prompt) {
 
 static void editor_update_status(agent_editor *ed, const char *status) {
     snprintf(ed->status, sizeof(ed->status), "%s", status ? status : "");
-    bool embedded_status = agent_footer_is_multiline(ed->status);
-    const char *status_start = stdout_is_tty() && !embedded_status ?
+    const char *status_start = stdout_is_tty() && ed->status[0] ?
         AGENT_STATUS_STYLE_START : "";
     const char *status_end = stdout_is_tty() && ed->status[0] ?
         AGENT_STATUS_STYLE_END : "";
