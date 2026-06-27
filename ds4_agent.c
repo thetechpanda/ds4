@@ -85,7 +85,6 @@ typedef struct {
     int web_cdp_port;
     const char *recover_session;
     bool non_interactive;
-    bool strict_sandbox;
 } agent_config;
 
 typedef enum {
@@ -624,7 +623,6 @@ static agent_config parse_options(int argc, char **argv) {
             .min_p = DS4_DEFAULT_MIN_P,
             .think_mode = DS4_THINK_HIGH,
         },
-        .strict_sandbox = true,
     };
     if (!getcwd(c.launch_working_directory, sizeof(c.launch_working_directory))) {
         fprintf(stderr, "ds4-agent: failed to get current working directory: %s\n",
@@ -663,8 +661,6 @@ static agent_config parse_options(int argc, char **argv) {
             c.gen.prompt = need_arg(&i, argc, argv, arg);
         } else if (!strcmp(arg, "--non-interactive")) {
             c.non_interactive = true;
-        } else if (!strcmp(arg, "--no-strict-sandbox")) {
-            c.strict_sandbox = false;
         } else if (!strcmp(arg, "-sys") || !strcmp(arg, "--system")) {
             c.gen.system = need_arg(&i, argc, argv, arg);
         } else if (!strcmp(arg, "--trace")) {
@@ -6774,11 +6770,6 @@ static int agent_test_failures;
 static bool agent_worker_remove_workspace(agent_worker *w, const char *path,
                                           char *removed, size_t removed_len,
                                           char *err, size_t err_len);
-#ifdef __APPLE__
-static char *agent_bash_sandbox_profile(const agent_path_list *roots,
-                                        const char *developer_dir,
-                                        const char *temp_dir);
-#endif
 
 static void agent_test_assert(bool cond, const char *expr,
                               const char *file, int line) {
@@ -7105,28 +7096,6 @@ static void test_agent_remove_auto_allowed_path_directly(void) {
     rmdir(root_tmp);
 }
 
-#ifdef __APPLE__
-static void test_agent_sandbox_profile_includes_path_dirs(void) {
-    const char *old_path = getenv("PATH");
-    char *saved_path = old_path ? xstrdup(old_path) : NULL;
-    setenv("PATH", "/tmp/ds4-agent-bin:relative:/opt/ds4-agent/bin::/usr/local/bin", 1);
-
-    char *profile = agent_bash_sandbox_profile(NULL, NULL, "/private/tmp");
-    AGENT_TEST_ASSERT(strstr(profile, "(subpath \"/tmp/ds4-agent-bin\")") != NULL);
-    AGENT_TEST_ASSERT(strstr(profile, "(subpath \"/opt/ds4-agent/bin\")") != NULL);
-    AGENT_TEST_ASSERT(strstr(profile, "(subpath \"/usr/local/bin\")") != NULL);
-    AGENT_TEST_ASSERT(strstr(profile, "(subpath \"relative\")") == NULL);
-    free(profile);
-
-    if (saved_path) {
-        setenv("PATH", saved_path, 1);
-        free(saved_path);
-    } else {
-        unsetenv("PATH");
-    }
-}
-#endif
-
 static void test_agent_command_in_path(void) {
     const char *old_path = getenv("PATH");
     char *saved_path = old_path ? xstrdup(old_path) : NULL;
@@ -7159,9 +7128,6 @@ static void ds4_agent_unit_tests_run(void) {
     test_agent_remove_auto_allowed_path_directly();
     test_agent_executable_exists();
     test_agent_command_in_path();
-#ifdef __APPLE__
-    test_agent_sandbox_profile_includes_path_dirs();
-#endif
 }
 #endif
 
@@ -7661,8 +7627,6 @@ struct agent_bash_job {
     int exit_status;
     bool running;
     bool timed_out;
-    bool sandboxed;
-    bool sandbox_fallback_used;
     struct agent_bash_job *next;
     agent_worker *worker;  /* back-pointer for terminal state restoration */
 };
@@ -7802,78 +7766,6 @@ static void agent_bash_poll(agent_bash_job *job) {
     }
 }
 
-#ifdef __APPLE__
-static bool agent_detect_apple_developer_dir(char out[PATH_MAX]) {
-    if (!out) return false;
-    out[0] = '\0';
-
-    const char *env = getenv("DEVELOPER_DIR");
-    if (env && env[0]) {
-        struct stat st;
-        if (stat(env, &st) == 0 && S_ISDIR(st.st_mode)) {
-            snprintf(out, PATH_MAX, "%s", env);
-            return true;
-        }
-    }
-
-    FILE *fp = popen("/usr/bin/xcode-select -p 2>/dev/null", "r");
-    if (fp) {
-        char buf[PATH_MAX];
-        if (fgets(buf, sizeof(buf), fp)) {
-            size_t n = strlen(buf);
-            while (n > 0 && (buf[n - 1] == '\n' || buf[n - 1] == '\r'))
-                buf[--n] = '\0';
-            if (buf[0]) {
-                struct stat st;
-                if (stat(buf, &st) == 0 && S_ISDIR(st.st_mode)) {
-                    snprintf(out, PATH_MAX, "%s", buf);
-                    pclose(fp);
-                    return true;
-                }
-            }
-        }
-        pclose(fp);
-    }
-
-    const char *fallback = "/Library/Developer/CommandLineTools";
-    struct stat st;
-    if (stat(fallback, &st) == 0 && S_ISDIR(st.st_mode)) {
-        snprintf(out, PATH_MAX, "%s", fallback);
-        return true;
-    }
-    return false;
-}
-
-static void agent_sbpl_quote(agent_buf *b, const char *s) {
-    agent_buf_append(b, "\"", 1);
-    for (const char *p = s ? s : ""; *p; p++) {
-        if (*p == '\\' || *p == '"') agent_buf_append(b, "\\", 1);
-        agent_buf_append(b, p, 1);
-    }
-    agent_buf_append(b, "\"", 1);
-}
-
-static void agent_sbpl_append_path_dirs(agent_buf *b) {
-    const char *path = getenv("PATH");
-    if (!path || !path[0]) return;
-    const char *p = path;
-    while (*p) {
-        const char *end = strchr(p, ':');
-        size_t n = end ? (size_t)(end - p) : strlen(p);
-        if (n > 0 && p[0] == '/') {
-            char dir[PATH_MAX];
-            if (n >= sizeof(dir)) n = sizeof(dir) - 1;
-            memcpy(dir, p, n);
-            dir[n] = '\0';
-            agent_buf_puts(b, "\n  (subpath ");
-            agent_sbpl_quote(b, dir);
-            agent_buf_puts(b, ")");
-        }
-        if (!end) break;
-        p = end + 1;
-    }
-}
-
 static bool agent_executable_exists(const char *path) {
     return path && path[0] && access(path, X_OK) == 0;
 }
@@ -7959,57 +7851,8 @@ static bool agent_read_docker_version(const char *docker_command,
     return nread > 0 && WIFEXITED(status) && WEXITSTATUS(status) == 0;
 }
 
-static char *agent_bash_sandbox_profile(const agent_path_list *roots,
-                                        const char *developer_dir,
-                                        const char *temp_dir) {
-    agent_buf b = {0};
-    agent_buf_puts(&b,
-        "(version 1)\n"
-        "(debug deny)\n"
-        "(allow process*)\n"
-        "(allow signal (target self))\n"
-        "(allow sysctl-read)\n"
-        "(allow file-read-metadata file-test-existence)\n"
-        "(allow file-read* file-map-executable\n"
-        "  (literal \"/\")\n"
-        "  (subpath \"/System\")\n"
-        "  (subpath \"/usr\")\n"
-        "  (subpath \"/bin\")\n"
-        "  (subpath \"/sbin\")\n"
-        "  (subpath \"/Library\")");
-    agent_sbpl_append_path_dirs(&b);
-    agent_buf_puts(&b, ")\n"
-        "(allow file-read* file-write* file-write-create file-test-existence file-ioctl\n"
-        "  (literal \"/tmp\")\n"
-        "  (literal \"/private/tmp\")\n"
-        "  (subpath \"/tmp\")\n"
-        "  (subpath \"/private/tmp\")\n"
-        "  (literal \"/dev/null\")\n"
-        "  (literal \"/dev/zero\")\n"
-        "  (literal \"/dev/random\")\n"
-        "  (literal \"/dev/urandom\")");
-    if (temp_dir && temp_dir[0]) {
-        agent_buf_puts(&b, "\n  (subpath ");
-        agent_sbpl_quote(&b, temp_dir);
-        agent_buf_puts(&b, ")");
-    }
-    if (developer_dir && developer_dir[0]) {
-        agent_buf_puts(&b, "\n  (subpath ");
-        agent_sbpl_quote(&b, developer_dir);
-        agent_buf_puts(&b, ")");
-    }
-    for (int i = 0; roots && i < roots->len; i++) {
-        agent_buf_puts(&b, "\n  (subpath ");
-        agent_sbpl_quote(&b, roots->v[i]);
-        agent_buf_puts(&b, ")");
-    }
-    agent_buf_puts(&b, ")\n");
-    return agent_buf_take(&b);
-}
-
-static void agent_bash_prepare_sandbox_env(const char *working_dir,
-                                           const char *developer_dir,
-                                           const char *temp_dir) {
+static void agent_bash_prepare_env(const char *working_dir,
+                                   const char *temp_dir) {
     if (!working_dir || !working_dir[0]) return;
 
     /* Keep command-local config inside the approved workspace so common
@@ -8030,20 +7873,85 @@ static void agent_bash_prepare_sandbox_env(const char *working_dir,
     setenv("GIT_CONFIG_NOSYSTEM", "1", 1);
     setenv("GIT_CONFIG_SYSTEM", "/dev/null", 1);
     setenv("GIT_CONFIG_GLOBAL", "/dev/null", 1);
-    if (developer_dir && developer_dir[0]) {
-        char git_exec_path[PATH_MAX];
-        setenv("DEVELOPER_DIR", developer_dir, 1);
-        snprintf(git_exec_path, sizeof(git_exec_path),
-                 "%s/usr/libexec/git-core", developer_dir);
-        setenv("GIT_EXEC_PATH", git_exec_path, 1);
-    }
 }
-#endif
+
+static bool agent_bash_use_docker_sandbox(const agent_worker *w) {
+    return w && w->cfg &&
+        w->cfg->docker_available &&
+        w->cfg->docker_container &&
+        w->cfg->docker_container[0];
+}
+
+static void agent_exec_command(const char *command, char *const argv[]) {
+    if (strchr(command, '/')) execv(command, argv);
+    else execvp(command, argv);
+}
+
+static void agent_bash_exec_local(const char *cmd, const char *working_dir,
+                                  const char *temp_dir) {
+    if (working_dir && chdir(working_dir) != 0) _exit(126);
+    agent_bash_prepare_env(working_dir, temp_dir);
+    execl("/bin/sh", "sh", "-c", cmd ? cmd : "", (char *)NULL);
+    _exit(127);
+}
+
+static void agent_bash_exec_docker(const agent_worker *w, const char *cmd,
+                                   const char *working_dir) {
+    const char *docker_command =
+        (w->cfg->docker_command && w->cfg->docker_command[0]) ?
+        w->cfg->docker_command : "docker";
+    const char *temp_dir =
+        (w->cfg->temp_directory[0]) ? w->cfg->temp_directory : working_dir;
+    char env_home[PATH_MAX + 16];
+    char env_tmpdir[PATH_MAX + 16];
+    char env_tmp[PATH_MAX + 16];
+    char env_temp[PATH_MAX + 16];
+    char env_xdg_config[PATH_MAX + 32];
+    char env_xdg_cache[PATH_MAX + 32];
+    char *argv[32];
+    int argc = 0;
+
+    snprintf(env_home, sizeof(env_home), "HOME=%s", working_dir ? working_dir : "");
+    snprintf(env_tmpdir, sizeof(env_tmpdir), "TMPDIR=%s", temp_dir ? temp_dir : "");
+    snprintf(env_tmp, sizeof(env_tmp), "TMP=%s", temp_dir ? temp_dir : "");
+    snprintf(env_temp, sizeof(env_temp), "TEMP=%s", temp_dir ? temp_dir : "");
+    snprintf(env_xdg_config, sizeof(env_xdg_config), "XDG_CONFIG_HOME=%s",
+             working_dir ? working_dir : "");
+    snprintf(env_xdg_cache, sizeof(env_xdg_cache), "XDG_CACHE_HOME=%s",
+             working_dir ? working_dir : "");
+
+    argv[argc++] = (char *)docker_command;
+    argv[argc++] = "exec";
+    argv[argc++] = "-i";
+    if (working_dir && working_dir[0]) {
+        argv[argc++] = "-w";
+        argv[argc++] = (char *)working_dir;
+    }
+    argv[argc++] = "-e"; argv[argc++] = env_home;
+    argv[argc++] = "-e"; argv[argc++] = env_tmpdir;
+    argv[argc++] = "-e"; argv[argc++] = env_tmp;
+    argv[argc++] = "-e"; argv[argc++] = env_temp;
+    argv[argc++] = "-e"; argv[argc++] = env_xdg_config;
+    argv[argc++] = "-e"; argv[argc++] = env_xdg_cache;
+    argv[argc++] = "-e"; argv[argc++] = "TERM=dumb";
+    argv[argc++] = "-e"; argv[argc++] = "PAGER=cat";
+    argv[argc++] = "-e"; argv[argc++] = "GIT_PAGER=cat";
+    argv[argc++] = "-e"; argv[argc++] = "GIT_CONFIG_NOSYSTEM=1";
+    argv[argc++] = "-e"; argv[argc++] = "GIT_CONFIG_SYSTEM=/dev/null";
+    argv[argc++] = "-e"; argv[argc++] = "GIT_CONFIG_GLOBAL=/dev/null";
+    argv[argc++] = (char *)w->cfg->docker_container;
+    argv[argc++] = "/bin/sh";
+    argv[argc++] = "-lc";
+    argv[argc++] = (char *)(cmd ? cmd : "");
+    argv[argc] = NULL;
+    agent_exec_command(docker_command, argv);
+    _exit(127);
+}
 
 /* Spawn a shell command into its own process group so bash_stop/timeout can
  * kill grandchildren created by the shell, not just the /bin/sh wrapper. */
 static agent_bash_job *agent_bash_start_mode(agent_worker *w, const char *cmd,
-                                             int timeout_sec, bool use_sandbox,
+                                             int timeout_sec, bool use_docker,
                                              char *err, size_t err_len) {
     char tmp_path[PATH_MAX];
     snprintf(tmp_path, sizeof(tmp_path), "%s/ds4_agent_output_XXXXXX",
@@ -8055,24 +7963,12 @@ static agent_bash_job *agent_bash_start_mode(agent_worker *w, const char *cmd,
     }
 
     const char *working_dir = agent_primary_working_directory(w);
-#ifdef __APPLE__
-    const agent_path_list *sandbox_roots = agent_working_directories(w);
-    char developer_dir[PATH_MAX] = {0};
-    if (!agent_detect_apple_developer_dir(developer_dir))
-        developer_dir[0] = '\0';
-    char *sandbox_profile = (use_sandbox && working_dir) ?
-        agent_bash_sandbox_profile(sandbox_roots, developer_dir,
-                                   w->cfg->temp_directory) : NULL;
-#endif
 
     int pipefd[2];
     if (pipe(pipefd) != 0) {
         snprintf(err, err_len, "failed to create pipe: %s", strerror(errno));
         close(tmpfd);
         unlink(tmp_path);
-#ifdef __APPLE__
-        if (sandbox_profile) free(sandbox_profile);
-#endif
         return NULL;
     }
     pid_t pid = fork();
@@ -8082,9 +7978,6 @@ static agent_bash_job *agent_bash_start_mode(agent_worker *w, const char *cmd,
         close(pipefd[1]);
         close(tmpfd);
         unlink(tmp_path);
-#ifdef __APPLE__
-        if (sandbox_profile) free(sandbox_profile);
-#endif
         return NULL;
     }
     if (pid == 0) {
@@ -8106,31 +7999,9 @@ static agent_bash_job *agent_bash_start_mode(agent_worker *w, const char *cmd,
         dup2(pipefd[1], STDOUT_FILENO);
         dup2(pipefd[1], STDERR_FILENO);
         close(pipefd[1]);
-        if (working_dir && chdir(working_dir) != 0) _exit(126);
-#ifdef __APPLE__
-        agent_bash_prepare_sandbox_env(working_dir, developer_dir,
-                                       w->cfg->temp_directory);
-        if (sandbox_profile) {
-            const char *path_env = getenv("PATH");
-            agent_buf path_define = {0};
-            agent_buf_puts(&path_define, "PATH=");
-            agent_buf_puts(&path_define, path_env ? path_env : "");
-            char *sandbox_path_define = agent_buf_take(&path_define);
-            execl("/usr/bin/sandbox-exec", "sandbox-exec", "-D",
-                  sandbox_path_define, "-p",
-                  sandbox_profile, "/bin/sh", "-c", cmd ? cmd : "",
-                  (char *)NULL);
-            free(sandbox_path_define);
-            _exit(127);
-        }
-#endif
-        execl("/bin/sh", "sh", "-c", cmd ? cmd : "", (char *)NULL);
-        _exit(127);
+        if (use_docker) agent_bash_exec_docker(w, cmd, working_dir);
+        agent_bash_exec_local(cmd, working_dir, w->cfg->temp_directory);
     }
-
-#ifdef __APPLE__
-    if (sandbox_profile) free(sandbox_profile);
-#endif
     close(pipefd[1]);
     setpgid(pid, pid);
     int old_flags;
@@ -8152,7 +8023,6 @@ static agent_bash_job *agent_bash_start_mode(agent_worker *w, const char *cmd,
     job->timeout_sec = timeout_sec;
     job->exit_status = -1;
     job->running = true;
-    job->sandboxed = use_sandbox;
     job->worker = w;
     job->next = w->bash_jobs;
     w->bash_jobs = job;
@@ -8161,11 +8031,9 @@ static agent_bash_job *agent_bash_start_mode(agent_worker *w, const char *cmd,
 
 static agent_bash_job *agent_bash_start(agent_worker *w, const char *cmd,
                                         int timeout_sec, char *err, size_t err_len) {
-#ifdef __APPLE__
-    return agent_bash_start_mode(w, cmd, timeout_sec, true, err, err_len);
-#else
-    return agent_bash_start_mode(w, cmd, timeout_sec, false, err, err_len);
-#endif
+    return agent_bash_start_mode(w, cmd, timeout_sec,
+                                 agent_bash_use_docker_sandbox(w),
+                                 err, err_len);
 }
 
 static void agent_tail_append(agent_buf *b, const char *s, size_t n, size_t max) {
@@ -8271,10 +8139,6 @@ static char *agent_bash_observation(agent_bash_job *job, bool mark_observed) {
         snprintf(line, sizeof(line), "exit_status=%d\n", job->exit_status);
         agent_buf_puts(&out, line);
     }
-    if (job->sandbox_fallback_used) {
-        agent_buf_puts(&out,
-            "note=filesystem sandbox failed to start cleanly; command was retried without it\n");
-    }
 
     if (job->bytes == 0) {
         agent_buf_puts(&out, "<output>\n</output>\n");
@@ -8335,20 +8199,6 @@ static char *agent_bash_observation(agent_bash_job *job, bool mark_observed) {
     }
     return agent_buf_take(&out);
 }
-
-#ifdef __APPLE__
-static bool agent_bash_should_retry_without_sandbox(const agent_bash_job *job) {
-    return job &&
-        job->sandboxed &&
-        !job->sandbox_fallback_used &&
-        !job->running &&
-        !job->timed_out &&
-        job->bytes == 0 &&
-        (job->exit_status == 134 ||
-         job->exit_status == 71 ||
-         job->exit_status == 127);
-}
-#endif
 
 static void agent_bash_publish_observation(agent_worker *w, const char *obs) {
     if (!obs || !obs[0]) return;
@@ -8448,35 +8298,6 @@ static char *agent_bash_job_tool_result(agent_worker *w, agent_bash_job *job,
     }
     if (wait || stop) agent_bash_refresh_for(w, job, refresh_sec);
     else agent_bash_poll(job);
-
-#ifdef __APPLE__
-    if (!stop && agent_bash_should_retry_without_sandbox(job)) {
-        if (w->cfg->strict_sandbox) {
-            agent_buf fail = {0};
-            agent_buf_puts(&fail,
-                "Tool error: bash filesystem sandbox failed and --strict-sandbox is enabled\n");
-            return agent_buf_take(&fail);
-        }
-        char retry_err[160] = {0};
-        char *retry_cmd = xstrdup(job->cmd ? job->cmd : "");
-        int retry_timeout = (int)job->timeout_sec;
-        agent_bash_remove_job(w, job);
-        job = agent_bash_start_mode(w, retry_cmd, retry_timeout, false,
-                                    retry_err, sizeof(retry_err));
-        free(retry_cmd);
-        if (!job) {
-            agent_buf fail = {0};
-            agent_buf_puts(&fail,
-                "Tool error: bash filesystem sandbox failed, and retry without sandbox failed: ");
-            agent_buf_puts(&fail, retry_err[0] ? retry_err : "unknown error");
-            agent_buf_puts(&fail, "\n");
-            return agent_buf_take(&fail);
-        }
-        job->sandbox_fallback_used = true;
-        if (wait) agent_bash_refresh_for(w, job, refresh_sec);
-        else agent_bash_poll(job);
-    }
-#endif
 
     char *obs = agent_bash_observation(job, true);
     agent_bash_publish_observation(w, obs);
