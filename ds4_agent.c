@@ -6736,6 +6736,11 @@ static int agent_test_failures;
 static bool agent_worker_remove_workspace(agent_worker *w, const char *path,
                                           char *removed, size_t removed_len,
                                           char *err, size_t err_len);
+#ifdef __APPLE__
+static char *agent_bash_sandbox_profile(const agent_path_list *roots,
+                                        const char *developer_dir,
+                                        const char *temp_dir);
+#endif
 
 static void agent_test_assert(bool cond, const char *expr,
                               const char *file, int line) {
@@ -7062,6 +7067,28 @@ static void test_agent_remove_auto_allowed_path_directly(void) {
     rmdir(root_tmp);
 }
 
+#ifdef __APPLE__
+static void test_agent_sandbox_profile_includes_path_dirs(void) {
+    const char *old_path = getenv("PATH");
+    char *saved_path = old_path ? xstrdup(old_path) : NULL;
+    setenv("PATH", "/tmp/ds4-agent-bin:relative:/opt/ds4-agent/bin::/usr/local/bin", 1);
+
+    char *profile = agent_bash_sandbox_profile(NULL, NULL, "/private/tmp");
+    AGENT_TEST_ASSERT(strstr(profile, "(subpath \"/tmp/ds4-agent-bin\")") != NULL);
+    AGENT_TEST_ASSERT(strstr(profile, "(subpath \"/opt/ds4-agent/bin\")") != NULL);
+    AGENT_TEST_ASSERT(strstr(profile, "(subpath \"/usr/local/bin\")") != NULL);
+    AGENT_TEST_ASSERT(strstr(profile, "(subpath \"relative\")") == NULL);
+    free(profile);
+
+    if (saved_path) {
+        setenv("PATH", saved_path, 1);
+        free(saved_path);
+    } else {
+        unsetenv("PATH");
+    }
+}
+#endif
+
 static void ds4_agent_unit_tests_run(void) {
     test_agent_edit_upto_tail_newline_is_not_part_of_anchor();
     test_agent_edit_upto_requires_tail_after_newline_strip();
@@ -7071,6 +7098,9 @@ static void ds4_agent_unit_tests_run(void) {
     test_agent_path_list_remove_prefix();
     test_agent_remove_workspace_clears_auto_allowed();
     test_agent_remove_auto_allowed_path_directly();
+#ifdef __APPLE__
+    test_agent_sandbox_profile_includes_path_dirs();
+#endif
 }
 #endif
 
@@ -7762,6 +7792,27 @@ static void agent_sbpl_quote(agent_buf *b, const char *s) {
     agent_buf_append(b, "\"", 1);
 }
 
+static void agent_sbpl_append_path_dirs(agent_buf *b) {
+    const char *path = getenv("PATH");
+    if (!path || !path[0]) return;
+    const char *p = path;
+    while (*p) {
+        const char *end = strchr(p, ':');
+        size_t n = end ? (size_t)(end - p) : strlen(p);
+        if (n > 0 && p[0] == '/') {
+            char dir[PATH_MAX];
+            if (n >= sizeof(dir)) n = sizeof(dir) - 1;
+            memcpy(dir, p, n);
+            dir[n] = '\0';
+            agent_buf_puts(b, "\n  (subpath ");
+            agent_sbpl_quote(b, dir);
+            agent_buf_puts(b, ")");
+        }
+        if (!end) break;
+        p = end + 1;
+    }
+}
+
 static char *agent_bash_sandbox_profile(const agent_path_list *roots,
                                         const char *developer_dir,
                                         const char *temp_dir) {
@@ -7774,20 +7825,25 @@ static char *agent_bash_sandbox_profile(const agent_path_list *roots,
         "(allow sysctl-read)\n"
         "(allow file-read-metadata file-test-existence)\n"
         "(allow file-read* file-map-executable\n"
+        "  (literal \"/\")\n"
         "  (subpath \"/System\")\n"
         "  (subpath \"/usr\")\n"
         "  (subpath \"/bin\")\n"
         "  (subpath \"/sbin\")\n"
-        "  (subpath \"/Library\"))\n"
-        "(allow file-read* file-write* file-test-existence file-ioctl\n"
+        "  (subpath \"/Library\")");
+    agent_sbpl_append_path_dirs(&b);
+    agent_buf_puts(&b, ")\n"
+        "(allow file-read* file-write* file-write-create file-test-existence file-ioctl\n"
         "  (literal \"/tmp\")\n"
         "  (literal \"/private/tmp\")\n"
+        "  (subpath \"/tmp\")\n"
+        "  (subpath \"/private/tmp\")\n"
         "  (literal \"/dev/null\")\n"
         "  (literal \"/dev/zero\")\n"
         "  (literal \"/dev/random\")\n"
         "  (literal \"/dev/urandom\")");
     if (temp_dir && temp_dir[0]) {
-        agent_buf_puts(&b, "\n  (literal ");
+        agent_buf_puts(&b, "\n  (subpath ");
         agent_sbpl_quote(&b, temp_dir);
         agent_buf_puts(&b, ")");
     }
@@ -7909,9 +7965,16 @@ static agent_bash_job *agent_bash_start_mode(agent_worker *w, const char *cmd,
         agent_bash_prepare_sandbox_env(working_dir, developer_dir,
                                        w->cfg->temp_directory);
         if (sandbox_profile) {
-            execl("/usr/bin/sandbox-exec", "sandbox-exec", "-p",
+            const char *path_env = getenv("PATH");
+            agent_buf path_define = {0};
+            agent_buf_puts(&path_define, "PATH=");
+            agent_buf_puts(&path_define, path_env ? path_env : "");
+            char *sandbox_path_define = agent_buf_take(&path_define);
+            execl("/usr/bin/sandbox-exec", "sandbox-exec", "-D",
+                  sandbox_path_define, "-p",
                   sandbox_profile, "/bin/sh", "-c", cmd ? cmd : "",
                   (char *)NULL);
+            free(sandbox_path_define);
             _exit(127);
         }
 #endif
