@@ -747,6 +747,8 @@ static agent_config parse_options(int argc, char **argv) {
         } else if (!strcmp(arg, "--dir-steering-attn")) {
             c.engine.directional_steering_attn = parse_float_range(need_arg(&i, argc, argv, arg), arg, -100.0f, 100.0f);
             steering_scale_set = true;
+        } else if (!strcmp(arg, "--recover")) {
+            c.recover_session = need_arg(&i, argc, argv, arg);
         } else {
             fprintf(stderr, "ds4-agent: unknown option: %s\n", arg);
             usage(stderr, NULL);
@@ -5625,11 +5627,12 @@ static bool agent_worker_recover_session(agent_worker *w, const char *prefix,
          * was restored and can use /switch or /list later. */
         {
             bool color = isatty(STDOUT_FILENO) != 0;
-            if (color) agent_publish(w, "\x1b[35m", 5);
-            agent_publishf(w, "recovered session %.8s (%d tokens%s)\n",
-                           sha, w->transcript.len,
-                           stripped ? ", rebuilt from text" : "");
-            if (color) agent_publish(w, "\x1b[0m", 4);
+            if (color) printf("\x1b[35m");
+            printf("recovered session %.8s (%d tokens%s)\n",
+                   sha, w->transcript.len,
+                   stripped ? ", rebuilt from text" : "");
+            if (color) printf("\x1b[0m");
+            fflush(stdout);
         }
     } else {
         ds4_tokens_free(&loaded);
