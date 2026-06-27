@@ -76,6 +76,7 @@ typedef struct {
     const char *docker_command;
     const char *docker_container;
     const char *docker_image;
+    bool docker_available;
     char launch_working_directory[PATH_MAX];
     agent_path_list working_directory_args;
     agent_path_list working_directories;
@@ -10990,6 +10991,20 @@ static bool agent_docker_list_sandbox_names(const char *docker_command,
     return agent_docker_capture(docker_command, argv, "docker list", out);
 }
 
+static bool agent_docker_feature_available_cfg(const agent_config *cfg) {
+    return cfg && cfg->docker_available;
+}
+
+static bool agent_docker_feature_available_worker(agent_worker *w) {
+    return w && w->cfg && agent_docker_feature_available_cfg(w->cfg);
+}
+
+static bool agent_docker_command_available(agent_worker *w, const char *op) {
+    if (agent_docker_feature_available_worker(w)) return true;
+    printf("%s failed: docker sandbox feature is not available\n", op);
+    return false;
+}
+
 static void agent_string_array_free(char **v, int count) {
     if (!v) return;
     for (int i = 0; i < count; i++) free(v[i]);
@@ -11090,6 +11105,8 @@ static bool agent_json_parse_string_array(const char *json,
 static bool agent_docker_refresh_mounts(agent_worker *w,
                                         char *err, size_t err_len) {
     if (!w || !w->cfg) return true;
+    if (!agent_docker_feature_available_cfg(w->cfg)) return true;
+    if (!w->cfg->docker_container || !w->cfg->docker_container[0]) return true;
     const char *docker_command =
         (w->cfg->docker_command && w->cfg->docker_command[0]) ?
         w->cfg->docker_command : "docker";
@@ -11262,6 +11279,7 @@ static bool agent_docker_refresh_mounts(agent_worker *w,
 }
 
 static void agent_command_docker_list(agent_worker *w) {
+    if (!agent_docker_command_available(w, "docker list")) return;
     const char *docker_command =
         (w && w->cfg && w->cfg->docker_command && w->cfg->docker_command[0]) ?
         w->cfg->docker_command : "docker";
@@ -11350,6 +11368,7 @@ static void agent_command_docker_create(agent_worker *w, char *args) {
         printf("docker create failed: worker configuration unavailable\n");
         return;
     }
+    if (!agent_docker_command_available(w, "docker create")) return;
 
     const char *docker_command =
         (w->cfg->docker_command && w->cfg->docker_command[0]) ?
@@ -11512,6 +11531,7 @@ static void agent_command_docker_use(agent_worker *w, char *args) {
         printf("docker use failed: worker configuration unavailable\n");
         return;
     }
+    if (!agent_docker_command_available(w, "docker use")) return;
 
     const char *docker_command =
         (w->cfg->docker_command && w->cfg->docker_command[0]) ?
@@ -11656,6 +11676,7 @@ static void agent_command_docker_describe(agent_worker *w, char *args) {
         printf("docker describe failed: worker configuration unavailable\n");
         return;
     }
+    if (!agent_docker_command_available(w, "docker describe")) return;
 
     const char *docker_command =
         (w->cfg->docker_command && w->cfg->docker_command[0]) ?
@@ -11731,6 +11752,7 @@ static void agent_command_docker_stop(agent_worker *w, char *args) {
         printf("docker stop failed: worker configuration unavailable\n");
         return;
     }
+    if (!agent_docker_command_available(w, "docker stop")) return;
 
     const char *docker_command =
         (w->cfg->docker_command && w->cfg->docker_command[0]) ?
@@ -11852,6 +11874,7 @@ static void agent_command_docker_destroy(agent_worker *w, char *args) {
         printf("docker destroy failed: worker configuration unavailable\n");
         return;
     }
+    if (!agent_docker_command_available(w, "docker destroy")) return;
 
     const char *docker_command =
         (w->cfg->docker_command && w->cfg->docker_command[0]) ?
@@ -12951,31 +12974,29 @@ static int run_agent(ds4_engine *engine, agent_config *cfg) {
 int main(int argc, char **argv) {
     agent_config cfg = parse_options(argc, argv);
     char docker_version[128] = {0};
-    if (cfg.docker_command && !agent_executable_exists(cfg.docker_command)) {
-        fprintf(stderr, "ds4-agent: --docker-command must point to an executable: %s\n",
-                cfg.docker_command);
-        return 1;
-    }
-    if (cfg.docker_build || cfg.docker_container || cfg.docker_image) {
-        const char *docker_command = cfg.docker_command ? cfg.docker_command : "docker";
-        if (!agent_command_in_path(docker_command)) {
-            fprintf(stderr, "ds4-agent: docker command not found: %s\n",
-                    docker_command);
-            return 1;
-        }
-        if (!agent_read_docker_version(docker_command, docker_version,
-                                       sizeof(docker_version))) {
-            fprintf(stderr, "ds4-agent: docker command failed: %s version\n",
-                    docker_command);
-            return 1;
-        }
-        bool color = isatty(STDOUT_FILENO) != 0;
+    const char *docker_command = cfg.docker_command ? cfg.docker_command : "docker";
+    cfg.docker_available = false;
+    bool color = isatty(STDOUT_FILENO) != 0;
+
+    if ((agent_command_in_path(docker_command) || 
+        agent_executable_exists(docker_command)) &&
+        agent_read_docker_version(docker_command, docker_version,
+                                  sizeof(docker_version))) {
+        cfg.docker_available = true;
         fprintf(stdout, "ds4-agent: sandboxing via docker is available ");
         if (color) fprintf(stdout, "\x1b[38;5;81m");
         fprintf(stdout, "(docker %s)", docker_version);
         if (color) fprintf(stdout, "\x1b[0m");
         fputc('\n', stdout);
+    } else {
+        fprintf(stdout, "ds4-agent: docker sandbox feature is not available");
+        if (cfg.docker_command && !agent_executable_exists(cfg.docker_command))
+            fprintf(stdout, " (%s is not executable)", cfg.docker_command);
+        else
+            fprintf(stdout, " (%s unavailable)", docker_command);
+        fputc('\n', stdout);
     }
+    
     if (cfg.chdir_path && chdir(cfg.chdir_path) != 0) {
         fprintf(stderr, "ds4-agent: failed to chdir to %s: %s\n",
                 cfg.chdir_path, strerror(errno));
