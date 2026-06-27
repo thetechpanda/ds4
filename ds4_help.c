@@ -284,6 +284,7 @@ static void print_agent_specific(FILE *fp, const help_colors *c) {
     opt(fp, c, "--recover SHA", "Load a saved session by SHA prefix at startup.");
     opt(fp, c, "--chdir DIR", "Change working directory before loading runtime assets.");
     opt(fp, c, "--docker-build FILE", "Build a Docker image from this Dockerfile for bash tools.");
+    opt(fp, c, "--docker-command PATH", "Use this Docker executable instead of resolving docker from PATH.");
     opt(fp, c, "--docker-container NAME", "Run bash tools in an existing Docker container.");
     opt(fp, c, "--docker-image NAME", "Run bash tools in a Docker container created from this image.");
     opt(fp, c, "--workspace DIR", "Add a jailed workspace root. Repeatable; defaults to the launch directory.");

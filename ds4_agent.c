@@ -71,6 +71,7 @@ typedef struct {
     agent_generation_options gen;
     const char *chdir_path;
     const char *docker_build;
+    const char *docker_command;
     const char *docker_container;
     const char *docker_image;
     char launch_working_directory[PATH_MAX];
@@ -694,6 +695,8 @@ static agent_config parse_options(int argc, char **argv) {
             c.chdir_path = need_arg(&i, argc, argv, arg);
         } else if (!strcmp(arg, "--docker-build")) {
             c.docker_build = need_arg(&i, argc, argv, arg);
+        } else if (!strcmp(arg, "--docker-command")) {
+            c.docker_command = need_arg(&i, argc, argv, arg);
         } else if (!strcmp(arg, "--docker-container")) {
             c.docker_container = need_arg(&i, argc, argv, arg);
         } else if (!strcmp(arg, "--docker-image")) {
@@ -7126,6 +7129,11 @@ static void test_agent_command_in_path(void) {
     }
 }
 
+static void test_agent_executable_exists(void) {
+    AGENT_TEST_ASSERT(agent_executable_exists("/bin/sh"));
+    AGENT_TEST_ASSERT(!agent_executable_exists("/definitely/not/a/real/executable"));
+}
+
 static void ds4_agent_unit_tests_run(void) {
     test_agent_edit_upto_tail_newline_is_not_part_of_anchor();
     test_agent_edit_upto_requires_tail_after_newline_strip();
@@ -7135,6 +7143,7 @@ static void ds4_agent_unit_tests_run(void) {
     test_agent_path_list_remove_prefix();
     test_agent_remove_workspace_clears_auto_allowed();
     test_agent_remove_auto_allowed_path_directly();
+    test_agent_executable_exists();
     test_agent_command_in_path();
 #ifdef __APPLE__
     test_agent_sandbox_profile_includes_path_dirs();
@@ -7851,9 +7860,13 @@ static void agent_sbpl_append_path_dirs(agent_buf *b) {
     }
 }
 
+static bool agent_executable_exists(const char *path) {
+    return path && path[0] && access(path, X_OK) == 0;
+}
+
 static bool agent_command_in_path(const char *command) {
     if (!command || !command[0]) return false;
-    if (strchr(command, '/')) return access(command, X_OK) == 0;
+    if (strchr(command, '/')) return agent_executable_exists(command);
 
     const char *path = getenv("PATH");
     if (!path || !path[0]) return false;
@@ -7871,13 +7884,40 @@ static bool agent_command_in_path(const char *command) {
             int written = snprintf(candidate, sizeof(candidate), "%s/%s", dir,
                                    command);
             if (written > 0 && written < (int)sizeof(candidate) &&
-                access(candidate, X_OK) == 0)
+                agent_executable_exists(candidate))
                 return true;
         }
         if (!end) break;
         p = end + 1;
     }
     return false;
+}
+
+static bool agent_docker_version_works(const char *docker_command) {
+    if (!docker_command || !docker_command[0]) return false;
+
+    pid_t pid = fork();
+    if (pid < 0) return false;
+    if (pid == 0) {
+        int devnull = open("/dev/null", O_RDWR);
+        if (devnull >= 0) {
+            dup2(devnull, STDOUT_FILENO);
+            dup2(devnull, STDERR_FILENO);
+            close(devnull);
+        }
+        if (strchr(docker_command, '/')) {
+            execl(docker_command, docker_command, "version", (char *)NULL);
+        } else {
+            execlp(docker_command, docker_command, "version", (char *)NULL);
+        }
+        _exit(127);
+    }
+
+    int status = 0;
+    while (waitpid(pid, &status, 0) < 0) {
+        if (errno != EINTR) return false;
+    }
+    return WIFEXITED(status) && WEXITSTATUS(status) == 0;
 }
 
 static char *agent_bash_sandbox_profile(const agent_path_list *roots,
@@ -11746,12 +11786,24 @@ static int run_agent(ds4_engine *engine, agent_config *cfg) {
 #ifndef DS4_AGENT_TEST_NO_MAIN
 int main(int argc, char **argv) {
     agent_config cfg = parse_options(argc, argv);
-    if ((cfg.docker_build || cfg.docker_container || cfg.docker_image) &&
-        !agent_command_in_path("docker")) {
-        fprintf(stderr, "ds4-agent: docker command not found in PATH\n");
+    if (cfg.docker_command && !agent_executable_exists(cfg.docker_command)) {
+        fprintf(stderr, "ds4-agent: --docker-command must point to an executable: %s\n",
+                cfg.docker_command);
         return 1;
-    } else {
-        fprintf(stdout, "ds4-agent: docker command found in PATH\n");
+    }
+    if (cfg.docker_build || cfg.docker_container || cfg.docker_image) {
+        const char *docker_command = cfg.docker_command ? cfg.docker_command : "docker";
+        if (!agent_command_in_path(docker_command)) {
+            fprintf(stderr, "ds4-agent: docker command not found: %s\n",
+                    docker_command);
+            return 1;
+        }
+        if (!agent_docker_version_works(docker_command)) {
+            fprintf(stderr, "ds4-agent: docker command failed: %s version\n",
+                    docker_command);
+            return 1;
+        }
+        fprintf(stdout, "ds4-agent: sandboxing via docker is available\n");
     }
     if (cfg.chdir_path && chdir(cfg.chdir_path) != 0) {
         fprintf(stderr, "ds4-agent: failed to chdir to %s: %s\n",
