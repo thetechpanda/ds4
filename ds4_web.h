@@ -12,6 +12,8 @@ typedef bool (*ds4_web_cancel_fn)(void *privdata);
 typedef struct {
     const char *home_dir;
     int port;
+    const char *cdp_host;
+    int cdp_port;
     ds4_web_confirm_fn confirm;
     void *confirm_privdata;
     ds4_web_log_fn log;

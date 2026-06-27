@@ -74,6 +74,8 @@ typedef struct {
     agent_path_list working_directory_args;
     agent_path_list working_directories;
     char temp_directory[PATH_MAX];
+    char web_cdp_host[256];
+    int web_cdp_port;
     const char *recover_session;
     bool non_interactive;
     bool strict_sandbox;
@@ -693,6 +695,16 @@ static agent_config parse_options(int argc, char **argv) {
         } else if (!strcmp(arg, "--temp-directory")) {
             snprintf(c.temp_directory, sizeof(c.temp_directory), "%s",
                      need_arg(&i, argc, argv, arg));
+        } else if (!strcmp(arg, "--web-cdp-host")) {
+            snprintf(c.web_cdp_host, sizeof(c.web_cdp_host), "%s",
+                     need_arg(&i, argc, argv, arg));
+        } else if (!strcmp(arg, "--web-cdp-port")) {
+            int v = parse_int(need_arg(&i, argc, argv, arg), arg);
+            if (v <= 0 || v > 65535) {
+                fprintf(stderr, "ds4-agent: --web-cdp-port must be 1..65535\n");
+                exit(2);
+            }
+            c.web_cdp_port = v;
         } else if (!strcmp(arg, "--quality")) {
             c.engine.quality = true;
         } else if (!strcmp(arg, "--ssd-streaming")) {
@@ -10768,6 +10780,8 @@ static int agent_worker_init(agent_worker *w, ds4_engine *engine, agent_config *
     ds4_web_config web_cfg = {
         .home_dir = getenv("HOME"),
         .port = 9333,
+        .cdp_host = cfg->web_cdp_host[0] ? cfg->web_cdp_host : NULL,
+        .cdp_port = cfg->web_cdp_port,
         .confirm = agent_web_confirm,
         .confirm_privdata = w,
         .log = agent_web_log,

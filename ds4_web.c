@@ -1,4 +1,5 @@
 #include "ds4_web.h"
+#include "ds4_web_remote_cdp.h"
 
 #include <arpa/inet.h>
 #include <ctype.h>
@@ -41,6 +42,7 @@ struct ds4_web {
     char home[PATH_MAX];
     char profile_dir[PATH_MAX];
     int port;
+    ds4_web_cdp_endpoint cdp;
     pid_t chrome_pid;
     bool browser_allowed;
     ds4_web_confirm_fn confirm;
@@ -242,16 +244,18 @@ static ssize_t web_read_some(int fd, char *buf, size_t len, int timeout_ms) {
     }
 }
 
-static char *web_http_request(const char *method, int port, const char *path,
+static char *web_http_request(const char *method, const char *host, int port,
+                              const char *path,
                               char *err, size_t err_len) {
-    int fd = web_tcp_connect("127.0.0.1", port, DS4_WEB_CONNECT_TIMEOUT_MS,
+    if (!host || !host[0]) host = "127.0.0.1";
+    int fd = web_tcp_connect(host, port, DS4_WEB_CONNECT_TIMEOUT_MS,
                              err, err_len);
     if (fd < 0) return NULL;
     web_buf req = {0};
     char line[512];
     snprintf(line, sizeof(line),
-             "%s %s HTTP/1.1\r\nHost: 127.0.0.1:%d\r\nConnection: close\r\n\r\n",
-             method, path, port);
+             "%s %s HTTP/1.1\r\nHost: %s:%d\r\nConnection: close\r\n\r\n",
+             method, path, host, port);
     web_buf_puts(&req, line);
     if (web_write_all(fd, req.ptr, req.len) != 0) {
         web_set_err(err, err_len, "write HTTP request failed: %s", strerror(errno));
@@ -293,7 +297,10 @@ static char *web_http_request(const char *method, int port, const char *path,
 
 static bool web_cdp_alive(ds4_web *web) {
     char err[160] = {0};
-    char *body = web_http_request("GET", web->port, "/json/version", err, sizeof(err));
+    char *body = web_http_request("GET",
+                                  ds4_web_cdp_endpoint_host(&web->cdp),
+                                  ds4_web_cdp_endpoint_port(&web->cdp),
+                                  "/json/version", err, sizeof(err));
     if (!body) return false;
     bool ok = strstr(body, "webSocketDebuggerUrl") != NULL;
     free(body);
@@ -1109,6 +1116,12 @@ static bool web_ensure_browser(ds4_web *web, char *err, size_t err_len) {
         waitpid(web->chrome_pid, &status, WNOHANG);
         web->chrome_pid = 0;
     }
+    if (ds4_web_cdp_endpoint_remote(&web->cdp)) {
+        web_set_err(err, err_len, "remote CDP is not reachable at %s:%d",
+                    ds4_web_cdp_endpoint_host(&web->cdp),
+                    ds4_web_cdp_endpoint_port(&web->cdp));
+        return false;
+    }
     if (!web->browser_allowed) {
         if (!web->confirm) {
             web_set_err(err, err_len,
@@ -1136,12 +1149,20 @@ static void web_tab_free(web_tab *tab) {
 }
 
 static char *web_browser_ws_url(ds4_web *web, char *err, size_t err_len) {
-    char *body = web_http_request("GET", web->port, "/json/version", err, err_len);
+    char *body = web_http_request("GET",
+                                  ds4_web_cdp_endpoint_host(&web->cdp),
+                                  ds4_web_cdp_endpoint_port(&web->cdp),
+                                  "/json/version", err, err_len);
     if (!body) return NULL;
     char *ws = web_json_get_string(body, "webSocketDebuggerUrl");
     free(body);
-    if (!ws) web_set_err(err, err_len, "Chrome did not return a browser WebSocket URL");
-    return ws;
+    if (!ws) {
+        web_set_err(err, err_len, "Chrome did not return a browser WebSocket URL");
+        return NULL;
+    }
+    char *rewritten = ds4_web_cdp_rewrite_ws_url(&web->cdp, ws);
+    free(ws);
+    return rewritten;
 }
 
 static bool web_open_tab(ds4_web *web, const char *url, web_tab *tab,
@@ -1178,10 +1199,7 @@ static bool web_open_tab(ds4_web *web, const char *url, web_tab *tab,
         return false;
     }
 
-    char ws_url[PATH_MAX + 128];
-    snprintf(ws_url, sizeof(ws_url), "ws://127.0.0.1:%d/devtools/page/%s",
-             web->port, tab->id);
-    tab->ws_url = web_xstrdup(ws_url);
+    tab->ws_url = ds4_web_cdp_page_ws_url(&web->cdp, tab->id);
     return true;
 }
 
@@ -1195,7 +1213,10 @@ static void web_close_tab(ds4_web *web, const web_tab *tab) {
 
     char err[160] = {0};
     char *path_s = web_buf_take(&path);
-    char *body = web_http_request("GET", web->port, path_s, err, sizeof(err));
+    char *body = web_http_request("GET",
+                                  ds4_web_cdp_endpoint_host(&web->cdp),
+                                  ds4_web_cdp_endpoint_port(&web->cdp),
+                                  path_s, err, sizeof(err));
     free(path_s);
     if (body) {
         free(body);
@@ -1330,6 +1351,10 @@ ds4_web *ds4_web_create(const ds4_web_config *cfg) {
     snprintf(web->home, sizeof(web->home), "%s", home);
     snprintf(web->profile_dir, sizeof(web->profile_dir), "%s/.ds4/browser", home);
     web->port = cfg && cfg->port > 0 ? cfg->port : DS4_WEB_DEFAULT_PORT;
+    ds4_web_cdp_endpoint_init(&web->cdp,
+                              cfg ? cfg->cdp_host : NULL,
+                              cfg ? cfg->cdp_port : 0,
+                              web->port);
     web->chrome_pid = 0;
     web->next_cdp_id = 1;
     if (cfg) {
@@ -1362,7 +1387,7 @@ char *ds4_web_google_search(ds4_web *web, const char *query,
     }
     char *q = web_url_encode(query);
     web_buf url = {0};
-    web_buf_puts(&url, "https://www.google.com/search?q=");
+    web_buf_puts(&url, "https://www.duckduckgo.com/search?q=");
     web_buf_puts(&url, q);
     free(q);
     char *url_s = web_buf_take(&url);

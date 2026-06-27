@@ -285,6 +285,8 @@ static void print_agent_specific(FILE *fp, const help_colors *c) {
     opt(fp, c, "--chdir DIR", "Change working directory before loading runtime assets.");
     opt(fp, c, "--working-directory DIR", "Add a jailed workspace root. Repeatable; defaults to the launch directory.");
     opt(fp, c, "--temp-directory DIR", "Temporary file directory (default: /tmp).");
+    opt(fp, c, "--web-cdp-host HOST", "Use an existing Chrome DevTools Protocol host instead of starting Chrome.");
+    opt(fp, c, "--web-cdp-port N", "Use an existing Chrome DevTools Protocol port instead of starting Chrome.");
     fputc('\n', fp);
 }
 
