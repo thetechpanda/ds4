@@ -530,6 +530,7 @@ static bool agent_slash_command_known(const char *cmd) {
            !strcmp(cmd, "/list") ||
            agent_slash_command_with_args(cmd, "/docker create") ||
            agent_slash_command_with_args(cmd, "/docker describe") ||
+           agent_slash_command_with_args(cmd, "/docker destroy") ||
            agent_slash_command_with_args(cmd, "/docker stop") ||
            agent_slash_command_with_args(cmd, "/docker use") ||
            !strcmp(cmd, "/docker list") ||
@@ -10819,6 +10820,8 @@ static void runtime_help(void) {
     puts("               Show the current Docker sandbox or switch to NAME.");
     puts("  /docker describe NAME");
     puts("               Show detailed metadata for a tagged Docker sandbox.");
+    puts("  /docker destroy NAME");
+    puts("               Destroy a stopped, inactive Docker sandbox after confirmation.");
     puts("  /docker stop [NAME]");
     puts("               Stop one tagged Docker sandbox or all agent sandboxes.");
     puts("  /docker list List Docker containers tagged ds4:sandbox.");
@@ -11518,6 +11521,132 @@ static void agent_command_docker_stop(agent_worker *w, char *args) {
     }
     free(out.ptr);
     free(names.ptr);
+}
+
+static bool agent_prompt_yes_no_default_yes(const char *prompt) {
+    char buf[32];
+    for (;;) {
+        printf("%s", prompt);
+        fflush(stdout);
+        int saved_flags = fcntl(STDIN_FILENO, F_GETFL, 0);
+        if (saved_flags >= 0 && (saved_flags & O_NONBLOCK))
+            fcntl(STDIN_FILENO, F_SETFL, saved_flags & ~O_NONBLOCK);
+        bool got_line = fgets(buf, sizeof(buf), stdin) != NULL;
+        if (saved_flags >= 0 && (saved_flags & O_NONBLOCK))
+            fcntl(STDIN_FILENO, F_SETFL, saved_flags);
+        if (!got_line) return false;
+        char *p = buf;
+        while (*p == ' ' || *p == '\t') p++;
+        if (*p == '\n' || *p == '\0' || *p == 'y' || *p == 'Y') return true;
+        if (*p == 'n' || *p == 'N') return false;
+    }
+}
+
+static void agent_command_docker_destroy(agent_worker *w, char *args) {
+    if (!w || !w->cfg) {
+        printf("docker destroy failed: worker configuration unavailable\n");
+        return;
+    }
+
+    const char *docker_command =
+        (w->cfg->docker_command && w->cfg->docker_command[0]) ?
+        w->cfg->docker_command : "docker";
+    if (!agent_command_in_path(docker_command)) {
+        printf("docker destroy failed: docker command not found: %s\n",
+               docker_command);
+        return;
+    }
+
+    while (*args == ' ' || *args == '\t') args++;
+    if (!args[0]) {
+        printf("usage: /docker destroy <name>\n");
+        return;
+    }
+
+    char *name = args;
+    while (*args && *args != ' ' && *args != '\t') args++;
+    if (*args) *args = '\0';
+
+    agent_buf out = {0};
+    if (!agent_docker_inspect_sandbox(docker_command, name, &out)) {
+        printf("docker destroy failed: unable to inspect sandbox: %s\n", name);
+        return;
+    }
+
+    char *line = out.ptr ? out.ptr : "";
+    char *newline = strchr(line, '\n');
+    if (newline) *newline = '\0';
+    char *container_name = line;
+    if (container_name[0] == '/') container_name++;
+    char *labels_json = strchr(line, '\t');
+    if (!labels_json) goto malformed;
+    *labels_json++ = '\0';
+    char *image = strchr(labels_json, '\t');
+    if (!image) goto malformed;
+    *image++ = '\0';
+    char *state = strchr(image, '\t');
+    if (!state) goto malformed;
+    *state++ = '\0';
+    char *ip = strchr(state, '\t');
+    if (!ip) goto malformed;
+    *ip++ = '\0';
+
+    if (!strstr(labels_json, "\"ds4:sandbox\"")) {
+        printf("docker destroy failed: container is not tagged ds4:sandbox: %s\n",
+               name);
+        free(out.ptr);
+        return;
+    }
+    if (w->cfg->docker_container &&
+        !strcmp(w->cfg->docker_container, container_name)) {
+        printf("docker destroy failed: sandbox is currently in use: %s\n",
+               container_name);
+        free(out.ptr);
+        return;
+    }
+    if (strcmp(state, "exited") != 0 &&
+        strcmp(state, "created") != 0 &&
+        strcmp(state, "dead") != 0) {
+        printf("docker destroy failed: sandbox must be stopped first: %s (state=%s)\n",
+               container_name, state[0] ? state : "unknown");
+        free(out.ptr);
+        return;
+    }
+
+    char prompt[PATH_MAX + 64];
+    snprintf(prompt, sizeof(prompt), "Destroy docker sandbox %s? (Y/n) ",
+             container_name);
+    if (!agent_prompt_yes_no_default_yes(prompt)) {
+        printf("docker destroy cancelled\n");
+        free(out.ptr);
+        return;
+    }
+
+    char *argv[] = {
+        (char *)docker_command,
+        "rm",
+        container_name,
+        NULL,
+    };
+    agent_buf rm_out = {0};
+    if (!agent_docker_capture(docker_command, argv, "docker destroy", &rm_out)) {
+        printf("docker destroy failed: unable to remove sandbox: %s\n",
+               container_name);
+        free(out.ptr);
+        return;
+    }
+    if (rm_out.ptr && rm_out.ptr[0]) {
+        printf("%s", rm_out.ptr);
+        if (rm_out.ptr[rm_out.len - 1] != '\n') printf("\n");
+    }
+    printf("destroyed docker sandbox %s\n", container_name);
+    free(rm_out.ptr);
+    free(out.ptr);
+    return;
+
+malformed:
+    printf("docker destroy failed: malformed docker inspect output\n");
+    free(out.ptr);
 }
 
 /* Initialize the worker, cache directory, sysprompt checkpoint path, trace file,
@@ -12270,6 +12399,14 @@ static int run_agent(ds4_engine *engine, agent_config *cfg) {
                     } else {
                         char *arg = cmd + 16;
                         agent_command_docker_describe(&worker, arg);
+                    }
+                } else if (!strncmp(cmd, "/docker destroy", 15) &&
+                           (cmd[15] == '\0' || cmd[15] == ' ' || cmd[15] == '\t')) {
+                    if (busy) {
+                        printf("command requires the model to be idle: %s\n", cmd);
+                    } else {
+                        char *arg = cmd + 15;
+                        agent_command_docker_destroy(&worker, arg);
                     }
                 } else if (!strncmp(cmd, "/docker stop", 12) &&
                            (cmd[12] == '\0' || cmd[12] == ' ' || cmd[12] == '\t')) {
