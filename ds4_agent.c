@@ -530,6 +530,7 @@ static bool agent_slash_command_known(const char *cmd) {
            !strcmp(cmd, "/list") ||
            agent_slash_command_with_args(cmd, "/docker create") ||
            agent_slash_command_with_args(cmd, "/docker describe") ||
+           agent_slash_command_with_args(cmd, "/docker stop") ||
            agent_slash_command_with_args(cmd, "/docker use") ||
            !strcmp(cmd, "/docker list") ||
            !strcmp(cmd, "/quit") ||
@@ -10818,6 +10819,8 @@ static void runtime_help(void) {
     puts("               Show the current Docker sandbox or switch to NAME.");
     puts("  /docker describe NAME");
     puts("               Show detailed metadata for a tagged Docker sandbox.");
+    puts("  /docker stop [NAME]");
+    puts("               Stop one tagged Docker sandbox or all agent sandboxes.");
     puts("  /docker list List Docker containers tagged ds4:sandbox.");
     puts("  /switch SHA  Load a saved session and show recent history.");
     puts("  /del SHA     Delete a saved session.");
@@ -10945,10 +10948,8 @@ static bool agent_docker_inspect_sandbox(const char *docker_command,
     return agent_docker_capture(docker_command, argv, "docker inspect", out);
 }
 
-static void agent_command_docker_list(agent_worker *w) {
-    const char *docker_command =
-        (w && w->cfg && w->cfg->docker_command && w->cfg->docker_command[0]) ?
-        w->cfg->docker_command : "docker";
+static bool agent_docker_list_sandbox_names(const char *docker_command,
+                                            agent_buf *out) {
     char *argv[] = {
         (char *)docker_command,
         "ps", "-a",
@@ -10956,8 +10957,15 @@ static void agent_command_docker_list(agent_worker *w) {
         "--format", "{{.Names}}",
         NULL,
     };
+    return agent_docker_capture(docker_command, argv, "docker list", out);
+}
+
+static void agent_command_docker_list(agent_worker *w) {
+    const char *docker_command =
+        (w && w->cfg && w->cfg->docker_command && w->cfg->docker_command[0]) ?
+        w->cfg->docker_command : "docker";
     agent_buf out = {0};
-    if (!agent_docker_capture(docker_command, argv, "docker list", &out))
+    if (!agent_docker_list_sandbox_names(docker_command, &out))
         return;
 
     if (!out.len) {
@@ -11277,6 +11285,64 @@ static void agent_command_docker_use(agent_worker *w, char *args) {
         return;
     }
 
+    if (strcmp(state, "running") != 0) {
+        char *start_argv[] = {
+            (char *)docker_command,
+            "start",
+            name,
+            NULL,
+        };
+        agent_buf start_out = {0};
+        if (!agent_docker_capture(docker_command, start_argv, "docker start",
+                                  &start_out)) {
+            printf("docker use failed: unable to start sandbox: %s\n", name);
+            free(out.ptr);
+            return;
+        }
+        free(start_out.ptr);
+        free(out.ptr);
+        memset(&out, 0, sizeof(out));
+        if (!agent_docker_inspect_sandbox(docker_command, name, &out)) {
+            printf("docker use failed: unable to inspect restarted sandbox: %s\n",
+                   name);
+            return;
+        }
+
+        line = out.ptr ? out.ptr : "";
+        newline = strchr(line, '\n');
+        if (newline) *newline = '\0';
+        container_name = line;
+        if (container_name[0] == '/') container_name++;
+        labels_json = strchr(line, '\t');
+        if (!labels_json) {
+            printf("docker use failed: malformed docker inspect output\n");
+            free(out.ptr);
+            return;
+        }
+        *labels_json++ = '\0';
+        image = strchr(labels_json, '\t');
+        if (!image) {
+            printf("docker use failed: malformed docker inspect output\n");
+            free(out.ptr);
+            return;
+        }
+        *image++ = '\0';
+        state = strchr(image, '\t');
+        if (!state) {
+            printf("docker use failed: malformed docker inspect output\n");
+            free(out.ptr);
+            return;
+        }
+        *state++ = '\0';
+        ip = strchr(state, '\t');
+        if (!ip) {
+            printf("docker use failed: malformed docker inspect output\n");
+            free(out.ptr);
+            return;
+        }
+        *ip++ = '\0';
+    }
+
     w->cfg->docker_container = xstrdup(name);
     w->cfg->docker_image = xstrdup(image);
     printf("docker sandbox switched to %s (%s, ip=%s)\n",
@@ -11357,6 +11423,101 @@ static void agent_command_docker_describe(agent_worker *w, char *args) {
 malformed:
     printf("docker describe failed: malformed docker inspect output\n");
     free(out.ptr);
+}
+
+static void agent_command_docker_stop(agent_worker *w, char *args) {
+    if (!w || !w->cfg) {
+        printf("docker stop failed: worker configuration unavailable\n");
+        return;
+    }
+
+    const char *docker_command =
+        (w->cfg->docker_command && w->cfg->docker_command[0]) ?
+        w->cfg->docker_command : "docker";
+    if (!agent_command_in_path(docker_command)) {
+        printf("docker stop failed: docker command not found: %s\n",
+               docker_command);
+        return;
+    }
+
+    while (*args == ' ' || *args == '\t') args++;
+
+    agent_buf names = {0};
+    if (!agent_docker_list_sandbox_names(docker_command, &names)) {
+        printf("docker stop failed: unable to list sandboxes\n");
+        return;
+    }
+    if (!names.len) {
+        printf("no ds4 sandbox containers found\n");
+        free(names.ptr);
+        return;
+    }
+
+    char *targets[256];
+    int target_count = 0;
+    bool stopping_current = false;
+    char *save = NULL;
+    if (!args[0]) {
+        for (char *line = strtok_r(names.ptr, "\n", &save);
+             line && target_count < (int)(sizeof(targets) / sizeof(targets[0]));
+             line = strtok_r(NULL, "\n", &save)) {
+            targets[target_count++] = line;
+            if (w->cfg->docker_container && !strcmp(w->cfg->docker_container, line))
+                stopping_current = true;
+        }
+    } else {
+        char *name = args;
+        while (*args && *args != ' ' && *args != '\t') args++;
+        if (*args) *args = '\0';
+
+        for (char *line = strtok_r(names.ptr, "\n", &save);
+             line;
+             line = strtok_r(NULL, "\n", &save)) {
+            if (strcmp(line, name) != 0) continue;
+            targets[target_count++] = line;
+            if (w->cfg->docker_container && !strcmp(w->cfg->docker_container, line))
+                stopping_current = true;
+            break;
+        }
+        if (target_count == 0) {
+            printf("docker stop failed: sandbox not found: %s\n", name);
+            free(names.ptr);
+            return;
+        }
+    }
+
+    if (stopping_current) {
+        printf("warning: stopping the sandbox currently in use: %s\n",
+               w->cfg->docker_container ? w->cfg->docker_container : "(unknown)");
+    }
+
+    int argv_cap = 3 + target_count + 1;
+    char **argv = xmalloc((size_t)argv_cap * sizeof(char *));
+    int argc = 0;
+    argv[argc++] = (char *)docker_command;
+    argv[argc++] = "stop";
+    for (int i = 0; i < target_count; i++)
+        argv[argc++] = targets[i];
+    argv[argc] = NULL;
+
+    agent_buf out = {0};
+    bool ok = agent_docker_capture(docker_command, argv, "docker stop", &out);
+    free(argv);
+    if (!ok) {
+        free(names.ptr);
+        return;
+    }
+
+    if (out.ptr && out.ptr[0]) {
+        printf("%s", out.ptr);
+        if (out.ptr[out.len - 1] != '\n') printf("\n");
+    }
+    if (!args[0]) {
+        printf("stopped %d docker sandbox container%s\n",
+               target_count, target_count == 1 ? "" : "s");
+    }
+    free(out.ptr);
+    free(names.ptr);
 }
 
 /* Initialize the worker, cache directory, sysprompt checkpoint path, trace file,
@@ -12109,6 +12270,14 @@ static int run_agent(ds4_engine *engine, agent_config *cfg) {
                     } else {
                         char *arg = cmd + 16;
                         agent_command_docker_describe(&worker, arg);
+                    }
+                } else if (!strncmp(cmd, "/docker stop", 12) &&
+                           (cmd[12] == '\0' || cmd[12] == ' ' || cmd[12] == '\t')) {
+                    if (busy) {
+                        printf("command requires the model to be idle: %s\n", cmd);
+                    } else {
+                        char *arg = cmd + 12;
+                        agent_command_docker_stop(&worker, arg);
                     }
                 } else if (!strncmp(cmd, "/power", 6) &&
                            (cmd[6] == '\0' || cmd[6] == ' ' || cmd[6] == '\t')) {
