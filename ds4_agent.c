@@ -11835,6 +11835,8 @@ static int run_agent(ds4_engine *engine, agent_config *cfg) {
                     free(echo);
                 }
                 editor_stop(&editor);
+                linenoiseHistoryAdd(cmd);
+                linenoiseHistorySave(hist);
                 bool busy = !worker_is_idle(&worker);
                 if (!cmd[0]) {
                     /* Empty input: just reopen the editor. */
