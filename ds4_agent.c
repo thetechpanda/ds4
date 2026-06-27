@@ -529,6 +529,7 @@ static bool agent_slash_command_known(const char *cmd) {
            !strcmp(cmd, "/compact") ||
            !strcmp(cmd, "/list") ||
            agent_slash_command_with_args(cmd, "/docker create") ||
+           agent_slash_command_with_args(cmd, "/docker use") ||
            !strcmp(cmd, "/docker list") ||
            !strcmp(cmd, "/quit") ||
            !strcmp(cmd, "/exit") ||
@@ -10812,6 +10813,8 @@ static void runtime_help(void) {
     puts("  /docker create IMAGE NAME [COMMAND]");
     puts("               Create a tagged Docker sandbox and switch to it.");
     puts("               Defaults to `sleep infinity` when COMMAND is omitted.");
+    puts("  /docker use NAME");
+    puts("               Mark an existing tagged Docker sandbox as current.");
     puts("  /docker list List Docker containers tagged ds4:sandbox.");
     puts("  /switch SHA  Load a saved session and show recent history.");
     puts("  /del SHA     Delete a saved session.");
@@ -11129,6 +11132,132 @@ static void agent_command_docker_create(agent_worker *w, char *args) {
         printf("%s", out.ptr);
         if (out.ptr[out.len - 1] != '\n') printf("\n");
     }
+    free(out.ptr);
+}
+
+static void agent_command_docker_use(agent_worker *w, char *args) {
+    if (!w || !w->cfg) {
+        printf("docker use failed: worker configuration unavailable\n");
+        return;
+    }
+
+    const char *docker_command =
+        (w->cfg->docker_command && w->cfg->docker_command[0]) ?
+        w->cfg->docker_command : "docker";
+    if (!agent_command_in_path(docker_command)) {
+        printf("docker use failed: docker command not found: %s\n",
+               docker_command);
+        return;
+    }
+
+    while (*args == ' ' || *args == '\t') args++;
+    if (!args[0]) {
+        printf("usage: /docker use <name>\n");
+        return;
+    }
+
+    char *name = args;
+    while (*args && *args != ' ' && *args != '\t') args++;
+    if (*args) *args = '\0';
+
+    char *argv[] = {
+        (char *)docker_command,
+        "inspect",
+        "--type", "container",
+        "--format",
+        "{{json .Config.Labels}}\t{{.Config.Image}}\t{{.State.Status}}",
+        name,
+        NULL,
+    };
+
+    int pipefd[2];
+    if (pipe(pipefd) != 0) {
+        printf("docker use failed: pipe: %s\n", strerror(errno));
+        return;
+    }
+
+    pid_t pid = fork();
+    if (pid < 0) {
+        close(pipefd[0]);
+        close(pipefd[1]);
+        printf("docker use failed: fork: %s\n", strerror(errno));
+        return;
+    }
+    if (pid == 0) {
+        close(pipefd[0]);
+        dup2(pipefd[1], STDOUT_FILENO);
+        dup2(pipefd[1], STDERR_FILENO);
+        close(pipefd[1]);
+        if (strchr(docker_command, '/')) execv(docker_command, argv);
+        else execvp(docker_command, argv);
+        dprintf(STDERR_FILENO, "failed to exec docker: %s\n", strerror(errno));
+        _exit(127);
+    }
+
+    close(pipefd[1]);
+    agent_buf out = {0};
+    char chunk[4096];
+    for (;;) {
+        ssize_t n = read(pipefd[0], chunk, sizeof(chunk));
+        if (n > 0) {
+            agent_buf_append(&out, chunk, (size_t)n);
+            continue;
+        }
+        if (n == 0) break;
+        if (errno == EINTR) continue;
+        close(pipefd[0]);
+        while (waitpid(pid, NULL, 0) < 0 && errno == EINTR) {}
+        printf("docker use failed: read: %s\n", strerror(errno));
+        free(out.ptr);
+        return;
+    }
+    close(pipefd[0]);
+
+    int status = 0;
+    while (waitpid(pid, &status, 0) < 0) {
+        if (errno != EINTR) {
+            printf("docker use failed: waitpid: %s\n", strerror(errno));
+            free(out.ptr);
+            return;
+        }
+    }
+
+    if (!WIFEXITED(status) || WEXITSTATUS(status) != 0) {
+        printf("docker use failed:\n%s", out.ptr ? out.ptr : "");
+        if (!out.len || out.ptr[out.len - 1] != '\n') printf("\n");
+        free(out.ptr);
+        return;
+    }
+
+    char *line = out.ptr ? out.ptr : "";
+    char *newline = strchr(line, '\n');
+    if (newline) *newline = '\0';
+    char *labels_json = line;
+    char *image = strchr(line, '\t');
+    if (!image) {
+        printf("docker use failed: malformed docker inspect output\n");
+        free(out.ptr);
+        return;
+    }
+    *image++ = '\0';
+    char *state = strchr(image, '\t');
+    if (!state) {
+        printf("docker use failed: malformed docker inspect output\n");
+        free(out.ptr);
+        return;
+    }
+    *state++ = '\0';
+
+    if (!strstr(labels_json, "\"ds4:sandbox\"")) {
+        printf("docker use failed: container is not tagged ds4:sandbox: %s\n",
+               name);
+        free(out.ptr);
+        return;
+    }
+
+    w->cfg->docker_container = xstrdup(name);
+    w->cfg->docker_image = xstrdup(image);
+    printf("docker sandbox switched to %s (%s)\n", name, state[0] ? state : "unknown");
     free(out.ptr);
 }
 
@@ -11866,6 +11995,14 @@ static int run_agent(ds4_engine *engine, agent_config *cfg) {
                     } else {
                         char *arg = cmd + 14;
                         agent_command_docker_create(&worker, arg);
+                    }
+                } else if (!strncmp(cmd, "/docker use", 11) &&
+                           (cmd[11] == '\0' || cmd[11] == ' ' || cmd[11] == '\t')) {
+                    if (busy) {
+                        printf("command requires the model to be idle: %s\n", cmd);
+                    } else {
+                        char *arg = cmd + 11;
+                        agent_command_docker_use(&worker, arg);
                     }
                 } else if (!strncmp(cmd, "/power", 6) &&
                            (cmd[6] == '\0' || cmd[6] == ' ' || cmd[6] == '\t')) {
