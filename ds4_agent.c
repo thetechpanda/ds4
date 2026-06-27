@@ -11515,6 +11515,13 @@ static void agent_command_docker_stop(agent_worker *w, char *args) {
         printf("%s", out.ptr);
         if (out.ptr[out.len - 1] != '\n') printf("\n");
     }
+    if (stopping_current) {
+        free((char *)w->cfg->docker_container);
+        w->cfg->docker_container = NULL;
+        free((char *)w->cfg->docker_image);
+        w->cfg->docker_image = NULL;
+        printf("cleared current docker sandbox selection\n");
+    }
     if (!args[0]) {
         printf("stopped %d docker sandbox container%s\n",
                target_count, target_count == 1 ? "" : "s");
