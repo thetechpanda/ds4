@@ -539,14 +539,11 @@ made against every configured root. Relative tool paths resolve from the first
 root, and bash commands start there. If an interactive tool call targets
 another directory, ds4-agent asks before adding another root, offering the
 exact target directory, its parent, or the next parent up, plus deny. If no
-answer arrives in 30 seconds, it selects the exact target directory. On macOS,
-bash is also run through the system sandbox (`sandbox-exec`) so filesystem
-access outside the current roots is denied. If `sandbox-exec` is unavailable
-or the generated profile is rejected, the tool fails with an error by default.
-Pass `--no-strict-sandbox` to fall back to unsandboxed bash instead. On
-non-Darwin builds,
-bash currently uses the first workspace as its cwd but is otherwise best-effort;
-file tools are still jailed by canonical path checks. The prompt shows the first
+answer arrives in 30 seconds, it selects the exact target directory. When a
+Docker sandbox is selected, bash tools run through that container. With strict
+sandboxing enabled by default, tool calls are rejected unless a Docker sandbox
+is currently selected; pass `--no-strict-sandbox` to allow tools without one.
+File tools are still jailed by canonical path checks. The prompt shows the first
 workspace root. Use `/workspace` to list roots, `/workspace +/path/to` to add a
 root, and `/workspace -/path/to` to remove one.
 

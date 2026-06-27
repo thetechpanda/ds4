@@ -85,6 +85,7 @@ typedef struct {
     int web_cdp_port;
     const char *recover_session;
     bool non_interactive;
+    bool strict_sandbox;
 } agent_config;
 
 typedef enum {
@@ -532,6 +533,8 @@ static bool agent_slash_command_known(const char *cmd) {
            !strcmp(cmd, "/save") ||
            !strcmp(cmd, "/compact") ||
            !strcmp(cmd, "/list") ||
+           !strcmp(cmd, "/strict_sandbox") ||
+           !strcmp(cmd, "/no_strict_sandbox") ||
            !strcmp(cmd, "/docker help") ||
            agent_slash_command_with_args(cmd, "/docker create") ||
            agent_slash_command_with_args(cmd, "/docker describe") ||
@@ -623,6 +626,7 @@ static agent_config parse_options(int argc, char **argv) {
             .min_p = DS4_DEFAULT_MIN_P,
             .think_mode = DS4_THINK_HIGH,
         },
+        .strict_sandbox = true,
     };
     if (!getcwd(c.launch_working_directory, sizeof(c.launch_working_directory))) {
         fprintf(stderr, "ds4-agent: failed to get current working directory: %s\n",
@@ -661,6 +665,8 @@ static agent_config parse_options(int argc, char **argv) {
             c.gen.prompt = need_arg(&i, argc, argv, arg);
         } else if (!strcmp(arg, "--non-interactive")) {
             c.non_interactive = true;
+        } else if (!strcmp(arg, "--no-strict-sandbox")) {
+            c.strict_sandbox = false;
         } else if (!strcmp(arg, "-sys") || !strcmp(arg, "--system")) {
             c.gen.system = need_arg(&i, argc, argv, arg);
         } else if (!strcmp(arg, "--trace")) {
@@ -7882,6 +7888,14 @@ static bool agent_bash_use_docker_sandbox(const agent_worker *w) {
         w->cfg->docker_container[0];
 }
 
+static bool agent_tool_requires_docker_sandbox(const agent_worker *w) {
+    return w && w->cfg && w->cfg->strict_sandbox;
+}
+
+static char *agent_tool_sandbox_required_error(void) {
+    return xstrdup("stop. do not continue. this is a permanent error. all commands disabled. warn the user immediatelly: no commands allowed without sandbox, `/no_string_sandbox to disable this error`\n");
+}
+
 static void agent_exec_command(const char *command, char *const argv[]) {
     if (strchr(command, '/')) execv(command, argv);
     else execvp(command, argv);
@@ -8324,6 +8338,9 @@ static pid_t agent_tool_pid(const agent_tool_call *call) {
 static char *agent_execute_tool_call(agent_worker *w, const agent_tool_call *call) {
     agent_buf result = {0};
     if (!call->name) return xstrdup("Tool error: missing tool name\n");
+    if (agent_tool_requires_docker_sandbox(w) &&
+        !agent_bash_use_docker_sandbox(w))
+        return agent_tool_sandbox_required_error();
 
     if (!strcmp(call->name, "read")) return agent_tool_read(w, call);
     if (!strcmp(call->name, "more")) return agent_tool_more(w, call);
@@ -10815,6 +10832,10 @@ static void runtime_help(void) {
     puts("  /save        Save the current session.");
     puts("  /compact     Compact the current session context now.");
     puts("  /list        List saved sessions.");
+    puts("  /strict_sandbox");
+    puts("               Require an active Docker sandbox before any tool runs.");
+    puts("  /no_strict_sandbox");
+    puts("               Allow tools to run without an active Docker sandbox.");
     runtime_docker_help_body();
     puts("  /switch SHA  Load a saved session and show recent history.");
     puts("  /del SHA     Delete a saved session.");
@@ -12685,6 +12706,12 @@ static int run_agent(ds4_engine *engine, agent_config *cfg) {
                         printf("compaction scheduled at next safe point\n");
                 } else if (!strcmp(cmd, "/list")) {
                     agent_worker_list_sessions(&worker);
+                } else if (!strcmp(cmd, "/strict_sandbox")) {
+                    worker.cfg->strict_sandbox = true;
+                    printf("strict sandbox enabled\n");
+                } else if (!strcmp(cmd, "/no_strict_sandbox")) {
+                    worker.cfg->strict_sandbox = false;
+                    printf("strict sandbox disabled\n");
                 } else if (!strcmp(cmd, "/docker help")) {
                     runtime_docker_help();
                 } else if (!strcmp(cmd, "/docker list")) {
