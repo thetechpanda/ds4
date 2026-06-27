@@ -556,7 +556,8 @@ static bool agent_slash_command_known(const char *cmd) {
            agent_slash_command_with_args(cmd, "/del") ||
            agent_slash_command_with_args(cmd, "/strip") ||
            agent_slash_command_with_args(cmd, "/history") ||
-           agent_slash_command_with_args(cmd, "/workspace");
+           agent_slash_command_with_args(cmd, "/workspace") ||
+           !strcmp(cmd, "/purge_auto_files");
 }
 
 static uint64_t parse_u64(const char *s, const char *opt) {
@@ -8153,22 +8154,22 @@ static void agent_docker_debug_publish_bash(agent_worker *w,
     }
     agent_docker_exec_add_env(argv, &argc, env_home, sizeof(env_home),
                               "HOME", working_dir);
-    agent_docker_exec_add_env(argv, &argc, env_tmpdir, sizeof(env_tmpdir),
-                              "TMPDIR", temp_dir);
-    agent_docker_exec_add_env(argv, &argc, env_tmp, sizeof(env_tmp),
-                              "TMP", temp_dir);
-    agent_docker_exec_add_env(argv, &argc, env_temp, sizeof(env_temp),
-                              "TEMP", temp_dir);
-    agent_docker_exec_add_env(argv, &argc, env_xdg_config, sizeof(env_xdg_config),
-                              "XDG_CONFIG_HOME", working_dir);
-    agent_docker_exec_add_env(argv, &argc, env_xdg_cache, sizeof(env_xdg_cache),
-                              "XDG_CACHE_HOME", working_dir);
+    // agent_docker_exec_add_env(argv, &argc, env_tmpdir, sizeof(env_tmpdir),
+    //                           "TMPDIR", temp_dir);
+    // agent_docker_exec_add_env(argv, &argc, env_tmp, sizeof(env_tmp),
+    //                           "TMP", temp_dir);
+    // agent_docker_exec_add_env(argv, &argc, env_temp, sizeof(env_temp),
+    //                           "TEMP", temp_dir);
+    // agent_docker_exec_add_env(argv, &argc, env_xdg_config, sizeof(env_xdg_config),
+    //                           "XDG_CONFIG_HOME", working_dir);
+    // agent_docker_exec_add_env(argv, &argc, env_xdg_cache, sizeof(env_xdg_cache),
+    //                           "XDG_CACHE_HOME", working_dir);
     argv[argc++] = "-e"; argv[argc++] = "TERM=dumb";
     argv[argc++] = "-e"; argv[argc++] = "PAGER=cat";
     argv[argc++] = "-e"; argv[argc++] = "GIT_PAGER=cat";
-    argv[argc++] = "-e"; argv[argc++] = "GIT_CONFIG_NOSYSTEM=1";
-    argv[argc++] = "-e"; argv[argc++] = "GIT_CONFIG_SYSTEM=/dev/null";
-    argv[argc++] = "-e"; argv[argc++] = "GIT_CONFIG_GLOBAL=/dev/null";
+    // argv[argc++] = "-e"; argv[argc++] = "GIT_CONFIG_NOSYSTEM=1";
+    // argv[argc++] = "-e"; argv[argc++] = "GIT_CONFIG_SYSTEM=/dev/null";
+    // argv[argc++] = "-e"; argv[argc++] = "GIT_CONFIG_GLOBAL=/dev/null";
     argv[argc++] = (char *)w->cfg->docker_container;
     argv[argc++] = "/bin/sh";
     argv[argc++] = "-lc";
@@ -8186,8 +8187,9 @@ static void agent_docker_exec_add_env(char **argv, int *argc,
                                       char *buf, size_t len,
                                       const char *key, const char *value) {
     if (!argv || !argc || !buf || len == 0 || !key || !key[0] ||
-        !value || !value[0])
+        !value || !value[0] || strncmp(value, "", strlen(value)) == 0 || strncmp(key, "", strlen(key)) == 0)
         return;
+    memset(buf, 0, len);
     snprintf(buf, len, "%s=%s", key, value);
     argv[(*argc)++] = "-e";
     argv[(*argc)++] = buf;
@@ -8232,22 +8234,22 @@ static bool agent_docker_exec_capture(agent_worker *w,
     }
     agent_docker_exec_add_env(argv, &argc, home_env, sizeof(home_env),
                               "HOME", working_dir);
-    agent_docker_exec_add_env(argv, &argc, tmpdir_env, sizeof(tmpdir_env),
-                              "TMPDIR", temp_dir);
-    agent_docker_exec_add_env(argv, &argc, tmp_env, sizeof(tmp_env),
-                              "TMP", temp_dir);
-    agent_docker_exec_add_env(argv, &argc, temp_env, sizeof(temp_env),
-                              "TEMP", temp_dir);
-    agent_docker_exec_add_env(argv, &argc, xdg_config_env, sizeof(xdg_config_env),
-                              "XDG_CONFIG_HOME", working_dir);
-    agent_docker_exec_add_env(argv, &argc, xdg_cache_env, sizeof(xdg_cache_env),
-                              "XDG_CACHE_HOME", working_dir);
+    // agent_docker_exec_add_env(argv, &argc, tmpdir_env, sizeof(tmpdir_env),
+    //                           "TMPDIR", temp_dir);
+    // agent_docker_exec_add_env(argv, &argc, tmp_env, sizeof(tmp_env),
+    //                           "TMP", temp_dir);
+    // agent_docker_exec_add_env(argv, &argc, temp_env, sizeof(temp_env),
+    //                           "TEMP", temp_dir);
+    // agent_docker_exec_add_env(argv, &argc, xdg_config_env, sizeof(xdg_config_env),
+    //                           "XDG_CONFIG_HOME", working_dir);
+    // agent_docker_exec_add_env(argv, &argc, xdg_cache_env, sizeof(xdg_cache_env),
+    //                           "XDG_CACHE_HOME", working_dir);
     argv[argc++] = "-e"; argv[argc++] = "TERM=dumb";
     argv[argc++] = "-e"; argv[argc++] = "PAGER=cat";
     argv[argc++] = "-e"; argv[argc++] = "GIT_PAGER=cat";
-    argv[argc++] = "-e"; argv[argc++] = "GIT_CONFIG_NOSYSTEM=1";
-    argv[argc++] = "-e"; argv[argc++] = "GIT_CONFIG_SYSTEM=/dev/null";
-    argv[argc++] = "-e"; argv[argc++] = "GIT_CONFIG_GLOBAL=/dev/null";
+    // argv[argc++] = "-e"; argv[argc++] = "GIT_CONFIG_NOSYSTEM=1";
+    // argv[argc++] = "-e"; argv[argc++] = "GIT_CONFIG_SYSTEM=/dev/null";
+    // argv[argc++] = "-e"; argv[argc++] = "GIT_CONFIG_GLOBAL=/dev/null";
     argv[argc++] = (char *)w->cfg->docker_container;
     for (int i = 0; i < cmd_argc; i++)
         argv[argc++] = cmd_argv[i];
@@ -8431,22 +8433,22 @@ static void agent_bash_exec_docker(agent_worker *w, const char *cmd,
     }
     agent_docker_exec_add_env(argv, &argc, env_home, sizeof(env_home),
                               "HOME", working_dir);
-    agent_docker_exec_add_env(argv, &argc, env_tmpdir, sizeof(env_tmpdir),
-                              "TMPDIR", temp_dir);
-    agent_docker_exec_add_env(argv, &argc, env_tmp, sizeof(env_tmp),
-                              "TMP", temp_dir);
-    agent_docker_exec_add_env(argv, &argc, env_temp, sizeof(env_temp),
-                              "TEMP", temp_dir);
-    agent_docker_exec_add_env(argv, &argc, env_xdg_config, sizeof(env_xdg_config),
-                              "XDG_CONFIG_HOME", working_dir);
-    agent_docker_exec_add_env(argv, &argc, env_xdg_cache, sizeof(env_xdg_cache),
-                              "XDG_CACHE_HOME", working_dir);
+    // agent_docker_exec_add_env(argv, &argc, env_tmpdir, sizeof(env_tmpdir),
+    //                           "TMPDIR", temp_dir);
+    // agent_docker_exec_add_env(argv, &argc, env_tmp, sizeof(env_tmp),
+    //                           "TMP", temp_dir);
+    // agent_docker_exec_add_env(argv, &argc, env_temp, sizeof(env_temp),
+    //                           "TEMP", temp_dir);
+    // agent_docker_exec_add_env(argv, &argc, env_xdg_config, sizeof(env_xdg_config),
+    //                           "XDG_CONFIG_HOME", working_dir);
+    // agent_docker_exec_add_env(argv, &argc, env_xdg_cache, sizeof(env_xdg_cache),
+    //                           "XDG_CACHE_HOME", working_dir);
     argv[argc++] = "-e"; argv[argc++] = "TERM=dumb";
     argv[argc++] = "-e"; argv[argc++] = "PAGER=cat";
     argv[argc++] = "-e"; argv[argc++] = "GIT_PAGER=cat";
-    argv[argc++] = "-e"; argv[argc++] = "GIT_CONFIG_NOSYSTEM=1";
-    argv[argc++] = "-e"; argv[argc++] = "GIT_CONFIG_SYSTEM=/dev/null";
-    argv[argc++] = "-e"; argv[argc++] = "GIT_CONFIG_GLOBAL=/dev/null";
+    // argv[argc++] = "-e"; argv[argc++] = "GIT_CONFIG_NOSYSTEM=1";
+    // argv[argc++] = "-e"; argv[argc++] = "GIT_CONFIG_SYSTEM=/dev/null";
+    // argv[argc++] = "-e"; argv[argc++] = "GIT_CONFIG_GLOBAL=/dev/null";
     argv[argc++] = (char *)w->cfg->docker_container;
     argv[argc++] = "/bin/sh";
     argv[argc++] = "-lc";
@@ -11340,6 +11342,8 @@ static void runtime_help(void) {
     puts("  /history [N] Show N recent user turns from the current session.");
     puts("  /power N     Set GPU duty cycle percentage, 1..100.");
     puts("  /workspace   List workspace roots; +PATH adds, -PATH removes. The first root is the active workspace.");
+    puts("  /purge_auto_files");
+    puts("               Delete auto-created files. Lists files, gives 5s to abort.");
     puts("  /new         Start a fresh session from the system prompt.");
     puts("  /quit, /exit Exit.");
     puts("  Ctrl+C       Interrupt generation; clear edited text.");
@@ -13350,6 +13354,78 @@ static int run_agent(ds4_engine *engine, agent_config *cfg) {
                         } else {
                             printf("usage: /workspace, /workspace +/path/to, /workspace -/path/to\n");
                         }
+                    }
+                } else if (!strcmp(cmd, "/purge_auto_files")) {
+                    pthread_mutex_lock(&worker.mu);
+                    int n = worker.auto_allowed_paths.len;
+                    if (n == 0) {
+                        pthread_mutex_unlock(&worker.mu);
+                        printf("no auto-created files to purge\n");
+                    } else {
+                        /* Copy list while holding the lock. */
+                        char **paths = xmalloc((size_t)n * sizeof(char *));
+                        for (int i = 0; i < n; i++)
+                            paths[i] = xstrdup(worker.auto_allowed_paths.v[i]);
+                        pthread_mutex_unlock(&worker.mu);
+
+                        printf("auto-created files (%d):\n", n);
+                        for (int i = 0; i < n; i++)
+                            printf("  %d. %s\n", i + 1, paths[i]);
+
+                        printf("\nDeletion will start in 5 seconds. Press Ctrl+C or type 'q' to abort...\n");
+                        fflush(stdout);
+
+                        bool aborted = false;
+                        struct pollfd pfd = { .fd = STDIN_FILENO, .events = POLLIN };
+                        int remaining_ms = 5000;
+                        while (remaining_ms > 0) {
+                            int rc = poll(&pfd, 1, remaining_ms);
+                            if (rc < 0) {
+                                if (errno == EINTR) {
+                                    /* SIGINT/SIGTERM received — treat as abort. */
+                                    aborted = true;
+                                    break;
+                                }
+                                break;
+                            }
+                            if (rc == 0) break; /* timeout */
+                            /* Data available on stdin — read a char. */
+                            char ch = 0;
+                            ssize_t nr = read(STDIN_FILENO, &ch, 1);
+                            if (nr == 1 && (ch == 'q' || ch == 0x03)) {
+                                aborted = true;
+                                break;
+                            }
+                            break;
+                        }
+                        if (aborted) {
+                            printf("aborted by user.\n");
+                        } else {
+                            printf("proceeding with deletion...\n");
+                            pthread_mutex_lock(&worker.mu);
+                            int deleted = 0;
+                            int failed = 0;
+                            for (int i = 0; i < n; i++) {
+                                if (unlink(paths[i]) == 0) {
+                                    printf("  deleted: %s\n", paths[i]);
+                                    deleted++;
+                                } else {
+                                    printf("  failed to delete: %s (%s)\n",
+                                           paths[i], strerror(errno));
+                                    failed++;
+                                }
+                            }
+                            /* Clear the list. */
+                            agent_path_list_free(&worker.auto_allowed_paths);
+                            worker.auto_allowed_paths.v = NULL;
+                            worker.auto_allowed_paths.len = 0;
+                            worker.auto_allowed_paths.cap = 0;
+                            pthread_mutex_unlock(&worker.mu);
+                            printf("\n%d file%s deleted, %d failed.\n",
+                                   deleted, deleted == 1 ? "" : "s", failed);
+                        }
+                        for (int i = 0; i < n; i++) free(paths[i]);
+                        free(paths);
                     }
                 } else if (cmd[0] == '/' && !agent_slash_command_known(cmd)) {
                     ssize_t ignored = write(STDOUT_FILENO, "\a", 1);
