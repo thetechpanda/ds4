@@ -90,6 +90,7 @@ typedef struct {
     const char *recover_session;
     bool non_interactive;
     bool strict_sandbox;
+    bool docker_auto;
 } agent_config;
 
 typedef enum {
@@ -632,6 +633,7 @@ static agent_config parse_options(int argc, char **argv) {
             .think_mode = DS4_THINK_HIGH,
         },
         .strict_sandbox = true,
+        .docker_auto = true,
     };
     if (!getcwd(c.launch_working_directory, sizeof(c.launch_working_directory))) {
         fprintf(stderr, "ds4-agent: failed to get current working directory: %s\n",
@@ -672,6 +674,8 @@ static agent_config parse_options(int argc, char **argv) {
             c.non_interactive = true;
         } else if (!strcmp(arg, "--no-strict-sandbox")) {
             c.strict_sandbox = false;
+        } else if (!strcmp(arg, "--no-docker-auto")) {
+            c.docker_auto = false;
         } else if (!strcmp(arg, "-sys") || !strcmp(arg, "--system")) {
             c.gen.system = need_arg(&i, argc, argv, arg);
         } else if (!strcmp(arg, "--trace")) {
@@ -8098,8 +8102,8 @@ static void agent_docker_debug_print_cfg(const agent_config *cfg,
     char *cmd = agent_docker_debug_command_text(argv);
     if (cmd) {
         bool color = isatty(STDOUT_FILENO) != 0;
-        if (color) printf("\x1b[90m[docker debug] %s\x1b[0m\n", cmd);
-        else printf("[docker debug] %s\n", cmd);
+        if (color) printf("\x1b[96m[docker debug] %s\x1b[0m\n\n", cmd);
+        else printf("[docker debug] %s\n\n", cmd);
         free(cmd);
     }
 }
@@ -8109,13 +8113,68 @@ static void agent_docker_debug_publish_worker(agent_worker *w,
     if (!w || !w->cfg || !w->cfg->docker_debug) return;
     char *cmd = agent_docker_debug_command_text(argv);
     if (cmd) {
-        const char *prefix = "\x1b[90m[docker debug] ";
-        const char *suffix = "\x1b[0m\n";
+        const char *prefix = "\x1b[96m[docker debug] ";
+        const char *suffix = "\x1b[0m\n\n";
         agent_publish(w, prefix, strlen(prefix));
         agent_publish(w, cmd, strlen(cmd));
         agent_publish(w, suffix, strlen(suffix));
         free(cmd);
     }
+}
+
+static void agent_docker_exec_add_env(char **argv, int *argc,
+                                      char *buf, size_t len,
+                                      const char *key, const char *value);
+
+static void agent_docker_debug_publish_bash(agent_worker *w,
+                                            const char *working_dir,
+                                            const char *cmd) {
+    if (!w || !w->cfg || !w->cfg->docker_debug) return;
+    const char *docker_command =
+        (w->cfg->docker_command && w->cfg->docker_command[0]) ?
+        w->cfg->docker_command : "docker";
+    const char *temp_dir =
+        (w->cfg->temp_directory[0]) ? w->cfg->temp_directory : working_dir;
+    char env_home[PATH_MAX + 16];
+    char env_tmpdir[PATH_MAX + 16];
+    char env_tmp[PATH_MAX + 16];
+    char env_temp[PATH_MAX + 16];
+    char env_xdg_config[PATH_MAX + 32];
+    char env_xdg_cache[PATH_MAX + 32];
+    char *argv[32];
+    int argc = 0;
+
+    argv[argc++] = (char *)docker_command;
+    argv[argc++] = "exec";
+    argv[argc++] = "-i";
+    if (working_dir && working_dir[0]) {
+        argv[argc++] = "-w";
+        argv[argc++] = (char *)working_dir;
+    }
+    agent_docker_exec_add_env(argv, &argc, env_home, sizeof(env_home),
+                              "HOME", working_dir);
+    agent_docker_exec_add_env(argv, &argc, env_tmpdir, sizeof(env_tmpdir),
+                              "TMPDIR", temp_dir);
+    agent_docker_exec_add_env(argv, &argc, env_tmp, sizeof(env_tmp),
+                              "TMP", temp_dir);
+    agent_docker_exec_add_env(argv, &argc, env_temp, sizeof(env_temp),
+                              "TEMP", temp_dir);
+    agent_docker_exec_add_env(argv, &argc, env_xdg_config, sizeof(env_xdg_config),
+                              "XDG_CONFIG_HOME", working_dir);
+    agent_docker_exec_add_env(argv, &argc, env_xdg_cache, sizeof(env_xdg_cache),
+                              "XDG_CACHE_HOME", working_dir);
+    argv[argc++] = "-e"; argv[argc++] = "TERM=dumb";
+    argv[argc++] = "-e"; argv[argc++] = "PAGER=cat";
+    argv[argc++] = "-e"; argv[argc++] = "GIT_PAGER=cat";
+    argv[argc++] = "-e"; argv[argc++] = "GIT_CONFIG_NOSYSTEM=1";
+    argv[argc++] = "-e"; argv[argc++] = "GIT_CONFIG_SYSTEM=/dev/null";
+    argv[argc++] = "-e"; argv[argc++] = "GIT_CONFIG_GLOBAL=/dev/null";
+    argv[argc++] = (char *)w->cfg->docker_container;
+    argv[argc++] = "/bin/sh";
+    argv[argc++] = "-lc";
+    argv[argc++] = (char *)(cmd ? cmd : "");
+    argv[argc] = NULL;
+    agent_docker_debug_publish_worker(w, argv);
 }
 
 static void agent_exec_command(const char *command, char *const argv[]) {
@@ -8283,8 +8342,7 @@ static bool agent_docker_read_file_bytes(agent_worker *w, const char *path,
     if (data) *data = NULL;
     if (len) *len = 0;
     const char *working_dir = agent_primary_working_directory(w);
-    char *argv[] = {"/bin/sh", "-lc", "cat -- \"$1\"", "sh",
-                    (char *)(path ? path : ""), NULL};
+    char *argv[] = {"cat", (char *)(path ? path : ""), NULL};
     agent_buf out = {0};
     int status = 0;
     bool ok = agent_docker_exec_capture(w, working_dir, argv, NULL, 0,
@@ -8305,15 +8363,31 @@ static bool agent_docker_write_file_bytes(agent_worker *w, const char *path,
                                           const char *data, size_t len,
                                           char *err, size_t err_len) {
     const char *working_dir = agent_primary_working_directory(w);
-    char *argv[] = {
-        "/bin/sh", "-lc",
-        "mkdir -p -- \"$(dirname -- \"$1\")\" && cat > \"$1\"",
-        "sh", (char *)(path ? path : ""), NULL
-    };
+    char parent[PATH_MAX];
+    if (!path || !path[0]) {
+        snprintf(err, err_len, "missing path");
+        return false;
+    }
+    if (!agent_path_parent(path, parent))
+        snprintf(parent, sizeof(parent), ".");
+
+    char *dir_argv[] = {"test", "-d", parent, NULL};
     agent_buf out = {0};
     int status = 0;
-    bool ok = agent_docker_exec_capture(w, working_dir, argv, data, len,
+    bool ok = agent_docker_exec_capture(w, working_dir, dir_argv, NULL, 0,
                                         "docker write", &out, &status);
+    free(out.ptr);
+    out.ptr = NULL;
+    out.len = 0;
+    out.cap = 0;
+    if (!ok) {
+        snprintf(err, err_len, "parent directory does not exist: %s", parent);
+        return false;
+    }
+
+    char *write_argv[] = {"tee", (char *)(path ? path : ""), NULL};
+    ok = agent_docker_exec_capture(w, working_dir, write_argv, data, len,
+                                   "docker write", &out, &status);
     if (!ok) {
         snprintf(err, err_len, "%s",
                  out.ptr && out.ptr[0] ? out.ptr : "docker write failed");
@@ -8378,7 +8452,6 @@ static void agent_bash_exec_docker(agent_worker *w, const char *cmd,
     argv[argc++] = "-lc";
     argv[argc++] = (char *)(cmd ? cmd : "");
     argv[argc] = NULL;
-    agent_docker_debug_publish_worker(w, argv);
     agent_exec_command(docker_command, argv);
     _exit(127);
 }
@@ -8398,6 +8471,7 @@ static agent_bash_job *agent_bash_start_mode(agent_worker *w, const char *cmd,
     }
 
     const char *working_dir = agent_primary_working_directory(w);
+    if (use_docker) agent_docker_debug_publish_bash(w, working_dir, cmd);
 
     int pipefd[2];
     if (pipe(pipefd) != 0) {
@@ -11427,6 +11501,30 @@ static bool agent_docker_feature_available_cfg(const agent_config *cfg) {
     return cfg && cfg->docker_available;
 }
 
+static void agent_config_autoload_first_docker_sandbox(agent_config *cfg) {
+    if (!cfg || !cfg->docker_auto) return;
+    if (!agent_docker_feature_available_cfg(cfg)) return;
+    if (cfg->docker_container && cfg->docker_container[0]) return;
+
+    const char *docker_command =
+        (cfg->docker_command && cfg->docker_command[0]) ?
+        cfg->docker_command : "docker";
+    agent_buf out = {0};
+    if (!agent_docker_list_sandbox_names(cfg, docker_command, &out)) return;
+    if (!out.ptr || !out.ptr[0]) {
+        free(out.ptr);
+        return;
+    }
+
+    char *newline = strchr(out.ptr, '\n');
+    if (newline) *newline = '\0';
+    if (out.ptr[0]) {
+        cfg->docker_container = xstrdup(out.ptr);
+        printf("auto-selected docker sandbox: %s\n", cfg->docker_container);
+    }
+    free(out.ptr);
+}
+
 static bool agent_docker_feature_available_worker(agent_worker *w) {
     return w && w->cfg && agent_docker_feature_available_cfg(w->cfg);
 }
@@ -13439,6 +13537,7 @@ int main(int argc, char **argv) {
             fprintf(stdout, " (%s unavailable)", docker_command);
         fputc('\n', stdout);
     }
+    agent_config_autoload_first_docker_sandbox(&cfg);
     
     if (cfg.chdir_path && chdir(cfg.chdir_path) != 0) {
         fprintf(stderr, "ds4-agent: failed to chdir to %s: %s\n",
