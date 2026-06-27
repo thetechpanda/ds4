@@ -8343,8 +8343,13 @@ static bool agent_docker_read_file_bytes(agent_worker *w, const char *path,
                                          char *err, size_t err_len) {
     if (data) *data = NULL;
     if (len) *len = 0;
+    if (!path || !path[0]) {
+        snprintf(err, err_len, "%s", 
+                 "docker read failed, path is empty");
+        return false;
+    }
     const char *working_dir = agent_primary_working_directory(w);
-    char *argv[] = {"cat", (char *)(path ? path : ""), NULL};
+    char *argv[] = {"cat", (char *)(path), NULL};
     agent_buf out = {0};
     int status = 0;
     bool ok = agent_docker_exec_capture(w, working_dir, argv, NULL, 0,
@@ -8511,7 +8516,7 @@ static agent_bash_job *agent_bash_start_mode(agent_worker *w, const char *cmd,
         dup2(pipefd[1], STDERR_FILENO);
         close(pipefd[1]);
         if (use_docker) agent_bash_exec_docker(w, cmd, working_dir);
-        agent_bash_exec_local(cmd, working_dir, w->cfg->temp_directory);
+        else agent_bash_exec_local(cmd, working_dir, w->cfg->temp_directory);
     }
     close(pipefd[1]);
     setpgid(pid, pid);
