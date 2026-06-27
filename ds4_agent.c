@@ -8186,7 +8186,7 @@ static void agent_docker_exec_add_env(char **argv, int *argc,
                                       char *buf, size_t len,
                                       const char *key, const char *value) {
     if (!argv || !argc || !buf || len == 0 || !key || !key[0] ||
-        !value || !value[0] || *key)
+        !value || !value[0])
         return;
     snprintf(buf, len, "%s=%s", key, value);
     argv[(*argc)++] = "-e";
