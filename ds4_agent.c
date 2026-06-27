@@ -70,6 +70,9 @@ typedef struct {
     ds4_engine_options engine;
     agent_generation_options gen;
     const char *chdir_path;
+    const char *docker_build;
+    const char *docker_container;
+    const char *docker_image;
     char launch_working_directory[PATH_MAX];
     agent_path_list working_directory_args;
     agent_path_list working_directories;
@@ -689,6 +692,12 @@ static agent_config parse_options(int argc, char **argv) {
             c.engine.n_threads = parse_int(need_arg(&i, argc, argv, arg), arg);
         } else if (!strcmp(arg, "--chdir")) {
             c.chdir_path = need_arg(&i, argc, argv, arg);
+        } else if (!strcmp(arg, "--docker-build")) {
+            c.docker_build = need_arg(&i, argc, argv, arg);
+        } else if (!strcmp(arg, "--docker-container")) {
+            c.docker_container = need_arg(&i, argc, argv, arg);
+        } else if (!strcmp(arg, "--docker-image")) {
+            c.docker_image = need_arg(&i, argc, argv, arg);
         } else if (!strcmp(arg, "--workspace")) {
             agent_path_list_append(&c.working_directory_args,
                                    need_arg(&i, argc, argv, arg));
