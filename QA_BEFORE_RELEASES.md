@@ -211,7 +211,7 @@ The agent is the most stateful component.  Test it manually, not only by build.
   test short output, large output truncation, non-zero exit output, long-running
   jobs, `bash_status`, and `bash_stop`.
 - Working-directory jail:
-  launch with one and then multiple `--working-directory` roots. Verify read,
+  launch with one and then multiple `--workspace` roots. Verify read,
   write, edit, list, search, and more check all roots, reject unapproved `..`,
   absolute outside paths, and symlink escapes, and ask before adding a new root
   with numbered exact/parent/grandparent choices and a visible 30-second

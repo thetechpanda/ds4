@@ -532,7 +532,7 @@ stripped session rebuilds the KV cache by prefilling the saved text.
 
 Use `--chdir /path/to/ds4` when launching `ds4-agent` from another directory,
 so relative runtime files such as `metal/*.metal` resolve from the project tree.
-Use `--working-directory /path/to/workspace` to add a workspace root for local
+Use `--workspace /path/to/workspace` to add a workspace root for local
 file tools. If you do not pass it, the initial workspace root is the directory
 where `ds4-agent` was launched from. The option is repeatable; path checks are
 made against every configured root. Relative tool paths resolve from the first

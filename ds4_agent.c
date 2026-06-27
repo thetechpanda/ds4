@@ -689,7 +689,7 @@ static agent_config parse_options(int argc, char **argv) {
             c.engine.n_threads = parse_int(need_arg(&i, argc, argv, arg), arg);
         } else if (!strcmp(arg, "--chdir")) {
             c.chdir_path = need_arg(&i, argc, argv, arg);
-        } else if (!strcmp(arg, "--working-directory")) {
+        } else if (!strcmp(arg, "--workspace")) {
             agent_path_list_append(&c.working_directory_args,
                                    need_arg(&i, argc, argv, arg));
         } else if (!strcmp(arg, "--temp-directory")) {
