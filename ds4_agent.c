@@ -10963,6 +10963,21 @@ static bool agent_docker_inspect_sandbox(const char *docker_command,
     return agent_docker_capture(docker_command, argv, "docker inspect", out);
 }
 
+static bool agent_docker_inspect_sandbox_sync(const char *docker_command,
+                                              const char *name,
+                                              agent_buf *out) {
+    char *argv[] = {
+        (char *)docker_command,
+        "inspect",
+        "--type", "container",
+        "--format",
+        "{{.Name}}\t{{.Config.Image}}\t{{.State.Status}}\t{{.Path}}\t{{json .Args}}",
+        (char *)(name ? name : ""),
+        NULL,
+    };
+    return agent_docker_capture(docker_command, argv, "docker inspect", out);
+}
+
 static bool agent_docker_list_sandbox_names(const char *docker_command,
                                             agent_buf *out) {
     char *argv[] = {
@@ -10973,6 +10988,277 @@ static bool agent_docker_list_sandbox_names(const char *docker_command,
         NULL,
     };
     return agent_docker_capture(docker_command, argv, "docker list", out);
+}
+
+static void agent_string_array_free(char **v, int count) {
+    if (!v) return;
+    for (int i = 0; i < count; i++) free(v[i]);
+    free(v);
+}
+
+static bool agent_json_parse_string_array(const char *json,
+                                          char ***out_v,
+                                          int *out_count) {
+    if (out_v) *out_v = NULL;
+    if (out_count) *out_count = 0;
+    if (!json) return false;
+
+    const unsigned char *p = (const unsigned char *)json;
+    while (isspace(*p)) p++;
+    if (*p != '[') return false;
+    p++;
+
+    char **items = NULL;
+    int len = 0;
+    int cap = 0;
+    for (;;) {
+        while (isspace(*p)) p++;
+        if (*p == ']') {
+            p++;
+            break;
+        }
+        if (*p != '"') {
+            agent_string_array_free(items, len);
+            return false;
+        }
+        p++;
+        agent_buf item = {0};
+        while (*p && *p != '"') {
+            if (*p == '\\') {
+                p++;
+                if (!*p) {
+                    agent_string_array_free(items, len);
+                    free(item.ptr);
+                    return false;
+                }
+                char c = (char)*p;
+                switch (c) {
+                    case '"': case '\\': case '/':
+                        agent_buf_append(&item, &c, 1);
+                        break;
+                    case 'b': c = '\b'; agent_buf_append(&item, &c, 1); break;
+                    case 'f': c = '\f'; agent_buf_append(&item, &c, 1); break;
+                    case 'n': c = '\n'; agent_buf_append(&item, &c, 1); break;
+                    case 'r': c = '\r'; agent_buf_append(&item, &c, 1); break;
+                    case 't': c = '\t'; agent_buf_append(&item, &c, 1); break;
+                    case 'u':
+                        /* Docker argv JSON here is expected to be plain ASCII. */
+                        agent_string_array_free(items, len);
+                        free(item.ptr);
+                        return false;
+                    default:
+                        agent_string_array_free(items, len);
+                        free(item.ptr);
+                        return false;
+                }
+                p++;
+                continue;
+            }
+            char c = (char)*p++;
+            agent_buf_append(&item, &c, 1);
+        }
+        if (*p != '"') {
+            agent_string_array_free(items, len);
+            free(item.ptr);
+            return false;
+        }
+        p++;
+        if (len == cap) {
+            cap = cap ? cap * 2 : 4;
+            items = xrealloc(items, (size_t)cap * sizeof(items[0]));
+        }
+        items[len++] = agent_buf_take(&item);
+        while (isspace(*p)) p++;
+        if (*p == ',') {
+            p++;
+            continue;
+        }
+        if (*p == ']') {
+            p++;
+            break;
+        }
+        agent_string_array_free(items, len);
+        return false;
+    }
+
+    if (out_v) *out_v = items;
+    else agent_string_array_free(items, len);
+    if (out_count) *out_count = len;
+    return true;
+}
+
+static bool agent_docker_refresh_mounts(agent_worker *w,
+                                        char *err, size_t err_len) {
+    if (!w || !w->cfg) return true;
+    const char *docker_command =
+        (w->cfg->docker_command && w->cfg->docker_command[0]) ?
+        w->cfg->docker_command : "docker";
+
+    agent_buf names = {0};
+    if (!agent_docker_list_sandbox_names(docker_command, &names)) {
+        snprintf(err, err_len, "unable to list docker sandboxes");
+        return false;
+    }
+    if (!names.len) {
+        free(names.ptr);
+        return true;
+    }
+
+    int refreshed = 0;
+    char *save = NULL;
+    for (char *line = strtok_r(names.ptr, "\n", &save);
+         line;
+         line = strtok_r(NULL, "\n", &save)) {
+        agent_buf inspect = {0};
+        if (!agent_docker_inspect_sandbox_sync(docker_command, line, &inspect)) {
+            snprintf(err, err_len, "unable to inspect docker sandbox: %s", line);
+            free(names.ptr);
+            return false;
+        }
+
+        char *row = inspect.ptr ? inspect.ptr : "";
+        char *newline = strchr(row, '\n');
+        if (newline) *newline = '\0';
+        char *name = row;
+        if (name[0] == '/') name++;
+        char *image = strchr(row, '\t');
+        if (!image) {
+            snprintf(err, err_len, "malformed docker inspect output for %s", line);
+            free(inspect.ptr);
+            free(names.ptr);
+            return false;
+        }
+        *image++ = '\0';
+        char *state = strchr(image, '\t');
+        if (!state) {
+            snprintf(err, err_len, "malformed docker inspect output for %s", line);
+            free(inspect.ptr);
+            free(names.ptr);
+            return false;
+        }
+        *state++ = '\0';
+        char *path = strchr(state, '\t');
+        if (!path) {
+            snprintf(err, err_len, "malformed docker inspect output for %s", line);
+            free(inspect.ptr);
+            free(names.ptr);
+            return false;
+        }
+        *path++ = '\0';
+        char *args_json = strchr(path, '\t');
+        if (!args_json) {
+            snprintf(err, err_len, "malformed docker inspect output for %s", line);
+            free(inspect.ptr);
+            free(names.ptr);
+            return false;
+        }
+        *args_json++ = '\0';
+
+        char **args = NULL;
+        int arg_count = 0;
+        if (!agent_json_parse_string_array(args_json, &args, &arg_count)) {
+            snprintf(err, err_len, "unable to parse docker args for %s", name);
+            free(inspect.ptr);
+            free(names.ptr);
+            return false;
+        }
+
+        int mount_count = w->working_directories.len;
+        bool mount_temp = w->cfg->temp_directory[0] != '\0';
+        int argv_cap = 16 + arg_count + (mount_count + (mount_temp ? 1 : 0)) * 2;
+        char **argv = xmalloc((size_t)argv_cap * sizeof(char *));
+        char **mount_args = xmalloc((size_t)(mount_count + (mount_temp ? 1 : 0) + 1) *
+                                    sizeof(char *));
+        int mount_args_len = 0;
+        bool was_running = !strcmp(state, "running");
+
+        if (was_running) {
+            char *stop_argv[] = {(char *)docker_command, "stop", name, NULL};
+            agent_buf stop_out = {0};
+            if (!agent_docker_capture(docker_command, stop_argv, "docker stop",
+                                      &stop_out)) {
+                snprintf(err, err_len, "unable to stop docker sandbox: %s", name);
+                free(stop_out.ptr);
+                free(argv);
+                free(mount_args);
+                agent_string_array_free(args, arg_count);
+                free(inspect.ptr);
+                free(names.ptr);
+                return false;
+            }
+            free(stop_out.ptr);
+        }
+
+        char *rm_argv[] = {(char *)docker_command, "rm", name, NULL};
+        agent_buf rm_out = {0};
+        if (!agent_docker_capture(docker_command, rm_argv, "docker rm", &rm_out)) {
+            snprintf(err, err_len, "unable to remove docker sandbox: %s", name);
+            free(rm_out.ptr);
+            free(argv);
+            free(mount_args);
+            agent_string_array_free(args, arg_count);
+            free(inspect.ptr);
+            free(names.ptr);
+            return false;
+        }
+        free(rm_out.ptr);
+
+        int argc = 0;
+        argv[argc++] = (char *)docker_command;
+        argv[argc++] = was_running ? "run" : "create";
+        if (was_running) argv[argc++] = "-d";
+        argv[argc++] = "--name";
+        argv[argc++] = name;
+        argv[argc++] = "--label";
+        argv[argc++] = "ds4:sandbox";
+        for (int i = 0; i < mount_count; i++) {
+            const char *root = w->working_directories.v[i];
+            size_t n = strlen(root) * 2 + 2;
+            char *mount = xmalloc(n);
+            snprintf(mount, n, "%s:%s", root, root);
+            mount_args[mount_args_len++] = mount;
+            argv[argc++] = "-v";
+            argv[argc++] = mount;
+        }
+        if (mount_temp) {
+            size_t n = strlen(w->cfg->temp_directory) * 2 + 2;
+            char *mount = xmalloc(n);
+            snprintf(mount, n, "%s:%s", w->cfg->temp_directory,
+                     w->cfg->temp_directory);
+            mount_args[mount_args_len++] = mount;
+            argv[argc++] = "-v";
+            argv[argc++] = mount;
+        }
+        argv[argc++] = image;
+        argv[argc++] = path;
+        for (int i = 0; i < arg_count; i++)
+            argv[argc++] = args[i];
+        argv[argc] = NULL;
+
+        agent_buf create_out = {0};
+        bool ok = agent_docker_capture(docker_command, argv,
+                                       was_running ? "docker run" : "docker create",
+                                       &create_out);
+        for (int i = 0; i < mount_args_len; i++) free(mount_args[i]);
+        free(mount_args);
+        free(argv);
+        agent_string_array_free(args, arg_count);
+        free(inspect.ptr);
+        if (!ok) {
+            snprintf(err, err_len, "unable to recreate docker sandbox: %s", name);
+            free(create_out.ptr);
+            free(names.ptr);
+            return false;
+        }
+        free(create_out.ptr);
+        refreshed++;
+    }
+
+    free(names.ptr);
+    if (refreshed > 0)
+        printf("updated docker sandbox mounts for %d container%s\n",
+               refreshed, refreshed == 1 ? "" : "s");
+    return true;
 }
 
 static void agent_command_docker_list(agent_worker *w) {
@@ -12472,16 +12758,28 @@ static int run_agent(ds4_engine *engine, agent_config *cfg) {
                                 if (op == '+') {
                                     if (agent_worker_add_workspace(&worker, arg,
                                                                    resolved, sizeof(resolved),
-                                                                   err, sizeof(err)))
+                                                                   err, sizeof(err))) {
                                         printf("added workspace %s\n", resolved);
-                                    else
+                                        char docker_err[256] = {0};
+                                        if (!agent_docker_refresh_mounts(&worker,
+                                                                         docker_err,
+                                                                         sizeof(docker_err)))
+                                            printf("docker sandbox mount update failed: %s\n",
+                                                   docker_err);
+                                    } else
                                         printf("workspace add failed: %s\n", err);
                                 } else {
                                     if (agent_worker_remove_workspace(&worker, arg,
                                                                       resolved, sizeof(resolved),
-                                                                      err, sizeof(err)))
+                                                                      err, sizeof(err))) {
                                         printf("removed workspace %s\n", resolved);
-                                    else
+                                        char docker_err[256] = {0};
+                                        if (!agent_docker_refresh_mounts(&worker,
+                                                                         docker_err,
+                                                                         sizeof(docker_err)))
+                                            printf("docker sandbox mount update failed: %s\n",
+                                                   docker_err);
+                                    } else
                                         printf("workspace remove failed: %s\n", err);
                                 }
                             }
