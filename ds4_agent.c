@@ -526,6 +526,7 @@ static bool agent_slash_command_known(const char *cmd) {
            !strcmp(cmd, "/save") ||
            !strcmp(cmd, "/compact") ||
            !strcmp(cmd, "/list") ||
+           !strcmp(cmd, "/docker list") ||
            !strcmp(cmd, "/quit") ||
            !strcmp(cmd, "/exit") ||
            !strcmp(cmd, "/new") ||
@@ -7893,31 +7894,56 @@ static bool agent_command_in_path(const char *command) {
     return false;
 }
 
-static bool agent_docker_version_works(const char *docker_command) {
-    if (!docker_command || !docker_command[0]) return false;
+static bool agent_read_docker_version(const char *docker_command,
+                                      char *version, size_t version_len) {
+    if (!docker_command || !docker_command[0] || !version || version_len == 0)
+        return false;
+    version[0] = '\0';
+
+    int pipefd[2];
+    if (pipe(pipefd) != 0) return false;
 
     pid_t pid = fork();
-    if (pid < 0) return false;
+    if (pid < 0) {
+        close(pipefd[0]);
+        close(pipefd[1]);
+        return false;
+    }
     if (pid == 0) {
         int devnull = open("/dev/null", O_RDWR);
+        close(pipefd[0]);
+        dup2(pipefd[1], STDOUT_FILENO);
         if (devnull >= 0) {
-            dup2(devnull, STDOUT_FILENO);
             dup2(devnull, STDERR_FILENO);
             close(devnull);
         }
+        close(pipefd[1]);
         if (strchr(docker_command, '/')) {
-            execl(docker_command, docker_command, "version", (char *)NULL);
+            execl(docker_command, docker_command, "version", "--format",
+                  "{{.Client.Version}}", (char *)NULL);
         } else {
-            execlp(docker_command, docker_command, "version", (char *)NULL);
+            execlp(docker_command, docker_command, "version", "--format",
+                   "{{.Client.Version}}", (char *)NULL);
         }
         _exit(127);
+    }
+
+    close(pipefd[1]);
+    ssize_t nread = read(pipefd[0], version, version_len - 1);
+    close(pipefd[0]);
+    if (nread < 0) nread = 0;
+    version[nread] = '\0';
+    while (nread > 0 &&
+           (version[nread - 1] == '\n' || version[nread - 1] == '\r' ||
+            version[nread - 1] == ' ' || version[nread - 1] == '\t')) {
+        version[--nread] = '\0';
     }
 
     int status = 0;
     while (waitpid(pid, &status, 0) < 0) {
         if (errno != EINTR) return false;
     }
-    return WIFEXITED(status) && WEXITSTATUS(status) == 0;
+    return nread > 0 && WIFEXITED(status) && WEXITSTATUS(status) == 0;
 }
 
 static char *agent_bash_sandbox_profile(const agent_path_list *roots,
@@ -10798,6 +10824,7 @@ static void runtime_help(void) {
     puts("  /save        Save the current session.");
     puts("  /compact     Compact the current session context now.");
     puts("  /list        List saved sessions.");
+    puts("  /docker list List Docker containers tagged ds4:sandbox.");
     puts("  /switch SHA  Load a saved session and show recent history.");
     puts("  /del SHA     Delete a saved session.");
     puts("  /strip SHA   Strip KV payload; /switch rebuilds it by prefill.");
@@ -10842,6 +10869,116 @@ static void editor_write_welcome_banner(agent_editor *editor,
     char banner[256];
     agent_format_welcome_banner(cfg, banner, sizeof(banner));
     editor_write_async(editor, banner, strlen(banner), prompt, statusline, true);
+}
+
+static void agent_command_docker_list(agent_worker *w) {
+    const char *docker_command =
+        (w && w->cfg && w->cfg->docker_command && w->cfg->docker_command[0]) ?
+        w->cfg->docker_command : "docker";
+    int pipefd[2];
+    if (pipe(pipefd) != 0) {
+        printf("docker list failed: pipe: %s\n", strerror(errno));
+        return;
+    }
+
+    pid_t pid = fork();
+    if (pid < 0) {
+        close(pipefd[0]);
+        close(pipefd[1]);
+        printf("docker list failed: fork: %s\n", strerror(errno));
+        return;
+    }
+    if (pid == 0) {
+        close(pipefd[0]);
+        dup2(pipefd[1], STDOUT_FILENO);
+        dup2(pipefd[1], STDERR_FILENO);
+        close(pipefd[1]);
+        if (strchr(docker_command, '/')) {
+            execl(docker_command, docker_command, "ps", "-a",
+                  "--filter", "label=ds4:sandbox",
+                  "--format", "{{.Names}}\t{{.State}}\t{{.Status}}",
+                  (char *)NULL);
+        } else {
+            execlp(docker_command, docker_command, "ps", "-a",
+                   "--filter", "label=ds4:sandbox",
+                   "--format", "{{.Names}}\t{{.State}}\t{{.Status}}",
+                   (char *)NULL);
+        }
+        _exit(127);
+    }
+
+    close(pipefd[1]);
+    agent_buf out = {0};
+    char chunk[4096];
+    for (;;) {
+        ssize_t n = read(pipefd[0], chunk, sizeof(chunk));
+        if (n > 0) {
+            agent_buf_append(&out, chunk, (size_t)n);
+            continue;
+        }
+        if (n == 0) break;
+        if (errno == EINTR) continue;
+        close(pipefd[0]);
+        while (waitpid(pid, NULL, 0) < 0 && errno == EINTR) {}
+        printf("docker list failed: read: %s\n", strerror(errno));
+        free(out.ptr);
+        return;
+    }
+    close(pipefd[0]);
+
+    int status = 0;
+    while (waitpid(pid, &status, 0) < 0) {
+        if (errno != EINTR) {
+            printf("docker list failed: waitpid: %s\n", strerror(errno));
+            free(out.ptr);
+            return;
+        }
+    }
+
+    if (!WIFEXITED(status) || WEXITSTATUS(status) != 0) {
+        printf("docker list failed:\n%s", out.ptr ? out.ptr : "");
+        if (!out.len || out.ptr[out.len - 1] != '\n') printf("\n");
+        free(out.ptr);
+        return;
+    }
+
+    if (!out.len) {
+        printf("no ds4 sandbox containers found\n");
+        free(out.ptr);
+        return;
+    }
+
+    bool color = isatty(STDOUT_FILENO) != 0;
+    int shown = 0;
+    char *save = NULL;
+    for (char *line = strtok_r(out.ptr, "\n", &save);
+         line;
+         line = strtok_r(NULL, "\n", &save)) {
+        char *name = line;
+        char *state = strchr(line, '\t');
+        if (!state) continue;
+        *state++ = '\0';
+        char *status_text = strchr(state, '\t');
+        if (!status_text) continue;
+        *status_text++ = '\0';
+
+        const char *state_color = "";
+        const char *reset = "";
+        if (color) {
+            if (!strcmp(state, "running")) {
+                state_color = "\x1b[32m";
+                reset = "\x1b[0m";
+            } else {
+                state_color = "\x1b[90m";
+                reset = "\x1b[0m";
+            }
+        }
+        printf("%s%-24s %-10s%s %s\n",
+               state_color, name, state, reset, status_text);
+        shown++;
+    }
+    if (!shown) printf("no ds4 sandbox containers found\n");
+    free(out.ptr);
 }
 
 /* Initialize the worker, cache directory, sysprompt checkpoint path, trace file,
@@ -11570,6 +11707,8 @@ static int run_agent(ds4_engine *engine, agent_config *cfg) {
                         printf("compaction scheduled at next safe point\n");
                 } else if (!strcmp(cmd, "/list")) {
                     agent_worker_list_sessions(&worker);
+                } else if (!strcmp(cmd, "/docker list")) {
+                    agent_command_docker_list(&worker);
                 } else if (!strncmp(cmd, "/power", 6) &&
                            (cmd[6] == '\0' || cmd[6] == ' ' || cmd[6] == '\t')) {
                     char *arg = cmd + 6;
@@ -11786,6 +11925,7 @@ static int run_agent(ds4_engine *engine, agent_config *cfg) {
 #ifndef DS4_AGENT_TEST_NO_MAIN
 int main(int argc, char **argv) {
     agent_config cfg = parse_options(argc, argv);
+    char docker_version[128] = {0};
     if (cfg.docker_command && !agent_executable_exists(cfg.docker_command)) {
         fprintf(stderr, "ds4-agent: --docker-command must point to an executable: %s\n",
                 cfg.docker_command);
@@ -11798,12 +11938,18 @@ int main(int argc, char **argv) {
                     docker_command);
             return 1;
         }
-        if (!agent_docker_version_works(docker_command)) {
+        if (!agent_read_docker_version(docker_command, docker_version,
+                                       sizeof(docker_version))) {
             fprintf(stderr, "ds4-agent: docker command failed: %s version\n",
                     docker_command);
             return 1;
         }
-        fprintf(stdout, "ds4-agent: sandboxing via docker is available\n");
+        bool color = isatty(STDOUT_FILENO) != 0;
+        fprintf(stdout, "ds4-agent: sandboxing via docker is available ");
+        if (color) fprintf(stdout, "\x1b[38;5;81m");
+        fprintf(stdout, "(docker %s)", docker_version);
+        if (color) fprintf(stdout, "\x1b[0m");
+        fputc('\n', stdout);
     }
     if (cfg.chdir_path && chdir(cfg.chdir_path) != 0) {
         fprintf(stderr, "ds4-agent: failed to chdir to %s: %s\n",
