@@ -7110,6 +7110,22 @@ static void test_agent_sandbox_profile_includes_path_dirs(void) {
 }
 #endif
 
+static void test_agent_command_in_path(void) {
+    const char *old_path = getenv("PATH");
+    char *saved_path = old_path ? xstrdup(old_path) : NULL;
+    setenv("PATH", "/bin:/usr/bin", 1);
+
+    AGENT_TEST_ASSERT(agent_command_in_path("sh"));
+    AGENT_TEST_ASSERT(!agent_command_in_path("ds4-agent-definitely-missing"));
+
+    if (saved_path) {
+        setenv("PATH", saved_path, 1);
+        free(saved_path);
+    } else {
+        unsetenv("PATH");
+    }
+}
+
 static void ds4_agent_unit_tests_run(void) {
     test_agent_edit_upto_tail_newline_is_not_part_of_anchor();
     test_agent_edit_upto_requires_tail_after_newline_strip();
@@ -7119,6 +7135,7 @@ static void ds4_agent_unit_tests_run(void) {
     test_agent_path_list_remove_prefix();
     test_agent_remove_workspace_clears_auto_allowed();
     test_agent_remove_auto_allowed_path_directly();
+    test_agent_command_in_path();
 #ifdef __APPLE__
     test_agent_sandbox_profile_includes_path_dirs();
 #endif
@@ -7832,6 +7849,35 @@ static void agent_sbpl_append_path_dirs(agent_buf *b) {
         if (!end) break;
         p = end + 1;
     }
+}
+
+static bool agent_command_in_path(const char *command) {
+    if (!command || !command[0]) return false;
+    if (strchr(command, '/')) return access(command, X_OK) == 0;
+
+    const char *path = getenv("PATH");
+    if (!path || !path[0]) return false;
+    const char *p = path;
+    while (*p) {
+        const char *end = strchr(p, ':');
+        size_t n = end ? (size_t)(end - p) : strlen(p);
+        if (n > 0) {
+            char dir[PATH_MAX];
+            if (n >= sizeof(dir)) n = sizeof(dir) - 1;
+            memcpy(dir, p, n);
+            dir[n] = '\0';
+
+            char candidate[PATH_MAX];
+            int written = snprintf(candidate, sizeof(candidate), "%s/%s", dir,
+                                   command);
+            if (written > 0 && written < (int)sizeof(candidate) &&
+                access(candidate, X_OK) == 0)
+                return true;
+        }
+        if (!end) break;
+        p = end + 1;
+    }
+    return false;
 }
 
 static char *agent_bash_sandbox_profile(const agent_path_list *roots,
@@ -11700,6 +11746,13 @@ static int run_agent(ds4_engine *engine, agent_config *cfg) {
 #ifndef DS4_AGENT_TEST_NO_MAIN
 int main(int argc, char **argv) {
     agent_config cfg = parse_options(argc, argv);
+    if ((cfg.docker_build || cfg.docker_container || cfg.docker_image) &&
+        !agent_command_in_path("docker")) {
+        fprintf(stderr, "ds4-agent: docker command not found in PATH\n");
+        return 1;
+    } else {
+        fprintf(stdout, "ds4-agent: docker command found in PATH\n");
+    }
     if (cfg.chdir_path && chdir(cfg.chdir_path) != 0) {
         fprintf(stderr, "ds4-agent: failed to chdir to %s: %s\n",
                 cfg.chdir_path, strerror(errno));
