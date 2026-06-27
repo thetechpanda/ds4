@@ -113,6 +113,7 @@ typedef struct {
     int power_percent;
     char error[256];
     char workspace[PATH_MAX];
+    char docker_container[256];
 } agent_status;
 
 typedef struct agent_bash_job agent_bash_job;
@@ -9557,6 +9558,13 @@ static void worker_update_status_workspace_locked(agent_worker *w) {
     snprintf(w->status.workspace, sizeof(w->status.workspace), "%s", root);
 }
 
+static void worker_update_status_docker_locked(agent_worker *w) {
+    const char *name = (w && w->cfg && w->cfg->docker_container) ?
+        w->cfg->docker_container : "";
+    snprintf(w->status.docker_container,
+             sizeof(w->status.docker_container), "%s", name);
+}
+
 /* Request interruption at the next model/tool polling point. */
 static void worker_interrupt(agent_worker *w) {
     pthread_mutex_lock(&w->mu);
@@ -9598,6 +9606,7 @@ static void worker_consume(agent_worker *w, char **out, size_t *out_len, agent_s
     w->status.ctx_size = w->cfg->gen.ctx_size;
     w->status.power_percent = worker_status_power_locked(w);
     worker_update_status_workspace_locked(w);
+    worker_update_status_docker_locked(w);
     if (status) *status = w->status;
     w->wake_pending = false;
     pthread_mutex_unlock(&w->mu);
@@ -9609,6 +9618,7 @@ static void worker_get_status(agent_worker *w, agent_status *status) {
     w->status.ctx_size = w->cfg->gen.ctx_size;
     w->status.power_percent = worker_status_power_locked(w);
     worker_update_status_workspace_locked(w);
+    worker_update_status_docker_locked(w);
     *status = w->status;
     pthread_mutex_unlock(&w->mu);
 }
@@ -9844,9 +9854,14 @@ static const char *agent_prefill_label(const agent_status *st) {
 static void build_status_text(const agent_status *st, char *buf, size_t len) {
     char used[32], total_ctx[32];
     char power[32];
+    char sandbox[512];
     agent_format_ctx_size(st->ctx_used, used, sizeof(used));
     agent_format_ctx_size(st->ctx_size, total_ctx, sizeof(total_ctx));
     agent_power_status_suffix(st, power, sizeof(power));
+    if (st->docker_container[0])
+        snprintf(sandbox, sizeof(sandbox), "✅ %s | ", st->docker_container);
+    else
+        snprintf(sandbox, sizeof(sandbox), "🚨 no-sandbox | ");
 
     switch (st->state) {
     case AGENT_WORKER_PREFILL: {
@@ -9857,36 +9872,39 @@ static void build_status_text(const agent_status *st, char *buf, size_t len) {
         char bar[AGENT_PROGRESS_BAR_MAX_BYTES];
         agent_progress_bar(done, total, st->prefill_tps, bar, sizeof(bar),
                            stdout_is_tty());
-        snprintf(buf, len, "ctx %s/%s | %s %s %d/%d %.1f%%%s",
-                 used, total_ctx, agent_prefill_label(st), bar,
+        snprintf(buf, len, "%sctx %s/%s | %s %s %d/%d %.1f%%%s",
+                 sandbox, used, total_ctx, agent_prefill_label(st), bar,
                  done, total, pct, power);
         break;
     }
     case AGENT_WORKER_GENERATING:
-        snprintf(buf, len, "ctx %s/%s | generation %d tokens%s %.1f t/s%s",
-                 used, total_ctx, st->generated,
+        snprintf(buf, len, "%sctx %s/%s | generation %d tokens%s %.1f t/s%s",
+                 sandbox, used, total_ctx, st->generated,
                  st->greedy_sampling ? " ❄️" : "", st->gen_tps, power);
         break;
     case AGENT_WORKER_COMPACTING:
-        snprintf(buf, len, "ctx %s/%s | COMPACTING summary %d tokens %.1f t/s%s",
-                 used, total_ctx, st->generated, st->gen_tps, power);
+        snprintf(buf, len, "%sctx %s/%s | COMPACTING summary %d tokens %.1f t/s%s",
+                 sandbox, used, total_ctx, st->generated, st->gen_tps, power);
         break;
     case AGENT_WORKER_DRAINING:
-        snprintf(buf, len, "ctx %s/%s | stopping after distributed cluster drains%s",
-                 used, total_ctx, power);
+        snprintf(buf, len, "%sctx %s/%s | stopping after distributed cluster drains%s",
+                 sandbox, used, total_ctx, power);
         break;
     case AGENT_WORKER_SAVING:
-        snprintf(buf, len, "ctx %s/%s | saving session%s", used, total_ctx, power);
+        snprintf(buf, len, "%sctx %s/%s | saving session%s",
+                 sandbox, used, total_ctx, power);
         break;
     case AGENT_WORKER_ERROR:
-        snprintf(buf, len, "ctx %s/%s | error: %s%s", used, total_ctx,
+        snprintf(buf, len, "%sctx %s/%s | error: %s%s", sandbox, used, total_ctx,
                  st->error[0] ? st->error : "unknown error", power);
         break;
     case AGENT_WORKER_STOPPED:
-        snprintf(buf, len, "ctx %s/%s | interrupted%s", used, total_ctx, power);
+        snprintf(buf, len, "%sctx %s/%s | interrupted%s",
+                 sandbox, used, total_ctx, power);
         break;
     default:
-        snprintf(buf, len, "ctx %s/%s | idle%s", used, total_ctx, power);
+        snprintf(buf, len, "%sctx %s/%s | idle%s",
+                 sandbox, used, total_ctx, power);
         break;
     }
 }
