@@ -526,6 +526,7 @@ static bool agent_slash_command_known(const char *cmd) {
            !strcmp(cmd, "/save") ||
            !strcmp(cmd, "/compact") ||
            !strcmp(cmd, "/list") ||
+           agent_slash_command_with_args(cmd, "/docker create") ||
            !strcmp(cmd, "/docker list") ||
            !strcmp(cmd, "/quit") ||
            !strcmp(cmd, "/exit") ||
@@ -10824,6 +10825,8 @@ static void runtime_help(void) {
     puts("  /save        Save the current session.");
     puts("  /compact     Compact the current session context now.");
     puts("  /list        List saved sessions.");
+    puts("  /docker create IMAGE NAME COMMAND");
+    puts("               Create a tagged Docker sandbox and switch to it.");
     puts("  /docker list List Docker containers tagged ds4:sandbox.");
     puts("  /switch SHA  Load a saved session and show recent history.");
     puts("  /del SHA     Delete a saved session.");
@@ -10904,6 +10907,7 @@ static void agent_command_docker_list(agent_worker *w) {
                    "--format", "{{.Names}}\t{{.State}}\t{{.Status}}",
                    (char *)NULL);
         }
+        dprintf(STDERR_FILENO, "failed to exec docker: %s\n", strerror(errno));
         _exit(127);
     }
 
@@ -10978,6 +10982,172 @@ static void agent_command_docker_list(agent_worker *w) {
         shown++;
     }
     if (!shown) printf("no ds4 sandbox containers found\n");
+    free(out.ptr);
+}
+
+static void agent_command_docker_create(agent_worker *w, char *args) {
+    if (!w || !w->cfg) {
+        printf("docker create failed: worker configuration unavailable\n");
+        return;
+    }
+
+    const char *docker_command =
+        (w->cfg->docker_command && w->cfg->docker_command[0]) ?
+        w->cfg->docker_command : "docker";
+    if (!agent_command_in_path(docker_command)) {
+        printf("docker create failed: docker command not found: %s\n",
+               docker_command);
+        return;
+    }
+
+    while (*args == ' ' || *args == '\t') args++;
+    if (!args[0]) {
+        printf("usage: /docker create <image> <name> <command>\n");
+        return;
+    }
+
+    char *image = args;
+    while (*args && *args != ' ' && *args != '\t') args++;
+    if (*args) *args++ = '\0';
+    while (*args == ' ' || *args == '\t') args++;
+    if (!args[0]) {
+        printf("usage: /docker create <image> <name> <command>\n");
+        return;
+    }
+
+    char *name = args;
+    while (*args && *args != ' ' && *args != '\t') args++;
+    if (*args) *args++ = '\0';
+    while (*args == ' ' || *args == '\t') args++;
+    if (!args[0]) {
+        printf("usage: /docker create <image> <name> <command>\n");
+        return;
+    }
+    char *command = args;
+
+    int mount_count = w->working_directories.len;
+    bool mount_temp = w->cfg->temp_directory[0] != '\0';
+    int argv_cap = 16 + (mount_count + (mount_temp ? 1 : 0)) * 2;
+    int mount_argc = mount_count + (mount_temp ? 1 : 0);
+    char **argv = xmalloc((size_t)argv_cap * sizeof(char *));
+    memset(argv, 0, (size_t)argv_cap * sizeof(char *));
+    char **mount_args = mount_argc > 0 ?
+        xmalloc((size_t)mount_argc * sizeof(char *)) : NULL;
+    int mount_args_len = 0;
+    int argc = 0;
+    argv[argc++] = (char *)docker_command;
+    argv[argc++] = "run";
+    argv[argc++] = "-d";
+    argv[argc++] = "--name";
+    argv[argc++] = name;
+    argv[argc++] = "--label";
+    argv[argc++] = "ds4:sandbox";
+    for (int i = 0; i < mount_count; i++) {
+        const char *root = w->working_directories.v[i];
+        size_t n = strlen(root) * 2 + 2;
+        char *mount = xmalloc(n);
+        snprintf(mount, n, "%s:%s", root, root);
+        mount_args[mount_args_len++] = mount;
+        argv[argc++] = "-v";
+        argv[argc++] = mount;
+    }
+    if (mount_temp) {
+        size_t n = strlen(w->cfg->temp_directory) * 2 + 2;
+        char *mount = xmalloc(n);
+        snprintf(mount, n, "%s:%s", w->cfg->temp_directory,
+                 w->cfg->temp_directory);
+        mount_args[mount_args_len++] = mount;
+        argv[argc++] = "-v";
+        argv[argc++] = mount;
+    }
+    argv[argc++] = image;
+    argv[argc++] = "/bin/sh";
+    argv[argc++] = "-lc";
+    argv[argc++] = command;
+    argv[argc] = NULL;
+
+    int pipefd[2];
+    if (pipe(pipefd) != 0) {
+        printf("docker create failed: pipe: %s\n", strerror(errno));
+        for (int i = 0; i < mount_args_len; i++) free(mount_args[i]);
+        free(mount_args);
+        free(argv);
+        return;
+    }
+
+    pid_t pid = fork();
+    if (pid < 0) {
+        close(pipefd[0]);
+        close(pipefd[1]);
+        printf("docker create failed: fork: %s\n", strerror(errno));
+        for (int i = 0; i < mount_args_len; i++) free(mount_args[i]);
+        free(mount_args);
+        free(argv);
+        return;
+    }
+    if (pid == 0) {
+        close(pipefd[0]);
+        dup2(pipefd[1], STDOUT_FILENO);
+        dup2(pipefd[1], STDERR_FILENO);
+        close(pipefd[1]);
+        if (strchr(docker_command, '/')) execv(docker_command, argv);
+        else execvp(docker_command, argv);
+        dprintf(STDERR_FILENO, "failed to exec docker: %s\n", strerror(errno));
+        _exit(127);
+    }
+
+    close(pipefd[1]);
+    agent_buf out = {0};
+    char chunk[4096];
+    for (;;) {
+        ssize_t n = read(pipefd[0], chunk, sizeof(chunk));
+        if (n > 0) {
+            agent_buf_append(&out, chunk, (size_t)n);
+            continue;
+        }
+        if (n == 0) break;
+        if (errno == EINTR) continue;
+        close(pipefd[0]);
+        while (waitpid(pid, NULL, 0) < 0 && errno == EINTR) {}
+        printf("docker create failed: read: %s\n", strerror(errno));
+        free(out.ptr);
+        for (int i = 0; i < mount_args_len; i++) free(mount_args[i]);
+        free(mount_args);
+        free(argv);
+        return;
+    }
+    close(pipefd[0]);
+
+    int status = 0;
+    while (waitpid(pid, &status, 0) < 0) {
+        if (errno != EINTR) {
+            printf("docker create failed: waitpid: %s\n", strerror(errno));
+            free(out.ptr);
+            for (int i = 0; i < mount_args_len; i++) free(mount_args[i]);
+            free(mount_args);
+            free(argv);
+            return;
+        }
+    }
+
+    for (int i = 0; i < mount_args_len; i++) free(mount_args[i]);
+    free(mount_args);
+    free(argv);
+
+    if (!WIFEXITED(status) || WEXITSTATUS(status) != 0) {
+        printf("docker create failed:\n%s", out.ptr ? out.ptr : "");
+        if (!out.len || out.ptr[out.len - 1] != '\n') printf("\n");
+        free(out.ptr);
+        return;
+    }
+
+    w->cfg->docker_container = xstrdup(name);
+    w->cfg->docker_image = xstrdup(image);
+    printf("docker sandbox switched to %s\n", name);
+    if (out.ptr && out.ptr[0]) {
+        printf("%s", out.ptr);
+        if (out.ptr[out.len - 1] != '\n') printf("\n");
+    }
     free(out.ptr);
 }
 
@@ -11709,6 +11879,14 @@ static int run_agent(ds4_engine *engine, agent_config *cfg) {
                     agent_worker_list_sessions(&worker);
                 } else if (!strcmp(cmd, "/docker list")) {
                     agent_command_docker_list(&worker);
+                } else if (!strncmp(cmd, "/docker create", 14) &&
+                           (cmd[14] == '\0' || cmd[14] == ' ' || cmd[14] == '\t')) {
+                    if (busy) {
+                        printf("command requires the model to be idle: %s\n", cmd);
+                    } else {
+                        char *arg = cmd + 14;
+                        agent_command_docker_create(&worker, arg);
+                    }
                 } else if (!strncmp(cmd, "/power", 6) &&
                            (cmd[6] == '\0' || cmd[6] == ' ' || cmd[6] == '\t')) {
                     char *arg = cmd + 6;
