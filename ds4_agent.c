@@ -36,6 +36,8 @@ int linenoiseEditInsert(struct linenoiseState *l, const char *c, size_t clen);
 
 static int set_nonblock(int fd, bool on, int *old_flags);
 static bool agent_parse_bool_default(const char *s, bool def);
+static bool agent_executable_exists(const char *path);
+static bool agent_command_in_path(const char *command);
 
 /* ============================================================================
  * Configuration, Worker State, And Streaming Types
@@ -9732,13 +9734,6 @@ static char *agent_format_user_prompt_echo(const char *text) {
     return agent_buf_take(&b);
 }
 
-static void agent_echo_user_prompt(const char *text) {
-    char *msg = agent_format_user_prompt_echo(text);
-    printf("%s", msg);
-    fflush(stdout);
-    free(msg);
-}
-
 /* ============================================================================
  * Terminal Prompt, Status Footer, And Async Output Rendering
  * ============================================================================
@@ -9936,17 +9931,6 @@ static char *agent_prompt_queue_take_all(agent_prompt_queue *q) {
         free(q->v[i]);
     }
     q->len = 0;
-    return agent_buf_take(&b);
-}
-
-static char *agent_prompt_queue_take_all_echo(agent_prompt_queue *q) {
-    if (!q->len) return NULL;
-    agent_buf b = {0};
-    for (size_t i = 0; i < q->len; i++) {
-        char *echo = agent_format_user_prompt_echo(q->v[i]);
-        agent_buf_puts(&b, echo);
-        free(echo);
-    }
     return agent_buf_take(&b);
 }
 
@@ -10825,8 +10809,9 @@ static void runtime_help(void) {
     puts("  /save        Save the current session.");
     puts("  /compact     Compact the current session context now.");
     puts("  /list        List saved sessions.");
-    puts("  /docker create IMAGE NAME COMMAND");
+    puts("  /docker create IMAGE NAME [COMMAND]");
     puts("               Create a tagged Docker sandbox and switch to it.");
+    puts("               Defaults to `sleep infinity` when COMMAND is omitted.");
     puts("  /docker list List Docker containers tagged ds4:sandbox.");
     puts("  /switch SHA  Load a saved session and show recent history.");
     puts("  /del SHA     Delete a saved session.");
@@ -11002,7 +10987,7 @@ static void agent_command_docker_create(agent_worker *w, char *args) {
 
     while (*args == ' ' || *args == '\t') args++;
     if (!args[0]) {
-        printf("usage: /docker create <image> <name> <command>\n");
+        printf("usage: /docker create <image> <name> [command]\n");
         return;
     }
 
@@ -11011,7 +10996,7 @@ static void agent_command_docker_create(agent_worker *w, char *args) {
     if (*args) *args++ = '\0';
     while (*args == ' ' || *args == '\t') args++;
     if (!args[0]) {
-        printf("usage: /docker create <image> <name> <command>\n");
+        printf("usage: /docker create <image> <name> [command]\n");
         return;
     }
 
@@ -11019,11 +11004,7 @@ static void agent_command_docker_create(agent_worker *w, char *args) {
     while (*args && *args != ' ' && *args != '\t') args++;
     if (*args) *args++ = '\0';
     while (*args == ' ' || *args == '\t') args++;
-    if (!args[0]) {
-        printf("usage: /docker create <image> <name> <command>\n");
-        return;
-    }
-    char *command = args;
+    const char *command = args[0] ? args : "sleep infinity";
 
     int mount_count = w->working_directories.len;
     bool mount_temp = w->cfg->temp_directory[0] != '\0';
@@ -11063,7 +11044,7 @@ static void agent_command_docker_create(agent_worker *w, char *args) {
     argv[argc++] = image;
     argv[argc++] = "/bin/sh";
     argv[argc++] = "-lc";
-    argv[argc++] = command;
+    argv[argc++] = (char *)command;
     argv[argc] = NULL;
 
     int pipefd[2];
@@ -11716,13 +11697,7 @@ static int run_agent(ds4_engine *engine, agent_config *cfg) {
         free(out);
 
         if (worker_take_queued_user_drain_request(&worker)) {
-            char *echo = agent_prompt_queue_take_all_echo(&queue);
             char *queued = agent_prompt_queue_take_all(&queue);
-            if (echo) {
-                build_footer_text(&st, &queue, footer_cols, statusline, sizeof(statusline));
-                editor_write_async(&editor, echo, strlen(echo), prompt, statusline, true);
-                free(echo);
-            }
             worker_answer_queued_user_drain(&worker, queued);
             continue;
         }
@@ -11792,19 +11767,14 @@ static int run_agent(ds4_engine *engine, agent_config *cfg) {
         }
 
         if (!initial_pending && queue.len && worker_is_idle(&worker)) {
-            char *echo = agent_prompt_queue_take_all_echo(&queue);
             char *queued = agent_prompt_queue_take_all(&queue);
             if (worker_submit(&worker, queued)) {
                 linenoiseHistoryAdd(queued);
                 linenoiseHistorySave(hist);
-                build_footer_text(&st, &queue, footer_cols, statusline, sizeof(statusline));
-                if (echo)
-                    editor_write_async(&editor, echo, strlen(echo), prompt, statusline, true);
             } else {
                 agent_prompt_queue_push_front(&queue, queued);
                 queued = NULL;
             }
-            free(echo);
             free(queued);
         }
 
@@ -11856,6 +11826,14 @@ static int run_agent(ds4_engine *engine, agent_config *cfg) {
                 bool was_below_output = editor.prompt_below_output;
                 bool had_output_line_open = editor.output_line_open;
                 int saved_output_col = editor.output_col;
+                bool should_echo = cmd[0] != '\0' &&
+                    !(cmd[0] == '/' && !agent_slash_command_known(cmd));
+                if (should_echo) {
+                    char *echo = agent_format_user_prompt_echo(cmd);
+                    editor_write_async(&editor, echo, strlen(echo),
+                                       prompt, statusline, true);
+                    free(echo);
+                }
                 editor_stop(&editor);
                 bool busy = !worker_is_idle(&worker);
                 if (!cmd[0]) {
@@ -12051,7 +12029,6 @@ static int run_agent(ds4_engine *engine, agent_config *cfg) {
                     linenoiseHistoryAdd(cmd);
                     linenoiseHistorySave(hist);
                     if (worker_submit(&worker, cmd)) {
-                        agent_echo_user_prompt(cmd);
                     } else {
                         restore_line = xstrdup(cmd);
                     }
