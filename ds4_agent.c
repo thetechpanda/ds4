@@ -91,6 +91,7 @@ typedef struct {
     bool non_interactive;
     bool strict_sandbox;
     bool docker_auto;
+    bool preserve_agent_files;
 } agent_config;
 
 typedef enum {
@@ -540,6 +541,8 @@ static bool agent_slash_command_known(const char *cmd) {
            !strcmp(cmd, "/list") ||
            !strcmp(cmd, "/strict_sandbox") ||
            !strcmp(cmd, "/no_strict_sandbox") ||
+           !strcmp(cmd, "/preserve_agent_files") ||
+           !strcmp(cmd, "/no_preserve_agent_files") ||
            !strcmp(cmd, "/docker help") ||
            !strcmp(cmd, "/docker debug") ||
            agent_slash_command_with_args(cmd, "/docker create") ||
@@ -552,6 +555,7 @@ static bool agent_slash_command_known(const char *cmd) {
            !strcmp(cmd, "/exit") ||
            !strcmp(cmd, "/new") ||
            agent_slash_command_with_args(cmd, "/power") ||
+           agent_slash_command_with_args(cmd, "/thinking") ||
            agent_slash_command_with_args(cmd, "/switch") ||
            agent_slash_command_with_args(cmd, "/del") ||
            agent_slash_command_with_args(cmd, "/strip") ||
@@ -635,6 +639,7 @@ static agent_config parse_options(int argc, char **argv) {
         },
         .strict_sandbox = true,
         .docker_auto = true,
+        .preserve_agent_files = false,
     };
     if (!getcwd(c.launch_working_directory, sizeof(c.launch_working_directory))) {
         fprintf(stderr, "ds4-agent: failed to get current working directory: %s\n",
@@ -677,6 +682,10 @@ static agent_config parse_options(int argc, char **argv) {
             c.strict_sandbox = false;
         } else if (!strcmp(arg, "--no-docker-auto")) {
             c.docker_auto = false;
+        } else if (!strcmp(arg, "--preserve-agent-files")) {
+            c.preserve_agent_files = true;
+        } else if (!strcmp(arg, "--no-preserve-agent-files")) {
+            c.preserve_agent_files = false;
         } else if (!strcmp(arg, "-sys") || !strcmp(arg, "--system")) {
             c.gen.system = need_arg(&i, argc, argv, arg);
         } else if (!strcmp(arg, "--trace")) {
@@ -7758,6 +7767,9 @@ static char *agent_tool_web_fetch(agent_worker *w, const agent_tool_call *call) 
     }
     free(head);
     free(md);
+    /* Delete the temp file unless preserve_agent_files is set. */
+    if (w && w->cfg && !w->cfg->preserve_agent_files && path[0])
+        unlink(path);
     return agent_buf_take(&out);
 }
 
@@ -7822,6 +7834,11 @@ static void agent_bash_job_free(agent_bash_job *job) {
     }
     if (job->pipe_fd >= 0) close(job->pipe_fd);
     if (job->tmp_fd >= 0) close(job->tmp_fd);
+    /* Delete the temp output file unless preserve_agent_files is set. */
+    if (job->worker && job->worker->cfg &&
+        !job->worker->cfg->preserve_agent_files &&
+        job->path[0])
+        unlink(job->path);
     free(job->cmd);
     free(job);
 }
@@ -11340,12 +11357,17 @@ static void runtime_help(void) {
     puts("               Require an active Docker sandbox before any tool runs.");
     puts("  /no_strict_sandbox");
     puts("               Allow tools to run without an active Docker sandbox.");
-    runtime_docker_help_body();
+    puts("  /preserve_agent_files");
+    puts("               Preserve agent output files after reading them.");
+    puts("  /no_preserve_agent_files");
+    puts("               Delete agent output files after reading them (default).");
     puts("  /switch SHA  Load a saved session and show recent history.");
     puts("  /del SHA     Delete a saved session.");
     puts("  /strip SHA   Strip KV payload; /switch rebuilds it by prefill.");
     puts("  /history [N] Show N recent user turns from the current session.");
     puts("  /power N     Set GPU duty cycle percentage, 1..100.");
+    puts("  /thinking off|default|max");
+    puts("               Set thinking effort level.");
     puts("  /workspace   List workspace roots; +PATH adds, -PATH removes. The first root is the active workspace.");
     puts("  /purge_auto_files");
     puts("               Delete auto-created files. Lists files, gives 5s to abort.");
@@ -13248,6 +13270,12 @@ static int run_agent(ds4_engine *engine, agent_config *cfg) {
                 } else if (!strcmp(cmd, "/no_strict_sandbox")) {
                     worker.cfg->strict_sandbox = false;
                     printf("strict sandbox disabled\n");
+                } else if (!strcmp(cmd, "/preserve_agent_files")) {
+                    worker.cfg->preserve_agent_files = true;
+                    printf("agent output files will be preserved\n");
+                } else if (!strcmp(cmd, "/no_preserve_agent_files")) {
+                    worker.cfg->preserve_agent_files = false;
+                    printf("agent output files will be deleted after reading\n");
                 } else if (!strcmp(cmd, "/docker help")) {
                     runtime_docker_help();
                 } else if (!strcmp(cmd, "/docker debug")) {
@@ -13309,6 +13337,24 @@ static int run_agent(ds4_engine *engine, agent_config *cfg) {
                         } else {
                             worker_request_power(&worker, power);
                         }
+                    }
+                } else if (!strncmp(cmd, "/thinking", 9) &&
+                           (cmd[9] == '\0' || cmd[9] == ' ' || cmd[9] == '\t')) {
+                    char *arg = cmd + 9;
+                    while (*arg == ' ' || *arg == '\t') arg++;
+                    if (!arg[0]) {
+                        printf("usage: /thinking off|default|max\n");
+                    } else if (!strcmp(arg, "off")) {
+                        worker.cfg->gen.think_mode = DS4_THINK_NONE;
+                        printf("thinking disabled\n");
+                    } else if (!strcmp(arg, "default")) {
+                        worker.cfg->gen.think_mode = DS4_THINK_HIGH;
+                        printf("thinking set to default\n");
+                    } else if (!strcmp(arg, "max")) {
+                        worker.cfg->gen.think_mode = DS4_THINK_MAX;
+                        printf("thinking set to max\n");
+                    } else {
+                        printf("usage: /thinking off|default|max\n");
                     }
                 } else if (!strncmp(cmd, "/workspace", 10) &&
                            (cmd[10] == '\0' || cmd[10] == ' ' || cmd[10] == '\t')) {

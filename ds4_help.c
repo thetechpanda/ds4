@@ -305,6 +305,7 @@ static void print_agent_sessions(FILE *fp, const help_colors *c) {
     opt(fp, c, "/strip ID", "Remove KV payload; the text history can be rebuilt later.");
     opt(fp, c, "/history [N]", "Show N recent user turns from the current session.");
     opt(fp, c, "/power N", "Set GPU duty cycle percentage, 1..100.");
+    opt(fp, c, "/thinking off|default|max", "Set thinking effort level.");
     opt(fp, c, "/docker create IMAGE NAME COMMAND", "Create and switch to a tagged Docker sandbox.");
     opt(fp, c, "/docker list", "List Docker containers tagged ds4:sandbox.");
     opt(fp, c, "/workspace [+-DIR]", "List workspace roots; +DIR adds, -DIR removes. The first root is active.");
