@@ -3801,6 +3801,19 @@ static void agent_buf_append(agent_buf *b, const char *s, size_t n) {
     b->ptr[b->len] = '\0';
 }
 
+static void agent_buf_append_full(agent_buf *b, const char *s, size_t n) {
+    if (!n || b->truncated) return;
+    if (b->len + n + 1 > b->cap) {
+        size_t cap = b->cap ? b->cap * 2 : 4096;
+        while (cap < b->len + n + 1) cap *= 2;
+        b->ptr = xrealloc(b->ptr, cap);
+        b->cap = cap;
+    }
+    memcpy(b->ptr + b->len, s, n);
+    b->len += n;
+    b->ptr[b->len] = '\0';
+}
+
 static void agent_buf_puts(agent_buf *b, const char *s) {
     agent_buf_append(b, s, strlen(s));
 }
@@ -6263,6 +6276,7 @@ static bool agent_docker_exec_capture(agent_worker *w,
                                       char *const cmd_argv[],
                                       const char *stdin_data,
                                       size_t stdin_len,
+                                      bool unbounded_output,
                                       const char *op,
                                       agent_buf *out,
                                       int *exit_status);
@@ -6475,7 +6489,7 @@ static char *agent_tool_list(agent_worker *w, const agent_tool_call *call) {
     if (agent_tool_use_docker_filesystem(w)) {
         const char *working_dir = agent_primary_working_directory(w);
         char *argv[] = {
-            "/bin/sh", "-lc",
+            "/bin/sh", "-c",
             "find \"$1\" -mindepth 1 -maxdepth 1 -printf '%y %s %f\\n' 2>/dev/null | "
             "sort | sed -n '1,300p'",
             "sh", (char *)path, NULL
@@ -6483,7 +6497,7 @@ static char *agent_tool_list(agent_worker *w, const agent_tool_call *call) {
         agent_buf out = {0};
         char hdr[PATH_MAX + 64];
         snprintf(hdr, sizeof(hdr), "%s:\n", path);
-        if (!agent_docker_exec_capture(w, working_dir, argv, NULL, 0,
+        if (!agent_docker_exec_capture(w, working_dir, argv, NULL, 0, false,
                                        "docker list", &out, NULL)) {
             agent_buf b = {0};
             agent_buf_puts(&b, "Tool error: opendir failed: ");
@@ -7546,12 +7560,12 @@ static char *agent_tool_search(agent_worker *w, const agent_tool_call *call) {
             "  grep \"$2\" -C \"$3\" -- \"$5\" \"$1\" 2>/dev/null; "
             "fi; rc=$?; [ \"$rc\" -le 1 ] || exit \"$rc\"; } | sed -n \"1,${6}p\"";
         char *argv[] = {
-            "/bin/sh", "-lc", (char *)script, "sh",
+            "/bin/sh", "-c", (char *)script, "sh",
             (char *)path, grep_flags, context_arg, (char *)(glob ? glob : ""),
             (char *)query, max_arg, NULL
         };
         agent_buf out = {0};
-        if (!agent_docker_exec_capture(w, working_dir, argv, NULL, 0,
+        if (!agent_docker_exec_capture(w, working_dir, argv, NULL, 0, false,
                                        "docker search", &out, NULL)) {
             agent_buf b = {0};
             agent_buf_puts(&b, "Tool error: ");
@@ -8143,6 +8157,15 @@ static void agent_docker_debug_publish_worker(agent_worker *w,
 static void agent_docker_exec_add_env(char **argv, int *argc,
                                       char *buf, size_t len,
                                       const char *key, const char *value);
+static void agent_docker_exec_add_standard_env(char **argv, int *argc,
+                                               char *home_env, size_t home_len,
+                                               char *tmpdir_env, size_t tmpdir_len,
+                                               char *tmp_env, size_t tmp_len,
+                                               char *temp_env, size_t temp_len,
+                                               char *xdg_config_env, size_t xdg_config_len,
+                                               char *xdg_cache_env, size_t xdg_cache_len,
+                                               const char *working_dir,
+                                               const char *temp_dir);
 
 static void agent_docker_debug_publish_bash(agent_worker *w,
                                             const char *working_dir,
@@ -8159,7 +8182,7 @@ static void agent_docker_debug_publish_bash(agent_worker *w,
     char env_temp[PATH_MAX + 16];
     char env_xdg_config[PATH_MAX + 32];
     char env_xdg_cache[PATH_MAX + 32];
-    char *argv[32];
+    char *argv[40];
     int argc = 0;
 
     argv[argc++] = (char *)docker_command;
@@ -8169,27 +8192,17 @@ static void agent_docker_debug_publish_bash(agent_worker *w,
         argv[argc++] = "-w";
         argv[argc++] = (char *)working_dir;
     }
-    agent_docker_exec_add_env(argv, &argc, env_home, sizeof(env_home),
-                              "HOME", working_dir);
-    // agent_docker_exec_add_env(argv, &argc, env_tmpdir, sizeof(env_tmpdir),
-    //                           "TMPDIR", temp_dir);
-    // agent_docker_exec_add_env(argv, &argc, env_tmp, sizeof(env_tmp),
-    //                           "TMP", temp_dir);
-    // agent_docker_exec_add_env(argv, &argc, env_temp, sizeof(env_temp),
-    //                           "TEMP", temp_dir);
-    // agent_docker_exec_add_env(argv, &argc, env_xdg_config, sizeof(env_xdg_config),
-    //                           "XDG_CONFIG_HOME", working_dir);
-    // agent_docker_exec_add_env(argv, &argc, env_xdg_cache, sizeof(env_xdg_cache),
-    //                           "XDG_CACHE_HOME", working_dir);
-    argv[argc++] = "-e"; argv[argc++] = "TERM=dumb";
-    argv[argc++] = "-e"; argv[argc++] = "PAGER=cat";
-    argv[argc++] = "-e"; argv[argc++] = "GIT_PAGER=cat";
-    // argv[argc++] = "-e"; argv[argc++] = "GIT_CONFIG_NOSYSTEM=1";
-    // argv[argc++] = "-e"; argv[argc++] = "GIT_CONFIG_SYSTEM=/dev/null";
-    // argv[argc++] = "-e"; argv[argc++] = "GIT_CONFIG_GLOBAL=/dev/null";
+    agent_docker_exec_add_standard_env(argv, &argc,
+                                       env_home, sizeof(env_home),
+                                       env_tmpdir, sizeof(env_tmpdir),
+                                       env_tmp, sizeof(env_tmp),
+                                       env_temp, sizeof(env_temp),
+                                       env_xdg_config, sizeof(env_xdg_config),
+                                       env_xdg_cache, sizeof(env_xdg_cache),
+                                       working_dir, temp_dir);
     argv[argc++] = (char *)w->cfg->docker_container;
     argv[argc++] = "/bin/sh";
-    argv[argc++] = "-lc";
+    argv[argc++] = "-c";
     argv[argc++] = (char *)(cmd ? cmd : "");
     argv[argc] = NULL;
     agent_docker_debug_publish_worker(w, argv);
@@ -8204,7 +8217,7 @@ static void agent_docker_exec_add_env(char **argv, int *argc,
                                       char *buf, size_t len,
                                       const char *key, const char *value) {
     if (!argv || !argc || !buf || len == 0 || !key || !key[0] ||
-        !value || !value[0] || strncmp(value, "", strlen(value)) == 0 || strncmp(key, "", strlen(key)) == 0)
+        !value || !value[0])
         return;
     memset(buf, 0, len);
     snprintf(buf, len, "%s=%s", key, value);
@@ -8212,11 +8225,43 @@ static void agent_docker_exec_add_env(char **argv, int *argc,
     argv[(*argc)++] = buf;
 }
 
+static void agent_docker_exec_add_standard_env(char **argv, int *argc,
+                                               char *home_env, size_t home_len,
+                                               char *tmpdir_env, size_t tmpdir_len,
+                                               char *tmp_env, size_t tmp_len,
+                                               char *temp_env, size_t temp_len,
+                                               char *xdg_config_env, size_t xdg_config_len,
+                                               char *xdg_cache_env, size_t xdg_cache_len,
+                                               const char *working_dir,
+                                               const char *temp_dir) {
+    const char *effective_temp =
+        (temp_dir && temp_dir[0]) ? temp_dir : working_dir;
+    agent_docker_exec_add_env(argv, argc, home_env, home_len,
+                              "HOME", working_dir);
+    agent_docker_exec_add_env(argv, argc, tmpdir_env, tmpdir_len,
+                              "TMPDIR", effective_temp);
+    agent_docker_exec_add_env(argv, argc, tmp_env, tmp_len,
+                              "TMP", effective_temp);
+    agent_docker_exec_add_env(argv, argc, temp_env, temp_len,
+                              "TEMP", effective_temp);
+    agent_docker_exec_add_env(argv, argc, xdg_config_env, xdg_config_len,
+                              "XDG_CONFIG_HOME", working_dir);
+    agent_docker_exec_add_env(argv, argc, xdg_cache_env, xdg_cache_len,
+                              "XDG_CACHE_HOME", working_dir);
+    argv[(*argc)++] = "-e"; argv[(*argc)++] = "TERM=dumb";
+    argv[(*argc)++] = "-e"; argv[(*argc)++] = "PAGER=cat";
+    argv[(*argc)++] = "-e"; argv[(*argc)++] = "GIT_PAGER=cat";
+    argv[(*argc)++] = "-e"; argv[(*argc)++] = "GIT_CONFIG_NOSYSTEM=1";
+    argv[(*argc)++] = "-e"; argv[(*argc)++] = "GIT_CONFIG_SYSTEM=/dev/null";
+    argv[(*argc)++] = "-e"; argv[(*argc)++] = "GIT_CONFIG_GLOBAL=/dev/null";
+}
+
 static bool agent_docker_exec_capture(agent_worker *w,
                                       const char *working_dir,
                                       char *const cmd_argv[],
                                       const char *stdin_data,
                                       size_t stdin_len,
+                                      bool unbounded_output,
                                       const char *op,
                                       agent_buf *out,
                                       int *exit_status) {
@@ -8249,24 +8294,14 @@ static bool agent_docker_exec_capture(agent_worker *w,
         argv[argc++] = "-w";
         argv[argc++] = (char *)working_dir;
     }
-    agent_docker_exec_add_env(argv, &argc, home_env, sizeof(home_env),
-                              "HOME", working_dir);
-    // agent_docker_exec_add_env(argv, &argc, tmpdir_env, sizeof(tmpdir_env),
-    //                           "TMPDIR", temp_dir);
-    // agent_docker_exec_add_env(argv, &argc, tmp_env, sizeof(tmp_env),
-    //                           "TMP", temp_dir);
-    // agent_docker_exec_add_env(argv, &argc, temp_env, sizeof(temp_env),
-    //                           "TEMP", temp_dir);
-    // agent_docker_exec_add_env(argv, &argc, xdg_config_env, sizeof(xdg_config_env),
-    //                           "XDG_CONFIG_HOME", working_dir);
-    // agent_docker_exec_add_env(argv, &argc, xdg_cache_env, sizeof(xdg_cache_env),
-    //                           "XDG_CACHE_HOME", working_dir);
-    argv[argc++] = "-e"; argv[argc++] = "TERM=dumb";
-    argv[argc++] = "-e"; argv[argc++] = "PAGER=cat";
-    argv[argc++] = "-e"; argv[argc++] = "GIT_PAGER=cat";
-    // argv[argc++] = "-e"; argv[argc++] = "GIT_CONFIG_NOSYSTEM=1";
-    // argv[argc++] = "-e"; argv[argc++] = "GIT_CONFIG_SYSTEM=/dev/null";
-    // argv[argc++] = "-e"; argv[argc++] = "GIT_CONFIG_GLOBAL=/dev/null";
+    agent_docker_exec_add_standard_env(argv, &argc,
+                                       home_env, sizeof(home_env),
+                                       tmpdir_env, sizeof(tmpdir_env),
+                                       tmp_env, sizeof(tmp_env),
+                                       temp_env, sizeof(temp_env),
+                                       xdg_config_env, sizeof(xdg_config_env),
+                                       xdg_cache_env, sizeof(xdg_cache_env),
+                                       working_dir, temp_dir);
     argv[argc++] = (char *)w->cfg->docker_container;
     for (int i = 0; i < cmd_argc; i++)
         argv[argc++] = cmd_argv[i];
@@ -8325,27 +8360,88 @@ static bool agent_docker_exec_capture(agent_worker *w,
         _exit(127);
     }
 
-    if (stdin_pipe[0] >= 0) {
+    size_t stdin_written = 0;
+    bool stdin_open = stdin_pipe[0] >= 0;
+    if (stdin_open) {
         close(stdin_pipe[0]);
-        if (stdin_len > 0) write_all(stdin_pipe[1], stdin_data, stdin_len);
-        close(stdin_pipe[1]);
+        set_nonblock(stdin_pipe[1], true, NULL);
     }
     close(stdout_pipe[1]);
     if (out) memset(out, 0, sizeof(*out));
     char chunk[4096];
-    for (;;) {
-        ssize_t n = read(stdout_pipe[0], chunk, sizeof(chunk));
-        if (n > 0) {
-            if (out) agent_buf_append(out, chunk, (size_t)n);
-            continue;
+    bool stdout_open = true;
+    while (stdout_open || stdin_open) {
+        struct pollfd pfds[2];
+        nfds_t nfds = 0;
+        int stdout_idx = -1;
+        int stdin_idx = -1;
+        if (stdout_open) {
+            stdout_idx = (int)nfds;
+            pfds[nfds].fd = stdout_pipe[0];
+            pfds[nfds].events = POLLIN | POLLHUP | POLLERR;
+            pfds[nfds].revents = 0;
+            nfds++;
         }
-        if (n == 0) break;
-        if (errno == EINTR) continue;
-        close(stdout_pipe[0]);
-        while (waitpid(pid, NULL, 0) < 0 && errno == EINTR) {}
-        return false;
+        if (stdin_open) {
+            stdin_idx = (int)nfds;
+            pfds[nfds].fd = stdin_pipe[1];
+            pfds[nfds].events = POLLOUT | POLLHUP | POLLERR;
+            pfds[nfds].revents = 0;
+            nfds++;
+        }
+        int prc = poll(pfds, nfds, -1);
+        if (prc < 0) {
+            if (errno == EINTR) continue;
+            if (stdin_open) close(stdin_pipe[1]);
+            close(stdout_pipe[0]);
+            while (waitpid(pid, NULL, 0) < 0 && errno == EINTR) {}
+            return false;
+        }
+        if (stdout_idx >= 0 &&
+            (pfds[stdout_idx].revents & (POLLIN | POLLHUP | POLLERR))) {
+            for (;;) {
+                ssize_t n = read(stdout_pipe[0], chunk, sizeof(chunk));
+                if (n > 0) {
+                    if (out) {
+                        if (unbounded_output) agent_buf_append_full(out, chunk, (size_t)n);
+                        else agent_buf_append(out, chunk, (size_t)n);
+                    }
+                    continue;
+                }
+                if (n == 0) {
+                    close(stdout_pipe[0]);
+                    stdout_open = false;
+                    break;
+                }
+                if (errno == EINTR) continue;
+                if (errno == EAGAIN || errno == EWOULDBLOCK) break;
+                close(stdout_pipe[0]);
+                if (stdin_open) close(stdin_pipe[1]);
+                while (waitpid(pid, NULL, 0) < 0 && errno == EINTR) {}
+                return false;
+            }
+        }
+        if (stdin_idx >= 0 &&
+            (pfds[stdin_idx].revents & (POLLOUT | POLLHUP | POLLERR))) {
+            while (stdin_written < stdin_len) {
+                ssize_t n = write(stdin_pipe[1], stdin_data + stdin_written,
+                                  stdin_len - stdin_written);
+                if (n > 0) {
+                    stdin_written += (size_t)n;
+                    continue;
+                }
+                if (n < 0 && errno == EINTR) continue;
+                if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) break;
+                close(stdin_pipe[1]);
+                stdin_open = false;
+                break;
+            }
+            if (stdin_open && stdin_written == stdin_len) {
+                close(stdin_pipe[1]);
+                stdin_open = false;
+            }
+        }
     }
-    close(stdout_pipe[0]);
 
     int status = 0;
     while (waitpid(pid, &status, 0) < 0) {
@@ -8369,7 +8465,7 @@ static bool agent_docker_read_file_bytes(agent_worker *w, const char *path,
     char *argv[] = {"cat", (char *)(path), NULL};
     agent_buf out = {0};
     int status = 0;
-    bool ok = agent_docker_exec_capture(w, working_dir, argv, NULL, 0,
+    bool ok = agent_docker_exec_capture(w, working_dir, argv, NULL, 0, true,
                                         "docker read", &out, &status);
     if (!ok) {
         snprintf(err, err_len, "%s",
@@ -8398,7 +8494,7 @@ static bool agent_docker_write_file_bytes(agent_worker *w, const char *path,
     char *dir_argv[] = {"test", "-d", parent, NULL};
     agent_buf out = {0};
     int status = 0;
-    bool ok = agent_docker_exec_capture(w, working_dir, dir_argv, NULL, 0,
+    bool ok = agent_docker_exec_capture(w, working_dir, dir_argv, NULL, 0, false,
                                         "docker write", &out, &status);
     free(out.ptr);
     out.ptr = NULL;
@@ -8409,8 +8505,9 @@ static bool agent_docker_write_file_bytes(agent_worker *w, const char *path,
         return false;
     }
 
-    char *write_argv[] = {"tee", (char *)(path ? path : ""), NULL};
-    ok = agent_docker_exec_capture(w, working_dir, write_argv, data, len,
+    char *write_argv[] = {"/bin/sh", "-c", "cat > \"$1\"", "sh",
+                          (char *)(path ? path : ""), NULL};
+    ok = agent_docker_exec_capture(w, working_dir, write_argv, data, len, false,
                                    "docker write", &out, &status);
     if (!ok) {
         snprintf(err, err_len, "%s",
@@ -8443,7 +8540,7 @@ static void agent_bash_exec_docker(agent_worker *w, const char *cmd,
     char env_temp[PATH_MAX + 16];
     char env_xdg_config[PATH_MAX + 32];
     char env_xdg_cache[PATH_MAX + 32];
-    char *argv[32];
+    char *argv[40];
     int argc = 0;
 
     argv[argc++] = (char *)docker_command;
@@ -8453,27 +8550,17 @@ static void agent_bash_exec_docker(agent_worker *w, const char *cmd,
         argv[argc++] = "-w";
         argv[argc++] = (char *)working_dir;
     }
-    agent_docker_exec_add_env(argv, &argc, env_home, sizeof(env_home),
-                              "HOME", working_dir);
-    // agent_docker_exec_add_env(argv, &argc, env_tmpdir, sizeof(env_tmpdir),
-    //                           "TMPDIR", temp_dir);
-    // agent_docker_exec_add_env(argv, &argc, env_tmp, sizeof(env_tmp),
-    //                           "TMP", temp_dir);
-    // agent_docker_exec_add_env(argv, &argc, env_temp, sizeof(env_temp),
-    //                           "TEMP", temp_dir);
-    // agent_docker_exec_add_env(argv, &argc, env_xdg_config, sizeof(env_xdg_config),
-    //                           "XDG_CONFIG_HOME", working_dir);
-    // agent_docker_exec_add_env(argv, &argc, env_xdg_cache, sizeof(env_xdg_cache),
-    //                           "XDG_CACHE_HOME", working_dir);
-    argv[argc++] = "-e"; argv[argc++] = "TERM=dumb";
-    argv[argc++] = "-e"; argv[argc++] = "PAGER=cat";
-    argv[argc++] = "-e"; argv[argc++] = "GIT_PAGER=cat";
-    // argv[argc++] = "-e"; argv[argc++] = "GIT_CONFIG_NOSYSTEM=1";
-    // argv[argc++] = "-e"; argv[argc++] = "GIT_CONFIG_SYSTEM=/dev/null";
-    // argv[argc++] = "-e"; argv[argc++] = "GIT_CONFIG_GLOBAL=/dev/null";
+    agent_docker_exec_add_standard_env(argv, &argc,
+                                       env_home, sizeof(env_home),
+                                       env_tmpdir, sizeof(env_tmpdir),
+                                       env_tmp, sizeof(env_tmp),
+                                       env_temp, sizeof(env_temp),
+                                       env_xdg_config, sizeof(env_xdg_config),
+                                       env_xdg_cache, sizeof(env_xdg_cache),
+                                       working_dir, temp_dir);
     argv[argc++] = (char *)w->cfg->docker_container;
     argv[argc++] = "/bin/sh";
-    argv[argc++] = "-lc";
+    argv[argc++] = "-c";
     argv[argc++] = (char *)(cmd ? cmd : "");
     argv[argc] = NULL;
     agent_exec_command(docker_command, argv);
