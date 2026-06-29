@@ -91,7 +91,9 @@ typedef struct {
     bool non_interactive;
     bool strict_sandbox;
     bool docker_auto;
-    bool preserve_agent_files;
+    bool command_output;
+    bool docker_allow_one_shot;
+    volatile bool preserve_agent_files;
 } agent_config;
 
 typedef enum {
@@ -126,6 +128,15 @@ typedef struct {
 } agent_status;
 
 typedef struct agent_bash_job agent_bash_job;
+
+typedef struct {
+    int stdin_fd;
+    int stdout_fd;
+    pid_t pid;
+    unsigned long long seq;
+    pthread_mutex_t mu;
+    bool active;
+} agent_docker_shell;
 
 struct agent_worker {
     ds4_engine *engine;
@@ -183,11 +194,13 @@ struct agent_worker {
     int more_next_line;
     bool more_bare;
     bool more_valid;
+    char docker_mount_fingerprint[4096];
     agent_bash_job *bash_jobs;
     int next_bash_job_id;
     agent_path_list working_directories;
     agent_path_list auto_allowed_paths;
     bool raw_mode_needs_restore;
+    agent_docker_shell docker_shell;
 };
 
 static unsigned agent_next_prefill_label(void);
@@ -353,6 +366,13 @@ typedef struct {
     bool active;
     bool done;
 } agent_edit_upto_forcer;
+
+typedef struct {
+    bool active;
+    size_t head_len;
+    size_t tail_offset;
+    size_t tail_len;
+} agent_edit_anchor_span;
 
 static volatile sig_atomic_t agent_sigint;
 static agent_worker *agent_completion_worker;
@@ -541,6 +561,7 @@ static bool agent_slash_command_known(const char *cmd) {
            !strcmp(cmd, "/list") ||
            !strcmp(cmd, "/strict_sandbox") ||
            !strcmp(cmd, "/no_strict_sandbox") ||
+           agent_slash_command_with_args(cmd, "/command_output") ||
            !strcmp(cmd, "/preserve_agent_files") ||
            !strcmp(cmd, "/no_preserve_agent_files") ||
            !strcmp(cmd, "/docker help") ||
@@ -639,6 +660,8 @@ static agent_config parse_options(int argc, char **argv) {
         },
         .strict_sandbox = true,
         .docker_auto = true,
+        .command_output = false,
+        .docker_allow_one_shot = false,
         .preserve_agent_files = false,
     };
     if (!getcwd(c.launch_working_directory, sizeof(c.launch_working_directory))) {
@@ -682,10 +705,10 @@ static agent_config parse_options(int argc, char **argv) {
             c.strict_sandbox = false;
         } else if (!strcmp(arg, "--no-docker-auto")) {
             c.docker_auto = false;
+        } else if (!strcmp(arg, "--docker-allow-one-shot")) {
+            c.docker_allow_one_shot = true;
         } else if (!strcmp(arg, "--preserve-agent-files")) {
             c.preserve_agent_files = true;
-        } else if (!strcmp(arg, "--no-preserve-agent-files")) {
-            c.preserve_agent_files = false;
         } else if (!strcmp(arg, "-sys") || !strcmp(arg, "--system")) {
             c.gen.system = need_arg(&i, argc, argv, arg);
         } else if (!strcmp(arg, "--trace")) {
@@ -942,6 +965,7 @@ static const char agent_tools_prompt_edit_line[] =
     "The old text must match exactly once in the current file; otherwise edit fails for safety.\n"
     "For large replacements, prefer anchored old text: write the first lines, then [upto], then the final lines. "
     "The tool replaces everything from the head through the tail. If the head or tail is ambiguous, the edit fails.\n"
+    "When old uses [upto], new may use one [upto] to keep the original omitted middle at that point.\n"
     "After [upto], always write unique final lines before closing old; never close old immediately after [upto].\n"
     "Do not use a generic tail anchor like:\n"
     "- BigNum bignum_add(BigNum *a, BigNum *b) {\n"
@@ -967,15 +991,13 @@ static const char agent_tools_prompt_edit_line[] =
     "Use read raw=true only when you need plain file text without line numbers or read annotations.\n\n";
 
 static const char agent_tools_prompt_after_edit_web[] =
-    "For long-running bash commands, pass refresh_sec. If a bash job is still running, use "
-    "bash_status to check it early or bash_stop to terminate it.\n\n"
-    "Use web_search to find web pages. Use web_fetch to read a known URL with a visible browser. "
+    "Use web_browse to find web pages. Use web_fetch to read a known URL with a visible browser. "
     "The first web call may ask the user for permission to start Chrome.\n\n"
     "### Available Tool Schemas\n\n"
     "{\n"
     "  \"type\": \"function\",\n"
     "  \"function\": {\n"
-    "    \"name\": \"web_search\",\n"
+    "    \"name\": \"web_browse\",\n"
     "    \"description\": \"Search Google in a visible browser and return compact Markdown links.\",\n"
     "    \"parameters\": {\n"
     "      \"type\": \"object\",\n"
@@ -1103,7 +1125,7 @@ static const char agent_tools_prompt_after_edit_core[] =
     "  \"type\": \"function\",\n"
     "  \"function\": {\n"
     "    \"name\": \"edit\",\n"
-    "    \"description\": \"Replace exactly one old text match; old may contain [upto] between unique head and tail anchors.\",\n"
+    "    \"description\": \"Replace exactly one old text match; old may contain [upto] between unique head and tail anchors; when old is anchored, new may contain one [upto] to keep the omitted original middle.\",\n"
     "    \"parameters\": {\n"
     "      \"type\": \"object\",\n"
     "      \"properties\": {\n"
@@ -1165,14 +1187,19 @@ static char *agent_build_tools_prompt(bool include_web_tools) {
     const char *edit = agent_tools_prompt_edit_line;
     size_t a = strlen(agent_tools_prompt_intro);
     size_t b = strlen(edit);
-    const char *after = include_web_tools ?
-        agent_tools_prompt_after_edit_web :
-        agent_tools_prompt_after_edit_core;
+    const char *after = agent_tools_prompt_after_edit_core;
     size_t c = strlen(after);
-    char *out = xmalloc(a + b + c + 1);
+    const char *tail = "";
+    size_t d = 0;
+    if (include_web_tools) {
+        tail = agent_tools_prompt_after_edit_web;
+        d = strlen(tail);
+    }
+    char *out = xmalloc(a + b + c + d + 1);
     memcpy(out, agent_tools_prompt_intro, a);
     memcpy(out + a, edit, b);
-    memcpy(out + a + b, after, c + 1);
+    memcpy(out + a + b, after, c);
+    memcpy(out + a + b + c, tail, d + 1);
     return out;
 }
 
@@ -1209,6 +1236,7 @@ static void agent_append_system_prompt(ds4_engine *engine, ds4_tokens *tokens,
      * supplied -sys text: arbitrary user text containing <｜User｜>, <think>, or
      * ｜DSML｜ must remain plain content, not control tokens. */
     char *tools_prompt = agent_build_tools_prompt(include_web_tools);
+    // fprintf(stdout, "--- agent prompt ---\n%s\n--- agent prompt ---\n", tools_prompt);
     ds4_tokenize_rendered_chat(engine, tools_prompt, tokens);
     free(tools_prompt);
 
@@ -3002,7 +3030,7 @@ static const char *agent_tool_viz_prefix(const char *name) {
     if (!strcmp(name, "write")) return "write ";
     if (!strcmp(name, "edit")) return "edit ";
     if (!strcmp(name, "search")) return "search ";
-    if (!strcmp(name, "web_search")) return "web ";
+    if (!strcmp(name, "web_browse")) return "web ";
     if (!strcmp(name, "web_fetch")) return "fetch ";
     return NULL;
 }
@@ -6271,21 +6299,60 @@ static void agent_worker_set_more(agent_worker *w, const char *path,
 }
 
 static bool agent_tool_use_docker_filesystem(const agent_worker *w);
-static bool agent_docker_exec_capture(agent_worker *w,
-                                      const char *working_dir,
-                                      char *const cmd_argv[],
-                                      const char *stdin_data,
-                                      size_t stdin_len,
-                                      bool unbounded_output,
-                                      const char *op,
-                                      agent_buf *out,
-                                      int *exit_status);
+static bool agent_docker_exec(agent_worker *w,
+                               const agent_config *cfg,
+                               const char *const argv_tail[],
+                               const char *stdin_data,
+                               size_t stdin_len,
+                               bool unbounded_output,
+                               const char *op,
+                               agent_buf *out,
+                               int *exit_status);
+static bool agent_docker_capture(const agent_config *cfg,
+                                  const char *docker_command, char *const argv[],
+                                  const char *op, agent_buf *out);
+static bool agent_docker_refresh_mounts(agent_worker *w,
+                                        char *err, size_t err_len);
+static void agent_docker_mount_fingerprint(agent_worker *w,
+                                           char *out, size_t out_len);
+static void agent_bash_publish_observation(agent_worker *w, const char *obs);
+static agent_bash_job *agent_bash_start_mode(agent_worker *w, const char *cmd,
+                                             int timeout_sec, bool use_docker,
+                                             char *err, size_t err_len);
+static char *agent_bash_job_tool_result(agent_worker *w, agent_bash_job *job,
+                                        bool wait, int refresh_sec,
+                                        bool stop, bool remove_if_done);
+static char *agent_docker_debug_command_text(char *const argv[]);
+static void agent_docker_build_shell_argv(char **argv, int *argc,
+                                          const char *docker_command,
+                                          const char *container,
+                                          const char *working_dir,
+                                          const char *temp_dir,
+                                          const char *cmd,
+                                          char *home_env, size_t home_len,
+                                          char *tmpdir_env, size_t tmpdir_len,
+                                          char *tmp_env, size_t tmp_len,
+                                          char *temp_env, size_t temp_len,
+                                          char *xdg_config_env, size_t xdg_config_len,
+                                          char *xdg_cache_env, size_t xdg_cache_len);
 static bool agent_docker_read_file_bytes(agent_worker *w, const char *path,
                                          char **data, size_t *len,
                                          char *err, size_t err_len);
+static char *agent_docker_read_range(agent_worker *w, const char *path,
+                                     int start_line, int max_lines,
+                                     bool bare, bool set_more);
 static bool agent_docker_write_file_bytes(agent_worker *w, const char *path,
                                           const char *data, size_t len,
                                           char *err, size_t err_len);
+static bool agent_docker_shell_exec_argv(agent_worker *w,
+                                          char *const cmd_argv[],
+                                           bool unbounded_output,
+                                          const char *op,
+                                          agent_buf *out,
+                                          int *exit_status);
+static char *agent_tool_edit(agent_worker *w, const agent_tool_call *call);
+static char *agent_tool_list(agent_worker *w, const agent_tool_call *call);
+static char *agent_tool_search(agent_worker *w, const agent_tool_call *call);
 
 static bool agent_tool_result_fits_context(agent_worker *w, const char *result,
                                            int reserve_tokens,
@@ -6297,6 +6364,140 @@ static bool agent_tool_result_fits_context(agent_worker *w, const char *result,
     ds4_tokens_free(&tmp);
     if (tokens_out) *tokens_out = tokens;
     return tokens + reserve_tokens < w->cfg->gen.ctx_size;
+}
+
+static char *agent_docker_read_range(agent_worker *w, const char *path,
+                                     int start_line, int max_lines,
+                                     bool bare, bool set_more) {
+    if (!path || !path[0]) return xstrdup("Tool error: read requires path\n");
+    if (start_line < 1) start_line = 1;
+    if (max_lines <= 0) max_lines = AGENT_READ_DEFAULT_LINES;
+
+    char start_arg[32];
+    char count_arg[32];
+    snprintf(start_arg, sizeof(start_arg), "start=%d", start_line);
+    snprintf(count_arg, sizeof(count_arg), "count=%d", max_lines);
+    char *argv[] = {
+        "awk",
+        "-v", start_arg,
+        "-v", count_arg,
+        "BEGIN { end = start + count - 1 } "
+        "NR >= start && NR <= end { printf(\"__DS4_LINE__%d\\t%s\\n\", NR, $0) } "
+        "END { printf(\"__DS4_TOTAL__%d\\n\", NR) }",
+        (char *)path,
+        NULL,
+    };
+    agent_buf shell_out = {0};
+    int status = 0;
+    if (!agent_docker_shell_exec_argv(w, argv, true, "docker read", &shell_out,
+                                      &status) || status != 0) {
+        agent_buf b = {0};
+        agent_buf_puts(&b, "Tool error: ");
+        agent_buf_puts(&b, shell_out.ptr && shell_out.ptr[0] ?
+                       shell_out.ptr : "docker read failed");
+        agent_buf_puts(&b, "\n");
+        free(shell_out.ptr);
+        return agent_buf_take(&b);
+    }
+
+    agent_buf lines = {0};
+    int total = -1;
+    int last_line = 0;
+    int emitted = 0;
+    agent_line_spans spans = {0};
+    agent_split_lines(shell_out.ptr ? shell_out.ptr : "", shell_out.len, &spans);
+    for (int i = 0; i < spans.len; i++) {
+        agent_line_span sp = spans.v[i];
+        const char *row = shell_out.ptr + sp.start;
+        size_t row_len = sp.content_end - sp.start;
+        const char total_prefix[] = "__DS4_TOTAL__";
+        const char line_prefix[] = "__DS4_LINE__";
+        if (row_len >= sizeof(total_prefix) - 1 &&
+            !memcmp(row, total_prefix, sizeof(total_prefix) - 1)) {
+            char tmp[32];
+            size_t n = row_len - (sizeof(total_prefix) - 1);
+            if (n >= sizeof(tmp)) n = sizeof(tmp) - 1;
+            memcpy(tmp, row + sizeof(total_prefix) - 1, n);
+            tmp[n] = '\0';
+            total = atoi(tmp);
+            continue;
+        }
+        if (row_len < sizeof(line_prefix) ||
+            memcmp(row, line_prefix, sizeof(line_prefix) - 1))
+            continue;
+        const char *num_start = row + sizeof(line_prefix) - 1;
+        const char *tab = memchr(num_start, '\t',
+                                 (size_t)(row + row_len - num_start));
+        if (!tab) continue;
+        char tmp[32];
+        size_t n = (size_t)(tab - num_start);
+        if (n >= sizeof(tmp)) n = sizeof(tmp) - 1;
+        memcpy(tmp, num_start, n);
+        tmp[n] = '\0';
+        int line_no = atoi(tmp);
+        const char *content = tab + 1;
+        size_t content_len = (size_t)(row + row_len - content);
+        last_line = line_no;
+        emitted++;
+        if (bare) {
+            agent_buf_append(&lines, content, content_len);
+            agent_buf_puts(&lines, "\n");
+        } else {
+            char prefix[64];
+            snprintf(prefix, sizeof(prefix), "%d ", line_no);
+            agent_buf_puts(&lines, prefix);
+            agent_buf_append(&lines, content, content_len);
+            agent_buf_puts(&lines, "\n");
+        }
+    }
+    agent_line_spans_free(&spans);
+    free(shell_out.ptr);
+
+    if (total < 0) {
+        free(lines.ptr);
+        return xstrdup("Tool error: docker read failed: malformed range output\n");
+    }
+
+    int start_idx = start_line - 1;
+    if (start_idx > total) start_idx = total;
+    int end_idx = start_idx + emitted;
+    if (end_idx > total) end_idx = total;
+    bool truncated = end_idx < total;
+
+    agent_buf out = {0};
+    if (bare) {
+        if (lines.ptr) agent_buf_append(&out, lines.ptr, lines.len);
+        if (truncated) {
+            char note[160];
+            snprintf(note, sizeof(note),
+                     "[Read truncated at line %d of %d. continue_offset=%d. "
+                     "Call more with count=%d to read the next chunk.]\n",
+                     end_idx, total, end_idx + 1, max_lines);
+            agent_buf_puts(&out, note);
+        }
+    } else {
+        char hdr[PATH_MAX + 160];
+        int display_start = total ? start_idx + 1 : 0;
+        int display_end = emitted ? last_line : end_idx;
+        if (truncated) {
+            snprintf(hdr, sizeof(hdr),
+                     "%s: lines %d-%d of %d; continue_offset=%d; "
+                     "call more with count=%d to read the next chunk\n",
+                     path, display_start, display_end, total,
+                     end_idx + 1, max_lines);
+        } else {
+            snprintf(hdr, sizeof(hdr), "%s: lines %d-%d of %d\n",
+                     path, display_start, display_end, total);
+        }
+        agent_buf_puts(&out, hdr);
+        if (lines.ptr) agent_buf_append(&out, lines.ptr, lines.len);
+    }
+    free(lines.ptr);
+    if (set_more) {
+        if (truncated) agent_worker_set_more(w, path, end_idx + 1, bare);
+        else agent_worker_set_more(w, NULL, 0, false);
+    }
+    return agent_buf_take(&out);
 }
 
 /* Read file text for the model.  Normal mode shows plain line numbers.  Raw
@@ -6311,7 +6512,9 @@ static char *agent_read_range(agent_worker *w, const char *path, int start_line,
     const char *display_path = path;
     if (!path || !path[0]) return xstrdup("Tool error: read requires path\n");
     char *file_path = NULL;
-    if (agent_tool_use_docker_filesystem(w)) {
+    if (agent_tool_use_docker_filesystem(w) && !whole_file) {
+        return agent_docker_read_range(w, path, start_line, max_lines, bare, set_more);
+    } else if (agent_tool_use_docker_filesystem(w)) {
         if (!agent_docker_read_file_bytes(w, path, &data, &len, err, sizeof(err))) {
             agent_buf b = {0};
             agent_buf_puts(&b, "Tool error: ");
@@ -6411,9 +6614,12 @@ static char *agent_read_range(agent_worker *w, const char *path, int start_line,
 static char *agent_tool_read(agent_worker *w, const agent_tool_call *call) {
     const char *path = agent_tool_arg_value(call, "path");
     bool whole = agent_parse_bool_default(agent_tool_arg_value(call, "whole"), false);
-    int start = agent_parse_int_default(agent_tool_arg_value(call, "start_line"),
-                                        1, 1, INT_MAX);
-    int count = agent_parse_int_default(agent_tool_arg_value(call, "max_lines"),
+    const char *start_s = agent_tool_arg_value(call, "start_line");
+    if (!start_s) start_s = agent_tool_arg_value(call, "offset");
+    int start = agent_parse_int_default(start_s, 1, 1, INT_MAX);
+    const char *count_s = agent_tool_arg_value(call, "max_lines");
+    if (!count_s) count_s = agent_tool_arg_value(call, "count");
+    int count = agent_parse_int_default(count_s,
                                         AGENT_READ_DEFAULT_LINES, 1, INT_MAX);
     bool raw = agent_parse_bool_default(agent_tool_arg_value(call, "raw"), false);
     return agent_read_range(w, path, start, count, whole, raw, true);
@@ -6487,7 +6693,6 @@ static char *agent_tool_list(agent_worker *w, const agent_tool_call *call) {
     const char *path = agent_tool_arg_value(call, "path");
     if (!path || !path[0]) path = ".";
     if (agent_tool_use_docker_filesystem(w)) {
-        const char *working_dir = agent_primary_working_directory(w);
         char *argv[] = {
             "/bin/sh", "-c",
             "find \"$1\" -mindepth 1 -maxdepth 1 -printf '%y %s %f\\n' 2>/dev/null | "
@@ -6497,7 +6702,7 @@ static char *agent_tool_list(agent_worker *w, const agent_tool_call *call) {
         agent_buf out = {0};
         char hdr[PATH_MAX + 64];
         snprintf(hdr, sizeof(hdr), "%s:\n", path);
-        if (!agent_docker_exec_capture(w, working_dir, argv, NULL, 0, false,
+        if (!agent_docker_shell_exec_argv(w, argv, false,
                                        "docker list", &out, NULL)) {
             agent_buf b = {0};
             agent_buf_puts(&b, "Tool error: opendir failed: ");
@@ -6836,13 +7041,40 @@ static bool agent_edit_upto_forcer_should_replace(agent_worker *w,
     return false;
 }
 
+static const char *agent_edit_find_upto_marker(const char *text) {
+    static const char marker[] = "[upto]";
+    size_t marker_len = strlen(marker);
+    const char *p = text;
+    while ((p = strstr(p, marker)) != NULL) {
+        const char *after = p + marker_len;
+        const char *line = p;
+        while (line > text && line[-1] != '\n' && line[-1] != '\r')
+            line--;
+        const char *q = line;
+        while (q < p && (*q == ' ' || *q == '\t'))
+            q++;
+        bool left_boundary = q == p;
+        q = after;
+        while (*q == ' ' || *q == '\t')
+            q++;
+        bool right_boundary = !*q || *q == '\n' || *q == '\r';
+        if (left_boundary && right_boundary)
+            return p;
+        p = after;
+    }
+    return NULL;
+}
+
 static bool agent_edit_find_old_span(const char *data, size_t len,
                                      const char *old, const char **match,
                                      size_t *match_len, bool *anchored,
+                                     agent_edit_anchor_span *anchor_span,
                                      char *err, size_t err_len) {
     static const char marker[] = "[upto]";
     size_t old_len = strlen(old);
-    const char *upto = strstr(old, marker);
+    if (anchor_span)
+        memset(anchor_span, 0, sizeof(*anchor_span));
+    const char *upto = agent_edit_find_upto_marker(old);
     if (!upto) {
         *anchored = false;
         if (!agent_find_unique(data, len, old, old_len, match, "old text",
@@ -6851,7 +7083,7 @@ static bool agent_edit_find_old_span(const char *data, size_t len,
         *match_len = old_len;
         return true;
     }
-    if (strstr(upto + strlen(marker), marker)) {
+    if (agent_edit_find_upto_marker(upto + strlen(marker))) {
         snprintf(err, err_len, "old text contains more than one [upto] marker");
         return false;
     }
@@ -6884,7 +7116,394 @@ static bool agent_edit_find_old_span(const char *data, size_t len,
     *anchored = true;
     *match = head_pos;
     *match_len = (size_t)(tail_pos - head_pos) + tail_len;
+    if (anchor_span) {
+        anchor_span->active = true;
+        anchor_span->head_len = head_len;
+        anchor_span->tail_offset = (size_t)(tail_pos - head_pos);
+        anchor_span->tail_len = tail_len;
+    }
     return true;
+}
+
+static char *agent_edit_resolve_new_text(const char *data, size_t len,
+                                         const char *match, size_t match_len,
+                                         const agent_edit_anchor_span *span,
+                                         const char *new_text,
+                                         bool *used_upto,
+                                         char *err, size_t err_len) {
+    static const char marker[] = "[upto]";
+    if (used_upto)
+        *used_upto = false;
+    if (!new_text)
+        new_text = "";
+    if (!span || !span->active)
+        return xstrdup(new_text);
+
+    const char *upto = agent_edit_find_upto_marker(new_text);
+    if (!upto)
+        return xstrdup(new_text);
+    if (agent_edit_find_upto_marker(upto + strlen(marker))) {
+        snprintf(err, err_len, "new text contains more than one [upto] marker");
+        return NULL;
+    }
+    if (!data || !match || match < data || match > data + len ||
+        match_len > (size_t)((data + len) - match))
+    {
+        snprintf(err, err_len, "anchored old match is outside file");
+        return NULL;
+    }
+    if (span->head_len > span->tail_offset ||
+        span->tail_offset > match_len ||
+        span->tail_len > match_len - span->tail_offset)
+    {
+        snprintf(err, err_len, "anchored old match span is invalid");
+        return NULL;
+    }
+
+    size_t new_len = strlen(new_text);
+    size_t new_head_len = (size_t)(upto - new_text);
+    const char *new_tail = upto + strlen(marker);
+    size_t new_tail_len = new_len - new_head_len - strlen(marker);
+    while (new_tail_len > 0 && (*new_tail == '\n' || *new_tail == '\r')) {
+        new_tail++;
+        new_tail_len--;
+    }
+
+    size_t middle_len = span->tail_offset - span->head_len;
+    size_t out_len = new_head_len + middle_len + new_tail_len;
+    char *out = xmalloc(out_len + 1);
+    memcpy(out, new_text, new_head_len);
+    memcpy(out + new_head_len, match + span->head_len, middle_len);
+    memcpy(out + new_head_len + middle_len, new_tail, new_tail_len);
+    out[out_len] = '\0';
+    if (used_upto)
+        *used_upto = true;
+    return out;
+}
+
+/* ============================================================================
+ * Persistent Docker Shell (agent_docker_shell)
+ *
+ * A worker-owned persistent shell session for synchronous Docker filesystem
+ * utility commands.  The shell is started once and reused across multiple
+ * exec calls, using a sentinel-based protocol to delimit command output.
+ * ============================================================================
+ */
+
+/* Forward declarations for docker helper functions used by the shell. */
+static void agent_docker_exec_add_env(char **argv, int *argc,
+                                      char *buf, size_t len,
+                                      const char *key, const char *value);
+static void agent_docker_exec_add_standard_env(char **argv, int *argc,
+                                               char *home_env, size_t home_len,
+                                               char *tmpdir_env, size_t tmpdir_len,
+                                               char *tmp_env, size_t tmp_len,
+                                               char *temp_env, size_t temp_len,
+                                               char *xdg_config_env, size_t xdg_config_len,
+                                               char *xdg_cache_env, size_t xdg_cache_len,
+                                               const char *working_dir,
+                                               const char *temp_dir);
+static void agent_buf_append_shell_quoted(agent_buf *b, const char *s);
+
+static bool agent_docker_shell_start(agent_worker *w) {
+    if (!w || !w->cfg || !agent_bash_use_docker_sandbox(w))
+        return false;
+    if (w->docker_shell.active)
+        return true;
+
+    const char *docker_command =
+        (w->cfg->docker_command && w->cfg->docker_command[0]) ?
+        w->cfg->docker_command : "docker";
+    const char *temp_dir = w->cfg->temp_directory[0] ?
+        w->cfg->temp_directory : NULL;
+    const char *working_dir = w->status.workspace[0] ?
+        w->status.workspace : NULL;
+
+    char home_env[PATH_MAX + 16];
+    char tmpdir_env[PATH_MAX + 16];
+    char tmp_env[PATH_MAX + 16];
+    char temp_env[PATH_MAX + 16];
+    char xdg_config_env[PATH_MAX + 32];
+    char xdg_cache_env[PATH_MAX + 32];
+    char *argv[48];
+    int argc = 0;
+    argv[argc++] = (char *)docker_command;
+    argv[argc++] = "exec";
+    argv[argc++] = "-i";
+    if (working_dir && working_dir[0]) {
+        argv[argc++] = "-w";
+        argv[argc++] = (char *)working_dir;
+    }
+    agent_docker_exec_add_standard_env(argv, &argc,
+                                       home_env, sizeof(home_env),
+                                       tmpdir_env, sizeof(tmpdir_env),
+                                       tmp_env, sizeof(tmp_env),
+                                       temp_env, sizeof(temp_env),
+                                       xdg_config_env, sizeof(xdg_config_env),
+                                       xdg_cache_env, sizeof(xdg_cache_env),
+                                       working_dir, temp_dir);
+    argv[argc++] = (char *)w->cfg->docker_container;
+    argv[argc++] = "/bin/sh";
+    argv[argc] = NULL;
+
+    int stdin_pipe[2];
+    int stdout_pipe[2];
+    if (pipe(stdin_pipe) != 0) return false;
+    if (pipe(stdout_pipe) != 0) {
+        close(stdin_pipe[0]);
+        close(stdin_pipe[1]);
+        return false;
+    }
+
+    pid_t pid = fork();
+    if (pid < 0) {
+        close(stdin_pipe[0]);
+        close(stdin_pipe[1]);
+        close(stdout_pipe[0]);
+        close(stdout_pipe[1]);
+        return false;
+    }
+
+    if (pid == 0) {
+        /* Child: attach stdin/stdout to pipes and exec docker. */
+        close(stdin_pipe[1]);
+        dup2(stdin_pipe[0], STDIN_FILENO);
+        close(stdin_pipe[0]);
+        close(stdout_pipe[0]);
+        dup2(stdout_pipe[1], STDOUT_FILENO);
+        dup2(stdout_pipe[1], STDERR_FILENO);
+        close(stdout_pipe[1]);
+        execvp(docker_command, argv);
+        _exit(127);
+    }
+
+    /* Parent: close the child's ends. */
+    close(stdin_pipe[0]);
+    close(stdout_pipe[1]);
+
+    w->docker_shell.stdin_fd = stdin_pipe[1];
+    w->docker_shell.stdout_fd = stdout_pipe[0];
+    w->docker_shell.pid = pid;
+    w->docker_shell.seq = 0;
+    w->docker_shell.active = true;
+    return true;
+}
+
+static bool agent_docker_shell_exec(agent_worker *w,
+                                    const char *cmd,
+                                     bool unbounded_output,
+                                    const char *op,
+                                    agent_buf *out,
+                                    int *exit_status) {
+    (void)op;
+    if (out) memset(out, 0, sizeof(*out));
+    if (exit_status) *exit_status = -1;
+    if (!w || !w->docker_shell.active || !cmd || !cmd[0])
+        return false;
+
+    if (w->cfg && w->cfg->docker_debug) {
+        const char *prefix = "\x1b[96m[docker debug] ";
+        const char *suffix = "\x1b[0m\n\n";
+        agent_publish(w, prefix, strlen(prefix));
+        agent_publish(w, cmd, strlen(cmd));
+        agent_publish(w, suffix, strlen(suffix));
+    }
+
+    pthread_mutex_lock(&w->docker_shell.mu);
+
+    /* Generate a unique sentinel per call. */
+    unsigned long long seq = w->docker_shell.seq++;
+    char sentinel[64];
+    int sentinel_len = snprintf(sentinel, sizeof(sentinel),
+                                "__DS4_DONE_%d_%llu__",
+                                (int)w->docker_shell.pid, seq);
+    if (sentinel_len < 0) sentinel_len = 0;
+
+    /* Build the sentinel-with-colon pattern: __DS4_DONE_<pid>_<seq>__: */
+    char sentinel_colon[80];
+    snprintf(sentinel_colon, sizeof(sentinel_colon),
+             "__DS4_DONE_%d_%llu__:", (int)w->docker_shell.pid, seq);
+    size_t colon_len = strlen(sentinel_colon);
+
+    /* Write: { <cmd>; } 2>&1; rc=$?; printf '\n__DS4_DONE_<sentinel>__:%d\n' "$rc" */
+    agent_buf write_buf = {0};
+    agent_buf_puts(&write_buf, "{ ");
+    agent_buf_puts(&write_buf, cmd);
+    agent_buf_puts(&write_buf, "; } 2>&1; rc=$?; printf '\\n");
+    agent_buf_puts(&write_buf, sentinel_colon);
+    agent_buf_puts(&write_buf, "%d\\n' \"$rc\"\n");
+    write_all(w->docker_shell.stdin_fd, write_buf.ptr, write_buf.len);
+    free(write_buf.ptr);
+
+    /* Read until we see the sentinel: line.  We search for sentinel_colon
+     * and verify it appears at the start of a line (preceded by \n or at
+     * position 0 of a chunk after a line boundary). */
+    bool saw_sentinel = false;
+    int rc = -1;
+    bool command_output = w && w->cfg && w->cfg->command_output;
+
+    for (;;) {
+        char chunk[4096];
+        ssize_t n = read(w->docker_shell.stdout_fd, chunk, sizeof(chunk));
+        if (n <= 0) break;
+
+        size_t start = 0;
+        size_t remaining = (size_t)n;
+        const char *data = chunk;
+
+        while (remaining > 0) {
+            const char *nl = memchr(data + start, '\n', remaining);
+            size_t line_len = nl ? (size_t)(nl - (data + start)) + 1 : remaining;
+            size_t line_start = start;
+            start += line_len;
+            remaining -= line_len > remaining ? remaining : line_len;
+
+            /* Check if this line contains the sentinel_colon pattern. */
+            const char *s = agent_memmem_simple(
+                data + line_start, line_len,
+                sentinel_colon, colon_len);
+            if (s) {
+                /* Found sentinel; parse exit code from this line.
+                 * The pattern ends with ':', and the exit code follows it. */
+                rc = atoi(s + colon_len);
+                saw_sentinel = true;
+                /* Append everything before the sentinel to the output buffer. */
+                size_t before = (size_t)(s - (data + line_start));
+                if (before > 0) {
+                    if (command_output) {
+                        agent_publish(w, "\x1b[90m", 5);
+                        agent_publish(w, data + line_start, before);
+                        agent_publish(w, "\x1b[0m", 4);
+                    }
+                    if (out) {
+                        if (unbounded_output)
+                            agent_buf_append_full(out, data + line_start, before);
+                        else
+                            agent_buf_append(out, data + line_start, before);
+                    }
+                }
+                break;
+            }
+            /* Line does not contain sentinel; append to output. */
+            if (command_output) {
+                agent_publish(w, "\x1b[90m", 5);
+                agent_publish(w, data + line_start, line_len);
+                agent_publish(w, "\x1b[0m", 4);
+            }
+            if (out) {
+                if (unbounded_output)
+                    agent_buf_append_full(out, data + line_start, line_len);
+                else
+                    agent_buf_append(out, data + line_start, line_len);
+            }
+        }
+        if (saw_sentinel) break;
+    }
+
+    if (!saw_sentinel) {
+        /* Timeout or incomplete read: try to consume any remaining data. */
+        struct pollfd pfd = { .fd = w->docker_shell.stdout_fd, .events = POLLIN };
+        int poll_rc;
+        do {
+            poll_rc = poll(&pfd, 1, 2000);
+        } while (poll_rc < 0 && errno == EINTR);
+
+        if (poll_rc > 0) {
+            char leftover[4096];
+            ssize_t n;
+            while ((n = read(w->docker_shell.stdout_fd, leftover, sizeof(leftover))) > 0) {
+                const char *s = agent_memmem_simple(leftover, (size_t)n,
+                                                    sentinel_colon, colon_len);
+                if (s) {
+                    /* Exit code follows the sentinel_colon pattern (ends with ':') */
+                    rc = atoi(s + colon_len);
+                    saw_sentinel = true;
+                    size_t before = (size_t)(s - leftover);
+                    if (before > 0) {
+                        if (command_output) {
+                            agent_publish(w, "\x1b[90m", 5);
+                            agent_publish(w, leftover, before);
+                            agent_publish(w, "\x1b[0m", 4);
+                        }
+                        if (out && before > 0) {
+                            if (unbounded_output)
+                                agent_buf_append_full(out, leftover, before);
+                            else
+                                agent_buf_append(out, leftover, before);
+                        }
+                    }
+                    break;
+                }
+                if (command_output) {
+                    agent_publish(w, "\x1b[90m", 5);
+                    agent_publish(w, leftover, (size_t)n);
+                    agent_publish(w, "\x1b[0m", 4);
+                }
+                if (out) {
+                    if (unbounded_output)
+                        agent_buf_append_full(out, leftover, (size_t)n);
+                    else
+                        agent_buf_append(out, leftover, (size_t)n);
+                }
+            }
+        }
+    }
+
+    /* Strip trailing newline from output if present. */
+    if (out && out->len > 0 && out->ptr[out->len - 1] == '\n')
+        out->len--;
+    if (out && out->len > 0)
+        out->ptr[out->len] = '\0';
+
+    if (exit_status) *exit_status = rc;
+    pthread_mutex_unlock(&w->docker_shell.mu);
+    return saw_sentinel;
+}
+
+static bool agent_docker_shell_exec_argv(agent_worker *w,
+                                         char *const cmd_argv[],
+                                         bool unbounded_output,
+                                         const char *op,
+                                         agent_buf *out,
+                                         int *exit_status) {
+    (void)op;
+    if (!cmd_argv || !cmd_argv[0])
+        return false;
+
+    /* Build command string by shell-quoting each argv element. */
+    agent_buf b = {0};
+    for (int i = 0; cmd_argv[i]; i++) {
+        if (i > 0) agent_buf_puts(&b, " ");
+        agent_buf_append_shell_quoted(&b, cmd_argv[i]);
+    }
+    bool ok = agent_docker_shell_exec(w, b.ptr, unbounded_output, op, out, exit_status);
+    free(b.ptr);
+    return ok;
+}
+
+static void agent_docker_shell_stop(agent_worker *w) {
+    if (!w) return;
+    if (w->docker_shell.active && w->docker_shell.pid > 0) {
+        kill(w->docker_shell.pid, SIGTERM);
+        int i;
+        for (i = 0; i < 50; i++) {
+            if (waitpid(w->docker_shell.pid, NULL, WNOHANG) == w->docker_shell.pid)
+                break;
+            usleep(10000);
+        }
+        if (i >= 50) kill(w->docker_shell.pid, SIGKILL);
+        waitpid(w->docker_shell.pid, NULL, 0);
+    }
+    if (w->docker_shell.stdin_fd >= 0) {
+        close(w->docker_shell.stdin_fd);
+    }
+    if (w->docker_shell.stdout_fd >= 0) {
+        close(w->docker_shell.stdout_fd);
+    }
+    w->docker_shell.stdin_fd = -1;
+    w->docker_shell.stdout_fd = -1;
+    w->docker_shell.pid = -1;
+    w->docker_shell.active = false;
 }
 
 #ifdef DS4_AGENT_TEST
@@ -6934,7 +7553,7 @@ static void test_agent_edit_upto_tail_newline_is_not_part_of_anchor(void) {
     char err[128] = {0};
     AGENT_TEST_ASSERT(agent_edit_find_old_span(data, strlen(data), old,
                                               &match, &match_len, &anchored,
-                                              err, sizeof(err)));
+                                              NULL, err, sizeof(err)));
     AGENT_TEST_ASSERT(anchored);
     AGENT_TEST_ASSERT(match == data);
     AGENT_TEST_ASSERT(match_len == strlen(data) - strlen("\trm -f bc\n"));
@@ -6950,8 +7569,235 @@ static void test_agent_edit_upto_requires_tail_after_newline_strip(void) {
 
     AGENT_TEST_ASSERT(!agent_edit_find_old_span(data, strlen(data), old,
                                                &match, &match_len, &anchored,
-                                               err, sizeof(err)));
+                                               NULL, err, sizeof(err)));
     AGENT_TEST_ASSERT(strstr(err, "must include a unique tail anchor") != NULL);
+}
+
+static void test_agent_edit_new_upto_preserves_omitted_middle(void) {
+    const char *data =
+        "static bool before(void);\n"
+        "\n"
+        "static bool keep_one(void);\n"
+        "static bool keep_two(void);\n"
+        "\n"
+        "static bool after(void);\n";
+    const char *old =
+        "static bool before(void);\n"
+        "\n"
+        "[upto]\n"
+        "static bool after(void);\n";
+    const char *new_text =
+        "static bool before(void);\n"
+        "static bool added(void);\n"
+        "\n"
+        "[upto]\n"
+        "static bool after(void);\n";
+    const char *expected =
+        "static bool before(void);\n"
+        "static bool added(void);\n"
+        "\n"
+        "static bool keep_one(void);\n"
+        "static bool keep_two(void);\n"
+        "\n"
+        "static bool after(void);\n";
+
+    const char *match = NULL;
+    size_t match_len = 0;
+    bool anchored = false;
+    bool used_upto = false;
+    agent_edit_anchor_span span = {0};
+    char err[128] = {0};
+    AGENT_TEST_ASSERT(agent_edit_find_old_span(data, strlen(data), old,
+                                              &match, &match_len, &anchored,
+                                              &span, err, sizeof(err)));
+    AGENT_TEST_ASSERT(anchored);
+    AGENT_TEST_ASSERT(span.active);
+    char *resolved = agent_edit_resolve_new_text(data, strlen(data),
+                                                 match, match_len, &span,
+                                                 new_text, &used_upto,
+                                                 err, sizeof(err));
+    AGENT_TEST_ASSERT(resolved != NULL);
+    if (resolved) {
+        AGENT_TEST_ASSERT(used_upto);
+        AGENT_TEST_ASSERT(strstr(resolved, "[upto]") == NULL);
+        AGENT_TEST_ASSERT(strcmp(resolved, expected) == 0);
+        free(resolved);
+    }
+}
+
+static void test_agent_edit_upto_accepts_indented_marker_line(void) {
+    const char *data =
+        "static void outer(void) {\n"
+        "    call_before();\n"
+        "    keep_one();\n"
+        "    keep_two();\n"
+        "    call_after();\n"
+        "}\n";
+    const char *old =
+        "static void outer(void) {\n"
+        "    call_before();\n"
+        "    [upto]\n"
+        "    call_after();\n";
+    const char *new_text =
+        "static void outer(void) {\n"
+        "    call_before();\n"
+        "    call_added();\n"
+        "    [upto]\n"
+        "    call_after();\n";
+    const char *expected =
+        "static void outer(void) {\n"
+        "    call_before();\n"
+        "    call_added();\n"
+        "    keep_one();\n"
+        "    keep_two();\n"
+        "    call_after();\n";
+
+    const char *match = NULL;
+    size_t match_len = 0;
+    bool anchored = false;
+    bool used_upto = false;
+    agent_edit_anchor_span span = {0};
+    char err[128] = {0};
+    AGENT_TEST_ASSERT(agent_edit_find_old_span(data, strlen(data), old,
+                                              &match, &match_len, &anchored,
+                                              &span, err, sizeof(err)));
+    AGENT_TEST_ASSERT(anchored);
+    char *resolved = agent_edit_resolve_new_text(data, strlen(data),
+                                                 match, match_len, &span,
+                                                 new_text, &used_upto,
+                                                 err, sizeof(err));
+    AGENT_TEST_ASSERT(resolved != NULL);
+    if (resolved) {
+        AGENT_TEST_ASSERT(used_upto);
+        AGENT_TEST_ASSERT(strstr(resolved, "[upto]") == NULL);
+        AGENT_TEST_ASSERT(strcmp(resolved, expected) == 0);
+        free(resolved);
+    }
+}
+
+static void test_agent_edit_new_literal_upto_is_not_merge_marker(void) {
+    const char *data =
+        "static bool before(void);\n"
+        "\n"
+        "static bool keep_one(void);\n"
+        "static bool keep_two(void);\n"
+        "\n"
+        "static bool after(void);\n";
+    const char *old =
+        "static bool before(void);\n"
+        "\n"
+        "[upto]\n"
+        "static bool after(void);\n";
+    const char *new_text =
+        "static bool before(void);\n"
+        "static const char *marker = \"[upto]\";\n"
+        "\n"
+        "[upto]\n"
+        "static bool after(void);\n";
+    const char *expected =
+        "static bool before(void);\n"
+        "static const char *marker = \"[upto]\";\n"
+        "\n"
+        "static bool keep_one(void);\n"
+        "static bool keep_two(void);\n"
+        "\n"
+        "static bool after(void);\n";
+
+    const char *match = NULL;
+    size_t match_len = 0;
+    bool anchored = false;
+    bool used_upto = false;
+    agent_edit_anchor_span span = {0};
+    char err[128] = {0};
+    AGENT_TEST_ASSERT(agent_edit_find_old_span(data, strlen(data), old,
+                                              &match, &match_len, &anchored,
+                                              &span, err, sizeof(err)));
+    char *resolved = agent_edit_resolve_new_text(data, strlen(data),
+                                                 match, match_len, &span,
+                                                 new_text, &used_upto,
+                                                 err, sizeof(err));
+    AGENT_TEST_ASSERT(resolved != NULL);
+    if (resolved) {
+        AGENT_TEST_ASSERT(used_upto);
+        AGENT_TEST_ASSERT(strstr(resolved, "\"[upto]\"") != NULL);
+        AGENT_TEST_ASSERT(strcmp(resolved, expected) == 0);
+        free(resolved);
+    }
+}
+
+static void test_agent_tool_edit_new_upto_merges_omitted_middle(void) {
+    char root_tmpl[] = "/tmp/ds4_agent_edit_root_XXXXXX";
+    char *root_tmp = mkdtemp(root_tmpl);
+    AGENT_TEST_ASSERT(root_tmp != NULL);
+    if (!root_tmp) return;
+
+    agent_config cfg = {.non_interactive = true};
+    agent_worker w = {.cfg = &cfg};
+    char root[PATH_MAX];
+    AGENT_TEST_ASSERT(realpath(root_tmp, root) != NULL);
+    agent_path_list_append(&w.working_directories, root);
+
+    char file_path[PATH_MAX];
+    snprintf(file_path, sizeof(file_path), "%s/sample.c", root);
+    const char *initial =
+        "static bool before(void);\n"
+        "\n"
+        "static bool keep_one(void);\n"
+        "static bool keep_two(void);\n"
+        "\n"
+        "static bool after(void);\n";
+    const char *expected =
+        "static bool before(void);\n"
+        "static bool added(void);\n"
+        "\n"
+        "static bool keep_one(void);\n"
+        "static bool keep_two(void);\n"
+        "\n"
+        "static bool after(void);\n";
+    char err[128] = {0};
+    AGENT_TEST_ASSERT(agent_write_file_bytes(file_path, initial, strlen(initial),
+                                             err, sizeof(err)) == 0);
+
+    agent_tool_arg args[] = {
+        {.name = "path", .value = "sample.c", .is_string = true},
+        {.name = "old", .value =
+            "static bool before(void);\n"
+            "\n"
+            "[upto]\n"
+            "static bool after(void);\n", .is_string = true},
+        {.name = "new", .value =
+            "static bool before(void);\n"
+            "static bool added(void);\n"
+            "\n"
+            "[upto]\n"
+            "static bool after(void);\n", .is_string = true},
+    };
+    agent_tool_call call = {
+        .name = "edit",
+        .args = args,
+        .argc = 3,
+    };
+    char *result = agent_tool_edit(&w, &call);
+    AGENT_TEST_ASSERT(result != NULL);
+    if (result) {
+        AGENT_TEST_ASSERT(strstr(result, "anchored old/new merge") != NULL);
+        free(result);
+    }
+
+    char *data = NULL;
+    size_t len = 0;
+    AGENT_TEST_ASSERT(agent_read_file_bytes(file_path, &data, &len,
+                                            err, sizeof(err)) == 0);
+    if (data) {
+        AGENT_TEST_ASSERT(strstr(data, "[upto]") == NULL);
+        AGENT_TEST_ASSERT(len == strlen(expected));
+        AGENT_TEST_ASSERT(strcmp(data, expected) == 0);
+        free(data);
+    }
+
+    unlink(file_path);
+    agent_path_list_free(&w.working_directories);
+    rmdir(root);
 }
 
 static void test_agent_working_directory_path_resolution(void) {
@@ -7219,6 +8065,11 @@ static void test_agent_remove_auto_allowed_path_directly(void) {
     rmdir(root_tmp);
 }
 
+static void test_agent_executable_exists(void) {
+    AGENT_TEST_ASSERT(agent_executable_exists("/bin/sh"));
+    AGENT_TEST_ASSERT(!agent_executable_exists("/definitely/not/a/real/executable"));
+}
+
 static void test_agent_command_in_path(void) {
     const char *old_path = getenv("PATH");
     char *saved_path = old_path ? xstrdup(old_path) : NULL;
@@ -7235,14 +8086,815 @@ static void test_agent_command_in_path(void) {
     }
 }
 
-static void test_agent_executable_exists(void) {
-    AGENT_TEST_ASSERT(agent_executable_exists("/bin/sh"));
-    AGENT_TEST_ASSERT(!agent_executable_exists("/definitely/not/a/real/executable"));
+static void test_agent_docker_exec_rejects_invalid_input(void) {
+    agent_config cfg = {0};
+    const char *const empty_argv[] = {NULL};
+    const char *const nonempty_argv[] = {"ps", NULL};
+    agent_buf out = {0};
+    int status = 0;
+
+    /* NULL cfg returns false */
+    AGENT_TEST_ASSERT(!agent_docker_exec(NULL, NULL, nonempty_argv,
+                                         NULL, 0, false, "test", &out, &status));
+    /* NULL argv returns false */
+    AGENT_TEST_ASSERT(!agent_docker_exec(NULL, &cfg, NULL,
+                                         NULL, 0, false, "test", &out, &status));
+    /* Empty argv (first element NULL) returns false */
+    AGENT_TEST_ASSERT(!agent_docker_exec(NULL, &cfg, empty_argv,
+                                         NULL, 0, false, "test", &out, &status));
+    /* No fork happened - out is still zeroed */
+    AGENT_TEST_ASSERT(out.ptr == NULL);
+    AGENT_TEST_ASSERT(out.len == 0);
+    free(out.ptr);
+}
+
+static void test_agent_docker_exec_no_capture(void) {
+    agent_config cfg = {0};
+    cfg.docker_command = "/nonexistent/docker";
+    const char *const argv[] = {"ps", NULL};
+    int status = 0;
+
+    /* out == NULL, command does not exist - should return false without crashing */
+    AGENT_TEST_ASSERT(!agent_docker_exec(NULL, &cfg, argv,
+                                         NULL, 0, false, "test", NULL, &status));
+}
+
+static void test_agent_docker_exec_debug_stdout(void) {
+    /* Capture stdout to check debug output */
+    int pipe_fds[2];
+    AGENT_TEST_ASSERT(pipe(pipe_fds) == 0);
+    int saved_stdout = dup(STDOUT_FILENO);
+    AGENT_TEST_ASSERT(saved_stdout >= 0);
+    dup2(pipe_fds[1], STDOUT_FILENO);
+    close(pipe_fds[1]);
+
+    agent_config cfg = {0};
+    cfg.docker_command = "/nonexistent/docker";
+    cfg.docker_debug = true;
+    const char *const argv[] = {"ps", NULL};
+    int status = 0;
+
+    /* w == NULL, debug enabled - should print to stdout before failing */
+    agent_docker_exec(NULL, &cfg, argv, NULL, 0, false, "test", NULL, &status);
+
+    /* Restore stdout */
+    dup2(saved_stdout, STDOUT_FILENO);
+    close(saved_stdout);
+
+    /* Read captured output */
+    char buf[256] = {0};
+    ssize_t n = read(pipe_fds[0], buf, sizeof(buf) - 1);
+    close(pipe_fds[0]);
+    AGENT_TEST_ASSERT(n > 0);
+    AGENT_TEST_ASSERT(strstr(buf, "[docker debug]") != NULL);
+    AGENT_TEST_ASSERT(strstr(buf, "docker") != NULL);
+    AGENT_TEST_ASSERT(strstr(buf, "ps") != NULL);
+}
+
+static void test_agent_docker_exec_zero_length_stdin(void) {
+    /* Use a simple command that reads stdin and exits.  Since docker is not
+     * available, we use /bin/sh -c "cat > /dev/null" as a fake docker command
+     * that accepts stdin and succeeds. */
+    agent_config cfg = {0};
+    cfg.docker_command = "/bin/sh";
+    const char *const argv[] = {"-c", "cat > /dev/null", NULL};
+    agent_buf out = {0};
+    int status = 0;
+
+    /* stdin_data is non-NULL with zero length - should succeed */
+    const char *empty = "";
+    AGENT_TEST_ASSERT(agent_docker_exec(NULL, &cfg, argv,
+                                        empty, 0, false, "test", &out, &status));
+    free(out.ptr);
+}
+
+static void test_agent_docker_exec_large_stdin_poll_loop(void) {
+    agent_config cfg = {0};
+    cfg.docker_command = "/bin/sh";
+    const char *const argv[] = {
+        "-c", "n=$(wc -c); printf '%s' \"$n\"", NULL
+    };
+    size_t data_len = 192 * 1024;
+    char *data = xmalloc(data_len);
+    memset(data, 'x', data_len);
+    agent_buf out = {0};
+    int status = 0;
+
+    AGENT_TEST_ASSERT(agent_docker_exec(NULL, &cfg, argv, data, data_len,
+                                        false, "test", &out, &status));
+    AGENT_TEST_ASSERT(out.ptr && strstr(out.ptr, "196608") != NULL);
+    free(out.ptr);
+    free(data);
+}
+
+static void test_agent_docker_capture_wrapper_rejects_null_cfg(void) {
+    char *argv[] = {(char *)"docker", "ps", NULL};
+    agent_buf out = {0};
+    AGENT_TEST_ASSERT(!agent_docker_capture(NULL, "docker", argv, "test", &out));
+    AGENT_TEST_ASSERT(out.ptr == NULL);
+}
+
+static void test_agent_docker_capture_wrapper_rejects_null_docker_command(void) {
+    agent_config cfg = {0};
+    char *argv[] = {(char *)"docker", "ps", NULL};
+    agent_buf out = {0};
+    AGENT_TEST_ASSERT(!agent_docker_capture(&cfg, NULL, argv, "test", &out));
+    AGENT_TEST_ASSERT(out.ptr == NULL);
+}
+
+static void test_agent_docker_capture_wrapper_rejects_null_argv(void) {
+    agent_config cfg = {0};
+    agent_buf out = {0};
+    AGENT_TEST_ASSERT(!agent_docker_capture(&cfg, "docker", NULL, "test", &out));
+    AGENT_TEST_ASSERT(out.ptr == NULL);
+}
+
+static void test_agent_docker_capture_wrapper_rejects_empty_argv(void) {
+    agent_config cfg = {0};
+    char *argv[] = {NULL};
+    agent_buf out = {0};
+    AGENT_TEST_ASSERT(!agent_docker_capture(&cfg, "docker", argv, "test", &out));
+    AGENT_TEST_ASSERT(out.ptr == NULL);
+}
+
+/* --- agent_docker_shell tests --- */
+
+static void test_agent_docker_shell_start_rejects_missing_container(void) {
+    agent_worker w = {0};
+    agent_config cfg = {0};
+    w.cfg = &cfg;
+    /* No container set */
+    AGENT_TEST_ASSERT(!agent_docker_shell_start(&w));
+    AGENT_TEST_ASSERT(!w.docker_shell.active);
+}
+
+static void test_agent_docker_shell_start_rejects_unavailable_docker(void) {
+    agent_worker w = {0};
+    agent_config cfg = {0};
+    cfg.docker_available = false;
+    cfg.docker_container = "test";
+    w.cfg = &cfg;
+    AGENT_TEST_ASSERT(!agent_docker_shell_start(&w));
+    AGENT_TEST_ASSERT(!w.docker_shell.active);
+}
+
+static void test_agent_docker_shell_exec_rejects_inactive_shell(void) {
+    agent_worker w = {0};
+    agent_buf out = {0};
+    int status = 0;
+    AGENT_TEST_ASSERT(!agent_docker_shell_exec(&w, "echo hello", false, "test", &out, &status));
+    AGENT_TEST_ASSERT(out.ptr == NULL);
+    free(out.ptr);
+}
+
+static void test_agent_docker_shell_parses_output_and_exit_code(void) {
+    /* Use a real /bin/sh to test the sentinel protocol.  We fork a shell,
+     * then send it a command via agent_docker_shell_exec and verify the
+     * output and exit code. */
+    int stdin_pipe[2];
+    int stdout_pipe[2];
+    AGENT_TEST_ASSERT(pipe(stdin_pipe) == 0);
+    AGENT_TEST_ASSERT(pipe(stdout_pipe) == 0);
+
+    pid_t child = fork();
+    if (child == 0) {
+        close(stdin_pipe[1]);
+        close(stdout_pipe[0]);
+        dup2(stdin_pipe[0], STDIN_FILENO);
+        dup2(stdout_pipe[1], STDOUT_FILENO);
+        dup2(stdout_pipe[1], STDERR_FILENO);
+        close(stdin_pipe[0]);
+        close(stdout_pipe[1]);
+        /* Start a real shell */
+        execl("/bin/sh", "sh", NULL);
+        _exit(127);
+    }
+    AGENT_TEST_ASSERT(child > 0);
+    close(stdin_pipe[0]);
+    close(stdout_pipe[1]);
+
+    agent_worker w = {0};
+    w.docker_shell.stdin_fd = stdin_pipe[1];
+    w.docker_shell.stdout_fd = stdout_pipe[0];
+    w.docker_shell.pid = child;
+    w.docker_shell.seq = 0;
+    w.docker_shell.active = true;
+    pthread_mutex_init(&w.docker_shell.mu, NULL);
+
+    /* Test: echo hello, should output "hello" and exit 0 */
+    agent_buf out = {0};
+    int status = 0;
+    AGENT_TEST_ASSERT(agent_docker_shell_exec(&w, "echo hello", false, "test", &out, &status));
+    AGENT_TEST_ASSERT(out.ptr != NULL);
+    AGENT_TEST_ASSERT(out.len > 0);
+    AGENT_TEST_ASSERT(strstr(out.ptr, "hello") != NULL);
+    AGENT_TEST_ASSERT(status == 0);
+
+    /* Test: return a non-zero exit code */
+    agent_buf out2 = {0};
+    int status2 = 0;
+    AGENT_TEST_ASSERT(agent_docker_shell_exec(&w, "false", false, "test", &out2, &status2));
+    AGENT_TEST_ASSERT(status2 != 0);
+
+    free(out.ptr);
+    free(out2.ptr);
+    close(stdin_pipe[1]);
+    close(stdout_pipe[0]);
+    kill(child, SIGKILL);
+    waitpid(child, NULL, 0);
+    pthread_mutex_destroy(&w.docker_shell.mu);
+}
+
+static void test_agent_docker_shell_argv_conversion(void) {
+    /* Test that agent_docker_shell_exec_argv properly shell-quotes arguments
+     * with spaces, quotes, dollar signs, and semicolons, using a real shell. */
+    int stdin_pipe[2];
+    int stdout_pipe[2];
+    AGENT_TEST_ASSERT(pipe(stdin_pipe) == 0);
+    AGENT_TEST_ASSERT(pipe(stdout_pipe) == 0);
+
+    pid_t child = fork();
+    if (child == 0) {
+        close(stdin_pipe[1]);
+        close(stdout_pipe[0]);
+        dup2(stdin_pipe[0], STDIN_FILENO);
+        dup2(stdout_pipe[1], STDOUT_FILENO);
+        dup2(stdout_pipe[1], STDERR_FILENO);
+        close(stdin_pipe[0]);
+        close(stdout_pipe[1]);
+        /* Start a real shell */
+        execl("/bin/sh", "sh", NULL);
+        _exit(127);
+    }
+    AGENT_TEST_ASSERT(child > 0);
+    close(stdin_pipe[0]);
+    close(stdout_pipe[1]);
+
+    agent_worker w = {0};
+    w.docker_shell.stdin_fd = stdin_pipe[1];
+    w.docker_shell.stdout_fd = stdout_pipe[0];
+    w.docker_shell.pid = child;
+    w.docker_shell.seq = 0;
+    w.docker_shell.active = true;
+    pthread_mutex_init(&w.docker_shell.mu, NULL);
+
+    /* Arguments with spaces, quotes, dollar signs, and semicolons */
+    char *const argv[] = {
+        (char *)"echo",
+        (char *)"hello world",
+        (char *)"it's fine",
+        (char *)"$VAR",
+        (char *)"a;b",
+        NULL
+    };
+    agent_buf out = {0};
+    int status = 0;
+    AGENT_TEST_ASSERT(agent_docker_shell_exec_argv(&w, argv, false, "test", &out, &status));
+    AGENT_TEST_ASSERT(out.ptr != NULL);
+    AGENT_TEST_ASSERT(out.len > 0);
+    AGENT_TEST_ASSERT(status == 0);
+    /* The output should contain the shell-quoted arguments */
+    AGENT_TEST_ASSERT(strstr(out.ptr, "hello world") != NULL);
+    AGENT_TEST_ASSERT(strstr(out.ptr, "it's fine") != NULL);
+    AGENT_TEST_ASSERT(strstr(out.ptr, "$VAR") != NULL);
+    AGENT_TEST_ASSERT(strstr(out.ptr, "a;b") != NULL);
+
+    free(out.ptr);
+    close(stdin_pipe[1]);
+    close(stdout_pipe[0]);
+    kill(child, SIGKILL);
+    waitpid(child, NULL, 0);
+    pthread_mutex_destroy(&w.docker_shell.mu);
+}
+
+static void test_agent_docker_shell_exec_argv_debug_publish(void) {
+    int stdin_pipe[2];
+    int stdout_pipe[2];
+    AGENT_TEST_ASSERT(pipe(stdin_pipe) == 0);
+    AGENT_TEST_ASSERT(pipe(stdout_pipe) == 0);
+
+    pid_t child = fork();
+    if (child == 0) {
+        close(stdin_pipe[1]);
+        close(stdout_pipe[0]);
+        dup2(stdin_pipe[0], STDIN_FILENO);
+        dup2(stdout_pipe[1], STDOUT_FILENO);
+        dup2(stdout_pipe[1], STDERR_FILENO);
+        close(stdin_pipe[0]);
+        close(stdout_pipe[1]);
+        execl("/bin/sh", "sh", NULL);
+        _exit(127);
+    }
+    AGENT_TEST_ASSERT(child > 0);
+    close(stdin_pipe[0]);
+    close(stdout_pipe[1]);
+
+    agent_config cfg = {.docker_debug = true};
+    agent_worker w = {0};
+    w.cfg = &cfg;
+    w.docker_shell.stdin_fd = stdin_pipe[1];
+    w.docker_shell.stdout_fd = stdout_pipe[0];
+    w.docker_shell.pid = child;
+    w.docker_shell.seq = 0;
+    w.docker_shell.active = true;
+    pthread_mutex_init(&w.mu, NULL);
+    pthread_cond_init(&w.cond, NULL);
+    pthread_mutex_init(&w.docker_shell.mu, NULL);
+
+    char *const argv[] = {
+        (char *)"cat",
+        (char *)"/tmp/example file.txt",
+        NULL
+    };
+    agent_buf out = {0};
+    int status = 0;
+    AGENT_TEST_ASSERT(agent_docker_shell_exec_argv(&w, argv, false,
+                                                  "test", &out, &status));
+    AGENT_TEST_ASSERT(status != 0);
+    AGENT_TEST_ASSERT(w.out != NULL);
+    AGENT_TEST_ASSERT(strstr(w.out, "[docker debug]") != NULL);
+    AGENT_TEST_ASSERT(strstr(w.out, "cat '/tmp/example file.txt'") != NULL);
+
+    free(out.ptr);
+    free(w.out);
+    close(stdin_pipe[1]);
+    close(stdout_pipe[0]);
+    kill(child, SIGKILL);
+    waitpid(child, NULL, 0);
+    pthread_mutex_destroy(&w.docker_shell.mu);
+    pthread_cond_destroy(&w.cond);
+    pthread_mutex_destroy(&w.mu);
+}
+
+static void test_agent_docker_shell_unbounded_output(void) {
+    int stdin_pipe[2];
+    int stdout_pipe[2];
+    AGENT_TEST_ASSERT(pipe(stdin_pipe) == 0);
+    AGENT_TEST_ASSERT(pipe(stdout_pipe) == 0);
+
+    pid_t child = fork();
+    if (child == 0) {
+        close(stdin_pipe[1]);
+        close(stdout_pipe[0]);
+        dup2(stdin_pipe[0], STDIN_FILENO);
+        dup2(stdout_pipe[1], STDOUT_FILENO);
+        dup2(stdout_pipe[1], STDERR_FILENO);
+        close(stdin_pipe[0]);
+        close(stdout_pipe[1]);
+        execl("/bin/sh", "sh", NULL);
+        _exit(127);
+    }
+    AGENT_TEST_ASSERT(child > 0);
+    close(stdin_pipe[0]);
+    close(stdout_pipe[1]);
+
+    agent_worker w = {0};
+    w.docker_shell.stdin_fd = stdin_pipe[1];
+    w.docker_shell.stdout_fd = stdout_pipe[0];
+    w.docker_shell.pid = child;
+    w.docker_shell.seq = 0;
+    w.docker_shell.active = true;
+    pthread_mutex_init(&w.docker_shell.mu, NULL);
+
+    agent_buf out = {0};
+    int status = 0;
+    AGENT_TEST_ASSERT(agent_docker_shell_exec(
+        &w,
+        "dd if=/dev/zero bs=1024 count=160 2>/dev/null | tr '\\000' x",
+        true, "test", &out, &status));
+    AGENT_TEST_ASSERT(status == 0);
+    AGENT_TEST_ASSERT(out.len == 160 * 1024);
+    AGENT_TEST_ASSERT(!out.truncated);
+
+    free(out.ptr);
+    close(stdin_pipe[1]);
+    close(stdout_pipe[0]);
+    kill(child, SIGKILL);
+    waitpid(child, NULL, 0);
+    pthread_mutex_destroy(&w.docker_shell.mu);
+}
+
+static void test_agent_docker_read_range_uses_shell_slice(void) {
+    char path[] = "/tmp/ds4-agent-read-range-XXXXXX";
+    int fd = mkstemp(path);
+    AGENT_TEST_ASSERT(fd >= 0);
+    FILE *f = fdopen(fd, "w");
+    AGENT_TEST_ASSERT(f != NULL);
+    for (int i = 1; i <= 1200; i++)
+        fprintf(f, "line%04d\n", i);
+    fclose(f);
+
+    int stdin_pipe[2];
+    int stdout_pipe[2];
+    AGENT_TEST_ASSERT(pipe(stdin_pipe) == 0);
+    AGENT_TEST_ASSERT(pipe(stdout_pipe) == 0);
+
+    pid_t child = fork();
+    if (child == 0) {
+        close(stdin_pipe[1]);
+        close(stdout_pipe[0]);
+        dup2(stdin_pipe[0], STDIN_FILENO);
+        dup2(stdout_pipe[1], STDOUT_FILENO);
+        dup2(stdout_pipe[1], STDERR_FILENO);
+        close(stdin_pipe[0]);
+        close(stdout_pipe[1]);
+        execl("/bin/sh", "sh", NULL);
+        _exit(127);
+    }
+    AGENT_TEST_ASSERT(child > 0);
+    close(stdin_pipe[0]);
+    close(stdout_pipe[1]);
+
+    agent_config cfg = {.docker_available = true, .docker_container = "test"};
+    agent_worker w = {0};
+    w.cfg = &cfg;
+    w.docker_shell.stdin_fd = stdin_pipe[1];
+    w.docker_shell.stdout_fd = stdout_pipe[0];
+    w.docker_shell.pid = child;
+    w.docker_shell.seq = 0;
+    w.docker_shell.active = true;
+    pthread_mutex_init(&w.docker_shell.mu, NULL);
+
+    char *result = agent_read_range(&w, path, 501, 5, false, false, true);
+    AGENT_TEST_ASSERT(result != NULL);
+    AGENT_TEST_ASSERT(strstr(result, "lines 501-505 of 1200") != NULL);
+    AGENT_TEST_ASSERT(strstr(result, "501 line0501") != NULL);
+    AGENT_TEST_ASSERT(strstr(result, "505 line0505") != NULL);
+    AGENT_TEST_ASSERT(strstr(result, "500 line0500") == NULL);
+    AGENT_TEST_ASSERT(w.more_valid);
+    AGENT_TEST_ASSERT(w.more_next_line == 506);
+    free(result);
+
+    close(stdin_pipe[1]);
+    close(stdout_pipe[0]);
+    kill(child, SIGKILL);
+    waitpid(child, NULL, 0);
+    pthread_mutex_destroy(&w.docker_shell.mu);
+    unlink(path);
+}
+
+static void test_agent_docker_refresh_mounts_skips_unchanged_fingerprint(void) {
+    agent_config cfg = {0};
+    cfg.docker_available = true;
+    cfg.docker_command = "/definitely/not/docker";
+    cfg.docker_container = "ds4-test";
+    snprintf(cfg.temp_directory, sizeof(cfg.temp_directory), "%s", "/tmp");
+
+    agent_worker w = {0};
+    w.cfg = &cfg;
+    agent_path_list_append(&w.working_directories, "/tmp");
+    agent_docker_mount_fingerprint(&w, w.docker_mount_fingerprint,
+                                   sizeof(w.docker_mount_fingerprint));
+
+    char err[256] = {0};
+    AGENT_TEST_ASSERT(agent_docker_refresh_mounts(&w, err, sizeof(err)));
+    AGENT_TEST_ASSERT(err[0] == '\0');
+    agent_path_list_free(&w.working_directories);
+}
+
+static void test_agent_bash_publish_observation_command_output_on(void) {
+    agent_config cfg = {.command_output = true};
+    agent_worker w = {0};
+    w.cfg = &cfg;
+    AGENT_TEST_ASSERT(pipe(w.wake_fd) == 0);
+    pthread_mutex_init(&w.mu, NULL);
+
+    const char *obs =
+        "bash job=1 pid=42 status=done elapsed_sec=0.1 timed_out=0\n"
+        "exit_status=0\n"
+        "<output>\n"
+        "</output>\n";
+    agent_bash_publish_observation(&w, obs);
+    AGENT_TEST_ASSERT(w.out != NULL);
+    AGENT_TEST_ASSERT(strstr(w.out, "\x1b[90m[bash completed with no output]\n\x1b[0m") != NULL);
+
+    free(w.out);
+    close(w.wake_fd[0]);
+    close(w.wake_fd[1]);
+    pthread_mutex_destroy(&w.mu);
+}
+
+static void test_agent_bash_publish_observation_command_output_off(void) {
+    agent_config cfg = {.command_output = false};
+    agent_worker w = {0};
+    w.cfg = &cfg;
+    AGENT_TEST_ASSERT(pipe(w.wake_fd) == 0);
+    pthread_mutex_init(&w.mu, NULL);
+
+    const char *obs =
+        "bash job=1 pid=42 status=done elapsed_sec=0.1 timed_out=0\n"
+        "exit_status=0\n"
+        "<output>\n"
+        "hidden\n"
+        "</output>\n";
+    agent_bash_publish_observation(&w, obs);
+    AGENT_TEST_ASSERT(w.out == NULL);
+
+    close(w.wake_fd[0]);
+    close(w.wake_fd[1]);
+    pthread_mutex_destroy(&w.mu);
+}
+
+static void test_agent_docker_bash_publishes_command_output(void) {
+    char docker_path[] = "/tmp/ds4-agent-fake-docker-XXXXXX";
+    int fd = mkstemp(docker_path);
+    AGENT_TEST_ASSERT(fd >= 0);
+    const char *script =
+        "#!/bin/sh\n"
+        "while [ \"$#\" -gt 0 ] && [ \"$1\" != \"/bin/sh\" ]; do shift; done\n"
+        "if [ \"$1\" != \"/bin/sh\" ]; then echo missing shell >&2; exit 127; fi\n"
+        "shift\n"
+        "if [ \"$1\" = \"-c\" ]; then shift; exec /bin/sh -c \"$1\"; fi\n"
+        "exec /bin/sh \"$@\"\n";
+    write_all(fd, script, strlen(script));
+    close(fd);
+    AGENT_TEST_ASSERT(chmod(docker_path, 0700) == 0);
+
+    agent_config cfg = {0};
+    cfg.docker_available = true;
+    cfg.docker_container = "fake-container";
+    cfg.docker_command = docker_path;
+    cfg.command_output = true;
+    snprintf(cfg.temp_directory, sizeof(cfg.temp_directory), "%s", "/tmp");
+
+    agent_worker w = {0};
+    w.cfg = &cfg;
+    AGENT_TEST_ASSERT(pipe(w.wake_fd) == 0);
+    pthread_mutex_init(&w.mu, NULL);
+    char err[160] = {0};
+    agent_bash_job *job = agent_bash_start_mode(&w, "printf docker-bash-output",
+                                                5, true, err, sizeof(err));
+    AGENT_TEST_ASSERT(job != NULL);
+    if (job) {
+        char *obs = agent_bash_job_tool_result(&w, job, true, 2, false, true);
+        AGENT_TEST_ASSERT(obs != NULL);
+        AGENT_TEST_ASSERT(strstr(obs, "docker-bash-output") != NULL);
+        AGENT_TEST_ASSERT(w.out != NULL);
+        AGENT_TEST_ASSERT(strstr(w.out, "\x1b[90mdocker-bash-output\x1b[0m\n") != NULL);
+        free(obs);
+    }
+
+    free(w.out);
+    agent_path_list_free(&w.auto_allowed_paths);
+    close(w.wake_fd[0]);
+    close(w.wake_fd[1]);
+    pthread_mutex_destroy(&w.mu);
+    unlink(docker_path);
+}
+
+static void test_agent_docker_shell_debug_argv_includes_docker_exec(void) {
+    char home_env[PATH_MAX + 16];
+    char tmpdir_env[PATH_MAX + 16];
+    char tmp_env[PATH_MAX + 16];
+    char temp_env[PATH_MAX + 16];
+    char xdg_config_env[PATH_MAX + 32];
+    char xdg_cache_env[PATH_MAX + 32];
+    char *argv[48];
+    int argc = 0;
+    agent_docker_build_shell_argv(argv, &argc, "docker", "ds4_c",
+                                  "/work", "/tmp", "echo hi",
+                                  home_env, sizeof(home_env),
+                                  tmpdir_env, sizeof(tmpdir_env),
+                                  tmp_env, sizeof(tmp_env),
+                                  temp_env, sizeof(temp_env),
+                                  xdg_config_env, sizeof(xdg_config_env),
+                                  xdg_cache_env, sizeof(xdg_cache_env));
+    AGENT_TEST_ASSERT(argc > 0);
+    char *cmd = agent_docker_debug_command_text(argv);
+    AGENT_TEST_ASSERT(cmd != NULL);
+    if (cmd) {
+        AGENT_TEST_ASSERT(strstr(cmd, "docker exec -i") != NULL);
+        AGENT_TEST_ASSERT(strstr(cmd, "-w /work") != NULL);
+        AGENT_TEST_ASSERT(strstr(cmd, "ds4_c /bin/sh -c 'echo hi'") != NULL);
+        free(cmd);
+    }
+}
+
+static void test_agent_docker_shell_stop_is_idempotent(void) {
+    agent_worker w = {0};
+    w.docker_shell.stdin_fd = 3;
+    w.docker_shell.stdout_fd = 4;
+    w.docker_shell.pid = 12345;
+    w.docker_shell.active = true;
+
+    agent_docker_shell_stop(&w);
+    AGENT_TEST_ASSERT(w.docker_shell.stdin_fd == -1);
+    AGENT_TEST_ASSERT(w.docker_shell.stdout_fd == -1);
+    AGENT_TEST_ASSERT(!w.docker_shell.active);
+
+    /* Second call should be harmless */
+    agent_docker_shell_stop(&w);
+    AGENT_TEST_ASSERT(w.docker_shell.stdin_fd == -1);
+    AGENT_TEST_ASSERT(w.docker_shell.stdout_fd == -1);
+}
+
+/* --- agent_tool_list / agent_tool_search persistent shell tests --- */
+
+static void test_agent_tool_list_with_fake_shell(void) {
+    int stdin_pipe[2], stdout_pipe[2];
+    AGENT_TEST_ASSERT(pipe(stdin_pipe) == 0);
+    AGENT_TEST_ASSERT(pipe(stdout_pipe) == 0);
+
+    pid_t child = fork();
+    if (child == 0) {
+        close(stdin_pipe[1]);
+        close(stdout_pipe[0]);
+        dup2(stdin_pipe[0], STDIN_FILENO);
+        dup2(stdout_pipe[1], STDOUT_FILENO);
+        dup2(stdout_pipe[1], STDERR_FILENO);
+        close(stdin_pipe[0]);
+        close(stdout_pipe[1]);
+        execl("/bin/sh", "sh", NULL);
+        _exit(127);
+    }
+    AGENT_TEST_ASSERT(child > 0);
+    close(stdin_pipe[0]);
+    close(stdout_pipe[1]);
+
+    agent_config cfg = {.docker_available = true, .docker_container = "test"};
+    agent_worker w = {0};
+    w.cfg = &cfg;
+    w.docker_shell.stdin_fd = stdin_pipe[1];
+    w.docker_shell.stdout_fd = stdout_pipe[0];
+    w.docker_shell.pid = child;
+    w.docker_shell.seq = 0;
+    w.docker_shell.active = true;
+    pthread_mutex_init(&w.docker_shell.mu, NULL);
+
+    agent_tool_arg args[] = {
+        {.name = "path", .value = "/tmp", .is_string = true},
+    };
+    agent_tool_call call = {
+        .name = "list",
+        .args = args,
+        .argc = 1,
+    };
+    char *result = agent_tool_list(&w, &call);
+    AGENT_TEST_ASSERT(result != NULL);
+    AGENT_TEST_ASSERT(strstr(result, "/tmp:") != NULL);
+    free(result);
+
+    close(stdin_pipe[1]);
+    close(stdout_pipe[0]);
+    kill(child, SIGKILL);
+    waitpid(child, NULL, 0);
+    pthread_mutex_destroy(&w.docker_shell.mu);
+}
+
+static void test_agent_tool_search_with_fake_shell(void) {
+    int stdin_pipe[2], stdout_pipe[2];
+    AGENT_TEST_ASSERT(pipe(stdin_pipe) == 0);
+    AGENT_TEST_ASSERT(pipe(stdout_pipe) == 0);
+
+    pid_t child = fork();
+    if (child == 0) {
+        close(stdin_pipe[1]);
+        close(stdout_pipe[0]);
+        dup2(stdin_pipe[0], STDIN_FILENO);
+        dup2(stdout_pipe[1], STDOUT_FILENO);
+        dup2(stdout_pipe[1], STDERR_FILENO);
+        close(stdin_pipe[0]);
+        close(stdout_pipe[1]);
+        execl("/bin/sh", "sh", NULL);
+        _exit(127);
+    }
+    AGENT_TEST_ASSERT(child > 0);
+    close(stdin_pipe[0]);
+    close(stdout_pipe[1]);
+
+    agent_config cfg = {.docker_available = true, .docker_container = "test"};
+    agent_worker w = {0};
+    w.cfg = &cfg;
+    w.docker_shell.stdin_fd = stdin_pipe[1];
+    w.docker_shell.stdout_fd = stdout_pipe[0];
+    w.docker_shell.pid = child;
+    w.docker_shell.seq = 0;
+    w.docker_shell.active = true;
+    pthread_mutex_init(&w.docker_shell.mu, NULL);
+
+    agent_tool_arg args[] = {
+        {.name = "query", .value = "hello", .is_string = true},
+        {.name = "path", .value = ".", .is_string = true},
+    };
+    agent_tool_call call = {
+        .name = "search",
+        .args = args,
+        .argc = 2,
+    };
+    char *result = agent_tool_search(&w, &call);
+    AGENT_TEST_ASSERT(result != NULL);
+    /* Should get "No matches" since there is no file with "hello" in /tmp */
+    AGENT_TEST_ASSERT(strstr(result, "No matches") != NULL);
+    free(result);
+
+    close(stdin_pipe[1]);
+    close(stdout_pipe[0]);
+    kill(child, SIGKILL);
+    waitpid(child, NULL, 0);
+    pthread_mutex_destroy(&w.docker_shell.mu);
+}
+
+static void test_agent_tool_list_fails_when_shell_inactive(void) {
+    agent_config cfg = {.docker_available = true, .docker_container = "test"};
+    agent_worker w = {0};
+    w.cfg = &cfg;
+    w.docker_shell.active = false;
+
+    agent_tool_arg args[] = {
+        {.name = "path", .value = ".", .is_string = true},
+    };
+    agent_tool_call call = {
+        .name = "list",
+        .args = args,
+        .argc = 1,
+    };
+    char *result = agent_tool_list(&w, &call);
+    AGENT_TEST_ASSERT(result != NULL);
+    AGENT_TEST_ASSERT(strstr(result, "Tool error") != NULL);
+    free(result);
+}
+
+static void test_agent_tool_search_fails_when_shell_inactive(void) {
+    agent_config cfg = {.docker_available = true, .docker_container = "test"};
+    agent_worker w = {0};
+    w.cfg = &cfg;
+    w.docker_shell.active = false;
+
+    agent_tool_arg args[] = {
+        {.name = "query", .value = "hello", .is_string = true},
+        {.name = "path", .value = ".", .is_string = true},
+    };
+    agent_tool_call call = {
+        .name = "search",
+        .args = args,
+        .argc = 2,
+    };
+    char *result = agent_tool_search(&w, &call);
+    AGENT_TEST_ASSERT(result != NULL);
+    AGENT_TEST_ASSERT(strstr(result, "Tool error") != NULL);
+    free(result);
+}
+
+static void test_agent_tool_list_shell_argv_quoting(void) {
+    int stdin_pipe[2], stdout_pipe[2];
+    AGENT_TEST_ASSERT(pipe(stdin_pipe) == 0);
+    AGENT_TEST_ASSERT(pipe(stdout_pipe) == 0);
+
+    pid_t child = fork();
+    if (child == 0) {
+        close(stdin_pipe[1]);
+        close(stdout_pipe[0]);
+        dup2(stdin_pipe[0], STDIN_FILENO);
+        dup2(stdout_pipe[1], STDOUT_FILENO);
+        dup2(stdout_pipe[1], STDERR_FILENO);
+        close(stdin_pipe[0]);
+        close(stdout_pipe[1]);
+        execl("/bin/sh", "sh", NULL);
+        _exit(127);
+    }
+    AGENT_TEST_ASSERT(child > 0);
+    close(stdin_pipe[0]);
+    close(stdout_pipe[1]);
+
+    agent_config cfg = {.docker_available = true, .docker_container = "test"};
+    agent_worker w = {0};
+    w.cfg = &cfg;
+    w.docker_shell.stdin_fd = stdin_pipe[1];
+    w.docker_shell.stdout_fd = stdout_pipe[0];
+    w.docker_shell.pid = child;
+    w.docker_shell.seq = 0;
+    w.docker_shell.active = true;
+    pthread_mutex_init(&w.docker_shell.mu, NULL);
+
+    /* Path with spaces, quotes, $, backticks, semicolons */
+    agent_tool_arg args[] = {
+        {.name = "path", .value = "/tmp/test dir'\"$`;", .is_string = true},
+    };
+    agent_tool_call call = {
+        .name = "list",
+        .args = args,
+        .argc = 1,
+    };
+    char *result = agent_tool_list(&w, &call);
+    AGENT_TEST_ASSERT(result != NULL);
+    AGENT_TEST_ASSERT(strstr(result, "Tool error") == NULL ||
+                      strstr(result, "/tmp/test") != NULL);
+    free(result);
+
+    close(stdin_pipe[1]);
+    close(stdout_pipe[0]);
+    kill(child, SIGKILL);
+    waitpid(child, NULL, 0);
+    pthread_mutex_destroy(&w.docker_shell.mu);
 }
 
 static void ds4_agent_unit_tests_run(void) {
     test_agent_edit_upto_tail_newline_is_not_part_of_anchor();
     test_agent_edit_upto_requires_tail_after_newline_strip();
+    test_agent_edit_new_upto_preserves_omitted_middle();
+    test_agent_edit_upto_accepts_indented_marker_line();
+    test_agent_edit_new_literal_upto_is_not_merge_marker();
+    test_agent_tool_edit_new_upto_merges_omitted_middle();
     test_agent_working_directory_path_resolution();
     test_agent_working_directory_file_tools();
     test_agent_default_working_directory_from_launch_cwd();
@@ -7251,6 +8903,34 @@ static void ds4_agent_unit_tests_run(void) {
     test_agent_remove_auto_allowed_path_directly();
     test_agent_executable_exists();
     test_agent_command_in_path();
+    test_agent_docker_exec_rejects_invalid_input();
+    test_agent_docker_exec_no_capture();
+    test_agent_docker_exec_debug_stdout();
+    test_agent_docker_exec_zero_length_stdin();
+    test_agent_docker_exec_large_stdin_poll_loop();
+    test_agent_docker_capture_wrapper_rejects_null_cfg();
+    test_agent_docker_capture_wrapper_rejects_null_docker_command();
+    test_agent_docker_capture_wrapper_rejects_null_argv();
+    test_agent_docker_capture_wrapper_rejects_empty_argv();
+    test_agent_docker_shell_start_rejects_missing_container();
+    test_agent_docker_shell_start_rejects_unavailable_docker();
+    test_agent_docker_shell_exec_rejects_inactive_shell();
+    test_agent_docker_shell_parses_output_and_exit_code();
+    test_agent_docker_shell_argv_conversion();
+    test_agent_docker_shell_exec_argv_debug_publish();
+    test_agent_docker_shell_unbounded_output();
+    test_agent_docker_read_range_uses_shell_slice();
+    test_agent_docker_refresh_mounts_skips_unchanged_fingerprint();
+    test_agent_bash_publish_observation_command_output_on();
+    test_agent_bash_publish_observation_command_output_off();
+    test_agent_docker_bash_publishes_command_output();
+    test_agent_docker_shell_debug_argv_includes_docker_exec();
+    test_agent_docker_shell_stop_is_idempotent();
+    test_agent_tool_list_with_fake_shell();
+    test_agent_tool_search_with_fake_shell();
+    test_agent_tool_list_fails_when_shell_inactive();
+    test_agent_tool_search_fails_when_shell_inactive();
+    test_agent_tool_list_shell_argv_quoting();
 }
 #endif
 
@@ -7286,7 +8966,7 @@ static bool agent_preflight_edit_old(agent_worker *w, const agent_tool_call *cal
     size_t match_len = 0;
     bool anchored = false;
     bool ok = agent_edit_find_old_span(data, len, old, &match, &match_len,
-                                       &anchored, err, err_len);
+                                       &anchored, NULL, err, err_len);
     free(file_path);
     free(data);
     return ok;
@@ -7333,7 +9013,8 @@ static char *agent_apply_file_splice(agent_worker *w, const char *path,
 /* Old/new editing is intentionally conservative: exact old text must be unique.
  * For large replacements, old may contain one [upto] marker: the head must be
  * unique, and the tail must be unique after that head before the whole span is
- * replaced. */
+ * replaced.  When old is anchored, new may contain one [upto] marker to keep
+ * the omitted original middle. */
 static char *agent_tool_edit(agent_worker *w, const agent_tool_call *call) {
     const char *path = agent_tool_arg_value(call, "path");
     if (!path || !path[0]) return xstrdup("Tool error: edit requires path\n");
@@ -7379,9 +9060,25 @@ static char *agent_tool_edit(agent_worker *w, const agent_tool_call *call) {
     const char *match = NULL;
     size_t match_len = 0;
     bool anchored = false;
+    bool new_used_upto = false;
+    agent_edit_anchor_span anchor_span = {0};
     if (!agent_edit_find_old_span(data, len, old, &match, &match_len,
-                                  &anchored, err, sizeof(err)))
+                                  &anchored, &anchor_span, err, sizeof(err)))
     {
+        free(data);
+        free(file_path);
+        agent_buf b = {0};
+        agent_buf_puts(&b, "Tool error: ");
+        agent_buf_puts(&b, err);
+        agent_buf_puts(&b, "\n");
+        return agent_buf_take(&b);
+    }
+
+    char *resolved_new = agent_edit_resolve_new_text(data, len, match, match_len,
+                                                     &anchor_span, new_text,
+                                                     &new_used_upto,
+                                                     err, sizeof(err));
+    if (!resolved_new) {
         free(data);
         free(file_path);
         agent_buf b = {0};
@@ -7393,9 +9090,11 @@ static char *agent_tool_edit(agent_worker *w, const agent_tool_call *call) {
 
     char *result = agent_apply_file_splice(w, display_path, data, len,
                                            (size_t)(match - data), match_len,
-                                           new_text,
-                                           anchored ? "anchored old/new replacement"
-                                                    : "old/new replacement");
+                                           resolved_new,
+                                           new_used_upto ? "anchored old/new merge"
+                                           : anchored ? "anchored old/new replacement"
+                                                      : "old/new replacement");
+    free(resolved_new);
     free(file_path);
     free(data);
     return result;
@@ -7540,8 +9239,7 @@ static char *agent_tool_search(agent_worker *w, const agent_tool_call *call) {
     int max_results = agent_parse_int_default(agent_tool_arg_value(call, "max_results"), 50, 1, 500);
     const char *glob = agent_tool_arg_value(call, "glob");
     if (agent_tool_use_docker_filesystem(w)) {
-        const char *working_dir = agent_primary_working_directory(w);
-        char grep_flags[32] = "-n";
+        char grep_flags[32] = "-nI";
         if (use_regex) strcat(grep_flags, "E");
         else strcat(grep_flags, "F");
         if (!case_sensitive) strcat(grep_flags, "i");
@@ -7552,20 +9250,20 @@ static char *agent_tool_search(agent_worker *w, const agent_tool_call *call) {
         const char *script =
             "{ if [ -d \"$1\" ]; then "
             "  if [ -n \"$4\" ]; then "
-            "    find \"$1\" -type f -name \"$4\" -print0 | xargs -0 grep \"$2\" -C \"$3\" -- \"$5\" 2>/dev/null; "
+            "    find \"$1\" \\( -name .git -o -name node_modules -o -name .agents -o -name .codex -o -name build -o -name target -o -name .cache \\) -type d -prune -o -type f -name \"$4\" -print0 | xargs -0 grep \"$2\" -C \"$3\" -- \"$5\" 2>/dev/null; "
             "  else "
-            "    grep \"$2\" -R -C \"$3\" -- \"$5\" \"$1\" 2>/dev/null; "
+            "    find \"$1\" \\( -name .git -o -name node_modules -o -name .agents -o -name .codex -o -name build -o -name target -o -name .cache \\) -type d -prune -o -type f -print0 | xargs -0 grep \"$2\" -C \"$3\" -- \"$5\" 2>/dev/null; "
             "  fi; "
             "else "
             "  grep \"$2\" -C \"$3\" -- \"$5\" \"$1\" 2>/dev/null; "
-            "fi; rc=$?; [ \"$rc\" -le 1 ] || exit \"$rc\"; } | sed -n \"1,${6}p\"";
+            "fi; } | sed -n \"1,${6}p;${6}q\"";
         char *argv[] = {
             "/bin/sh", "-c", (char *)script, "sh",
             (char *)path, grep_flags, context_arg, (char *)(glob ? glob : ""),
             (char *)query, max_arg, NULL
         };
         agent_buf out = {0};
-        if (!agent_docker_exec_capture(w, working_dir, argv, NULL, 0, false,
+        if (!agent_docker_shell_exec_argv(w, argv, false,
                                        "docker search", &out, NULL)) {
             agent_buf b = {0};
             agent_buf_puts(&b, "Tool error: ");
@@ -7708,15 +9406,15 @@ static bool agent_write_temp_text(const char *temp_dir, const char *prefix,
     return true;
 }
 
-static char *agent_tool_web_search(agent_worker *w, const agent_tool_call *call) {
+static char *agent_tool_web_browse(agent_worker *w, const agent_tool_call *call) {
     const char *query = agent_tool_arg_value(call, "query");
-    if (!query || !query[0]) return xstrdup("Tool error: web_search requires query\n");
+    if (!query || !query[0]) return xstrdup("Tool error: web_browse requires query\n");
     char err[256] = {0};
     agent_publishf_system_status(w, "Searching Google for %s...", query);
     char *md = ds4_web_google_search(w->web, query, err, sizeof(err));
     if (!md) {
         agent_buf b = {0};
-        agent_buf_puts(&b, "Tool error: web_search failed: ");
+        agent_buf_puts(&b, "Tool error: web_browse failed: ");
         agent_buf_puts(&b, err[0] ? err : "unknown error");
         agent_buf_puts(&b, "\n");
         return agent_buf_take(&b);
@@ -7781,9 +9479,8 @@ static char *agent_tool_web_fetch(agent_worker *w, const agent_tool_call *call) 
     }
     free(head);
     free(md);
-    /* Delete the temp file unless preserve_agent_files is set. */
-    if (w && w->cfg && !w->cfg->preserve_agent_files && path[0])
-        unlink(path);
+    /* Defer deletion - the model may need to read this file via the read tool.
+     * Cleanup happens during worker free or via /purge_auto_files. */
     return agent_buf_take(&out);
 }
 
@@ -7829,6 +9526,16 @@ struct agent_bash_job {
 static int agent_bash_display_lines(const agent_bash_job *job) {
     if (!job || job->bytes == 0) return 0;
     return job->newline_count + (job->last_byte != '\n');
+}
+
+static void agent_bash_publish_output_chunk(agent_bash_job *job,
+                                            const char *s, size_t n) {
+    if (!job || !job->worker || !job->worker->cfg ||
+        !job->worker->cfg->command_output || !s || !n)
+        return;
+    agent_publish(job->worker, "\x1b[90m", 5);
+    agent_publish(job->worker, s, n);
+    agent_publish(job->worker, "\x1b[0m", 4);
 }
 
 static void agent_bash_note_output(agent_bash_job *job, const char *s, size_t n) {
@@ -7896,6 +9603,7 @@ static void agent_bash_drain(agent_bash_job *job) {
         if (n > 0) {
             agent_bash_note_output(job, tmp, (size_t)n);
             if (job->tmp_fd >= 0) write_all(job->tmp_fd, tmp, (size_t)n);
+            agent_bash_publish_output_chunk(job, tmp, (size_t)n);
             continue;
         }
         if (n < 0 && errno == EINTR) continue;
@@ -7912,6 +9620,9 @@ static void agent_worker_note_terminal_mode_may_have_changed(agent_worker *w) {
 
 static void agent_bash_finalize(agent_bash_job *job, int status) {
     agent_bash_drain(job);
+    if (job && job->bytes > 0 && job->last_byte != '\n' &&
+        job->worker && job->worker->cfg && job->worker->cfg->command_output)
+        agent_publish(job->worker, "\n", 1);
     if (job->pipe_fd >= 0) {
         close(job->pipe_fd);
         job->pipe_fd = -1;
@@ -8005,50 +9716,32 @@ static bool agent_read_docker_version(const char *docker_command,
         return false;
     version[0] = '\0';
 
-    int pipefd[2];
-    if (pipe(pipefd) != 0) return false;
-
-    pid_t pid = fork();
-    if (pid < 0) {
-        close(pipefd[0]);
-        close(pipefd[1]);
+    agent_config tmp_cfg = {0};
+    tmp_cfg.docker_command = docker_command;
+    const char *const argv[] = {"version", "--format", "{{.Client.Version}}", NULL};
+    agent_buf out = {0};
+    int status = 0;
+    if (!agent_docker_exec(NULL, &tmp_cfg, argv, NULL, 0, true,
+                           "docker version", &out, &status))
+        return false;
+    if (!out.ptr || !out.ptr[0]) {
+        free(out.ptr);
         return false;
     }
-    if (pid == 0) {
-        int devnull = open("/dev/null", O_RDWR);
-        close(pipefd[0]);
-        dup2(pipefd[1], STDOUT_FILENO);
-        if (devnull >= 0) {
-            dup2(devnull, STDERR_FILENO);
-            close(devnull);
-        }
-        close(pipefd[1]);
-        if (strchr(docker_command, '/')) {
-            execl(docker_command, docker_command, "version", "--format",
-                  "{{.Client.Version}}", (char *)NULL);
-        } else {
-            execlp(docker_command, docker_command, "version", "--format",
-                   "{{.Client.Version}}", (char *)NULL);
-        }
-        _exit(127);
-    }
+    size_t copy = out.len;
+    if (copy >= version_len) copy = version_len - 1;
+    memcpy(version, out.ptr, copy);
+    version[copy] = '\0';
+    free(out.ptr);
 
-    close(pipefd[1]);
-    ssize_t nread = read(pipefd[0], version, version_len - 1);
-    close(pipefd[0]);
-    if (nread < 0) nread = 0;
-    version[nread] = '\0';
+    /* Strip trailing whitespace (including newlines, carriage returns, etc.) */
+    size_t nread = strlen(version);
     while (nread > 0 &&
            (version[nread - 1] == '\n' || version[nread - 1] == '\r' ||
             version[nread - 1] == ' ' || version[nread - 1] == '\t')) {
         version[--nread] = '\0';
     }
-
-    int status = 0;
-    while (waitpid(pid, &status, 0) < 0) {
-        if (errno != EINTR) return false;
-    }
-    return nread > 0 && WIFEXITED(status) && WEXITSTATUS(status) == 0;
+    return nread > 0;
 }
 
 static void agent_bash_prepare_env(const char *working_dir,
@@ -8090,7 +9783,7 @@ static bool agent_tool_requires_docker_sandbox(const agent_worker *w,
                                                const char *tool_name) {
     if (!w || !w->cfg || !w->cfg->strict_sandbox) return false;
     if (tool_name &&
-        (!strcmp(tool_name, "web_search") || !strcmp(tool_name, "web_fetch")))
+        (!strcmp(tool_name, "web_browse") || !strcmp(tool_name, "web_fetch")))
         return false;
     return true;
 }
@@ -8102,7 +9795,13 @@ static char *agent_tool_sandbox_required_error(void) {
 static void agent_buf_append_shell_quoted(agent_buf *b, const char *s) {
     bool needs_quote = !s || !s[0];
     for (const unsigned char *p = (const unsigned char *)(s ? s : ""); *p; p++) {
-        if (isspace(*p) || *p == '\'' || *p == '"' || *p == '\\') {
+        if (isspace(*p) || *p == '\'' || *p == '"' || *p == '\\' ||
+            *p == '$' || *p == ';' || *p == '&' || *p == '|' ||
+            *p == '>' || *p == '<' || *p == '`' || *p == '(' ||
+            *p == ')' || *p == '{' || *p == '}' || *p == '[' ||
+            *p == ']' || *p == '~' || *p == '*' || *p == '?' ||
+            *p == '!' || *p == '#' || *p == '=' || *p == '%' ||
+            *p == '^' || *p == '@') {
             needs_quote = true;
             break;
         }
@@ -8126,86 +9825,6 @@ static char *agent_docker_debug_command_text(char *const argv[]) {
         agent_buf_append_shell_quoted(&b, argv[i]);
     }
     return agent_buf_take(&b);
-}
-
-static void agent_docker_debug_print_cfg(const agent_config *cfg,
-                                         char *const argv[]) {
-    if (!cfg || !cfg->docker_debug) return;
-    char *cmd = agent_docker_debug_command_text(argv);
-    if (cmd) {
-        bool color = isatty(STDOUT_FILENO) != 0;
-        if (color) printf("\x1b[96m[docker debug] %s\x1b[0m\n\n", cmd);
-        else printf("[docker debug] %s\n\n", cmd);
-        free(cmd);
-    }
-}
-
-static void agent_docker_debug_publish_worker(agent_worker *w,
-                                              char *const argv[]) {
-    if (!w || !w->cfg || !w->cfg->docker_debug) return;
-    char *cmd = agent_docker_debug_command_text(argv);
-    if (cmd) {
-        const char *prefix = "\x1b[96m[docker debug] ";
-        const char *suffix = "\x1b[0m\n\n";
-        agent_publish(w, prefix, strlen(prefix));
-        agent_publish(w, cmd, strlen(cmd));
-        agent_publish(w, suffix, strlen(suffix));
-        free(cmd);
-    }
-}
-
-static void agent_docker_exec_add_env(char **argv, int *argc,
-                                      char *buf, size_t len,
-                                      const char *key, const char *value);
-static void agent_docker_exec_add_standard_env(char **argv, int *argc,
-                                               char *home_env, size_t home_len,
-                                               char *tmpdir_env, size_t tmpdir_len,
-                                               char *tmp_env, size_t tmp_len,
-                                               char *temp_env, size_t temp_len,
-                                               char *xdg_config_env, size_t xdg_config_len,
-                                               char *xdg_cache_env, size_t xdg_cache_len,
-                                               const char *working_dir,
-                                               const char *temp_dir);
-
-static void agent_docker_debug_publish_bash(agent_worker *w,
-                                            const char *working_dir,
-                                            const char *cmd) {
-    if (!w || !w->cfg || !w->cfg->docker_debug) return;
-    const char *docker_command =
-        (w->cfg->docker_command && w->cfg->docker_command[0]) ?
-        w->cfg->docker_command : "docker";
-    const char *temp_dir =
-        (w->cfg->temp_directory[0]) ? w->cfg->temp_directory : working_dir;
-    char env_home[PATH_MAX + 16];
-    char env_tmpdir[PATH_MAX + 16];
-    char env_tmp[PATH_MAX + 16];
-    char env_temp[PATH_MAX + 16];
-    char env_xdg_config[PATH_MAX + 32];
-    char env_xdg_cache[PATH_MAX + 32];
-    char *argv[40];
-    int argc = 0;
-
-    argv[argc++] = (char *)docker_command;
-    argv[argc++] = "exec";
-    argv[argc++] = "-i";
-    if (working_dir && working_dir[0]) {
-        argv[argc++] = "-w";
-        argv[argc++] = (char *)working_dir;
-    }
-    agent_docker_exec_add_standard_env(argv, &argc,
-                                       env_home, sizeof(env_home),
-                                       env_tmpdir, sizeof(env_tmpdir),
-                                       env_tmp, sizeof(env_tmp),
-                                       env_temp, sizeof(env_temp),
-                                       env_xdg_config, sizeof(env_xdg_config),
-                                       env_xdg_cache, sizeof(env_xdg_cache),
-                                       working_dir, temp_dir);
-    argv[argc++] = (char *)w->cfg->docker_container;
-    argv[argc++] = "/bin/sh";
-    argv[argc++] = "-c";
-    argv[argc++] = (char *)(cmd ? cmd : "");
-    argv[argc] = NULL;
-    agent_docker_debug_publish_worker(w, argv);
 }
 
 static void agent_exec_command(const char *command, char *const argv[]) {
@@ -8256,62 +9875,106 @@ static void agent_docker_exec_add_standard_env(char **argv, int *argc,
     argv[(*argc)++] = "-e"; argv[(*argc)++] = "GIT_CONFIG_GLOBAL=/dev/null";
 }
 
-static bool agent_docker_exec_capture(agent_worker *w,
-                                      const char *working_dir,
-                                      char *const cmd_argv[],
-                                      const char *stdin_data,
-                                      size_t stdin_len,
-                                      bool unbounded_output,
-                                      const char *op,
-                                      agent_buf *out,
-                                      int *exit_status) {
+static void agent_docker_build_shell_argv(char **argv, int *argc,
+                                          const char *docker_command,
+                                          const char *container,
+                                          const char *working_dir,
+                                          const char *temp_dir,
+                                          const char *cmd,
+                                          char *home_env, size_t home_len,
+                                          char *tmpdir_env, size_t tmpdir_len,
+                                          char *tmp_env, size_t tmp_len,
+                                          char *temp_env, size_t temp_len,
+                                          char *xdg_config_env, size_t xdg_config_len,
+                                          char *xdg_cache_env, size_t xdg_cache_len) {
+    *argc = 0;
+    argv[(*argc)++] = (char *)docker_command;
+    argv[(*argc)++] = "exec";
+    argv[(*argc)++] = "-i";
+    if (working_dir && working_dir[0]) {
+        argv[(*argc)++] = "-w";
+        argv[(*argc)++] = (char *)working_dir;
+    }
+    agent_docker_exec_add_standard_env(argv, argc,
+                                       home_env, home_len,
+                                       tmpdir_env, tmpdir_len,
+                                       tmp_env, tmp_len,
+                                       temp_env, temp_len,
+                                       xdg_config_env, xdg_config_len,
+                                       xdg_cache_env, xdg_cache_len,
+                                       working_dir, temp_dir);
+    argv[(*argc)++] = (char *)container;
+    argv[(*argc)++] = "/bin/sh";
+    argv[(*argc)++] = "-c";
+    argv[(*argc)++] = (char *)(cmd ? cmd : "");
+    argv[*argc] = NULL;
+}
+
+/* Central host-side Docker CLI runner.  This function replaces duplicated
+ * fork/exec/capture code and is also the lower-level primitive used by one-shot
+ * docker exec operations.
+ *
+ * argv_tail starts with the Docker subcommand, e.g. {"ps", "-a", NULL}.
+ * The helper resolves cfg->docker_command or falls back to "docker".
+ * stdin_data == NULL connects stdin to /dev/null.
+ * stdin_data != NULL writes exactly stdin_len bytes, including zero bytes
+ *   for empty-file writes.
+ * out == NULL inherits stdout/stderr; otherwise stdout and stderr are captured.
+ * Uses a poll loop when stdin is supplied so writing stdin and reading output
+ * cannot deadlock.
+ * exit_status receives the raw wait status when available.
+ * Debug output is printed to stdout when w == NULL and published through
+ *   agent_publish when w != NULL. */
+static bool agent_docker_exec(agent_worker *w,
+                               const agent_config *cfg,
+                               const char *const argv_tail[],
+                               const char *stdin_data,
+                               size_t stdin_len,
+                               bool unbounded_output,
+                               const char *op,
+                               agent_buf *out,
+                               int *exit_status) {
     if (out) memset(out, 0, sizeof(*out));
     if (exit_status) *exit_status = -1;
-    if (!w || !w->cfg || !agent_bash_use_docker_sandbox(w) ||
-        !cmd_argv || !cmd_argv[0])
-        return false;
+    if (!cfg || !argv_tail || !argv_tail[0]) return false;
 
     const char *docker_command =
-        (w->cfg->docker_command && w->cfg->docker_command[0]) ?
-        w->cfg->docker_command : "docker";
-    const char *temp_dir = w->cfg->temp_directory[0] ?
-        w->cfg->temp_directory : NULL;
-    int cmd_argc = 0;
-    while (cmd_argv[cmd_argc]) cmd_argc++;
+        (cfg->docker_command && cfg->docker_command[0]) ?
+        cfg->docker_command : "docker";
+    int tail_argc = 0;
+    while (argv_tail[tail_argc]) tail_argc++;
 
-    char home_env[PATH_MAX + 16];
-    char tmpdir_env[PATH_MAX + 16];
-    char tmp_env[PATH_MAX + 16];
-    char temp_env[PATH_MAX + 16];
-    char xdg_config_env[PATH_MAX + 32];
-    char xdg_cache_env[PATH_MAX + 32];
     char *argv[48];
     int argc = 0;
     argv[argc++] = (char *)docker_command;
-    argv[argc++] = "exec";
-    argv[argc++] = "-i";
-    if (working_dir && working_dir[0]) {
-        argv[argc++] = "-w";
-        argv[argc++] = (char *)working_dir;
-    }
-    agent_docker_exec_add_standard_env(argv, &argc,
-                                       home_env, sizeof(home_env),
-                                       tmpdir_env, sizeof(tmpdir_env),
-                                       tmp_env, sizeof(tmp_env),
-                                       temp_env, sizeof(temp_env),
-                                       xdg_config_env, sizeof(xdg_config_env),
-                                       xdg_cache_env, sizeof(xdg_cache_env),
-                                       working_dir, temp_dir);
-    argv[argc++] = (char *)w->cfg->docker_container;
-    for (int i = 0; i < cmd_argc; i++)
-        argv[argc++] = cmd_argv[i];
+    for (int i = 0; i < tail_argc; i++)
+        argv[argc++] = (char *)argv_tail[i];
     argv[argc] = NULL;
+
+    if (w && w->cfg && w->cfg->docker_debug) {
+        char *cmd = agent_docker_debug_command_text(argv);
+        if (cmd) {
+            const char *prefix = "\x1b[96m[docker debug] ";
+            const char *suffix = "\x1b[0m\n\n";
+            agent_publish(w, prefix, strlen(prefix));
+            agent_publish(w, cmd, strlen(cmd));
+            agent_publish(w, suffix, strlen(suffix));
+            free(cmd);
+        }
+    } else if (cfg && cfg->docker_debug) {
+        char *cmd = agent_docker_debug_command_text(argv);
+        if (cmd) {
+            bool color = isatty(STDOUT_FILENO) != 0;
+            if (color) printf("\x1b[96m[docker debug] %s\x1b[0m\n\n", cmd);
+            else printf("[docker debug] %s\n\n", cmd);
+            fflush(stdout);
+            free(cmd);
+        }
+    }
 
     int stdin_pipe[2] = {-1, -1};
     if (stdin_data && pipe(stdin_pipe) != 0) {
-        if (out) {
-            agent_buf_puts(out, "failed to create stdin pipe");
-        }
+        if (out) agent_buf_puts(out, "failed to create stdin pipe");
         return false;
     }
     int stdout_pipe[2];
@@ -8324,7 +9987,6 @@ static bool agent_docker_exec_capture(agent_worker *w,
         return false;
     }
 
-    agent_docker_debug_publish_worker(w, argv);
     pid_t pid = fork();
     if (pid < 0) {
         if (stdin_pipe[0] >= 0) {
@@ -8367,6 +10029,7 @@ static bool agent_docker_exec_capture(agent_worker *w,
         set_nonblock(stdin_pipe[1], true, NULL);
     }
     close(stdout_pipe[1]);
+    set_nonblock(stdout_pipe[0], true, NULL);
     if (out) memset(out, 0, sizeof(*out));
     char chunk[4096];
     bool stdout_open = true;
@@ -8461,12 +10124,10 @@ static bool agent_docker_read_file_bytes(agent_worker *w, const char *path,
                  "docker read failed, path is empty");
         return false;
     }
-    const char *working_dir = agent_primary_working_directory(w);
     char *argv[] = {"cat", (char *)(path), NULL};
     agent_buf out = {0};
-    int status = 0;
-    bool ok = agent_docker_exec_capture(w, working_dir, argv, NULL, 0, true,
-                                        "docker read", &out, &status);
+    bool ok = agent_docker_shell_exec_argv(w, argv, true,
+                                           "docker read", &out, NULL);
     if (!ok) {
         snprintf(err, err_len, "%s",
                  out.ptr && out.ptr[0] ? out.ptr : "docker read failed");
@@ -8483,6 +10144,8 @@ static bool agent_docker_write_file_bytes(agent_worker *w, const char *path,
                                           const char *data, size_t len,
                                           char *err, size_t err_len) {
     const char *working_dir = agent_primary_working_directory(w);
+    const char *temp_dir = (w && w->cfg && w->cfg->temp_directory[0]) ?
+        w->cfg->temp_directory : NULL;
     char parent[PATH_MAX];
     if (!path || !path[0]) {
         snprintf(err, err_len, "missing path");
@@ -8493,9 +10156,8 @@ static bool agent_docker_write_file_bytes(agent_worker *w, const char *path,
 
     char *dir_argv[] = {"test", "-d", parent, NULL};
     agent_buf out = {0};
-    int status = 0;
-    bool ok = agent_docker_exec_capture(w, working_dir, dir_argv, NULL, 0, false,
-                                        "docker write", &out, &status);
+    bool ok = agent_docker_shell_exec_argv(w, dir_argv, false,
+                                           "docker write", &out, NULL);
     free(out.ptr);
     out.ptr = NULL;
     out.len = 0;
@@ -8505,10 +10167,38 @@ static bool agent_docker_write_file_bytes(agent_worker *w, const char *path,
         return false;
     }
 
-    char *write_argv[] = {"/bin/sh", "-c", "cat > \"$1\"", "sh",
-                          (char *)(path ? path : ""), NULL};
-    ok = agent_docker_exec_capture(w, working_dir, write_argv, data, len, false,
-                                   "docker write", &out, &status);
+    char home_env[PATH_MAX + 16];
+    char tmpdir_env[PATH_MAX + 16];
+    char tmp_env[PATH_MAX + 16];
+    char temp_env[PATH_MAX + 16];
+    char xdg_config_env[PATH_MAX + 32];
+    char xdg_cache_env[PATH_MAX + 32];
+    char *tail[48];
+    int argc = 0;
+    tail[argc++] = "exec";
+    tail[argc++] = "-i";
+    if (working_dir && working_dir[0]) {
+        tail[argc++] = "-w";
+        tail[argc++] = (char *)working_dir;
+    }
+    agent_docker_exec_add_standard_env(tail, &argc,
+                                       home_env, sizeof(home_env),
+                                       tmpdir_env, sizeof(tmpdir_env),
+                                       tmp_env, sizeof(tmp_env),
+                                       temp_env, sizeof(temp_env),
+                                       xdg_config_env, sizeof(xdg_config_env),
+                                       xdg_cache_env, sizeof(xdg_cache_env),
+                                       working_dir, temp_dir);
+    tail[argc++] = (char *)w->cfg->docker_container;
+    tail[argc++] = "/bin/sh";
+    tail[argc++] = "-c";
+    tail[argc++] = "cat > \"$1\"";
+    tail[argc++] = "sh";
+    tail[argc++] = (char *)path;
+    tail[argc] = NULL;
+    ok = agent_docker_exec(w, w->cfg, (const char *const *)tail,
+                           data ? data : "", len, false,
+                           "docker write", &out, NULL);
     if (!ok) {
         snprintf(err, err_len, "%s",
                  out.ptr && out.ptr[0] ? out.ptr : "docker write failed");
@@ -8527,43 +10217,43 @@ static void agent_bash_exec_local(const char *cmd, const char *working_dir,
     _exit(127);
 }
 
+/* The persistent Docker shell (agent_docker_shell) is started at worker init
+ * and used for filesystem tool execution (read, write, list, search, edit).
+ * The bash tool uses a separate direct docker exec via fork/exec. */
+
 static void agent_bash_exec_docker(agent_worker *w, const char *cmd,
                                    const char *working_dir) {
+    if (!w || !w->cfg || !agent_bash_use_docker_sandbox(w)) {
+        dprintf(STDERR_FILENO, "docker sandbox is not active\n");
+        _exit(127);
+    }
+
     const char *docker_command =
         (w->cfg->docker_command && w->cfg->docker_command[0]) ?
         w->cfg->docker_command : "docker";
-    const char *temp_dir =
-        (w->cfg->temp_directory[0]) ? w->cfg->temp_directory : working_dir;
-    char env_home[PATH_MAX + 16];
-    char env_tmpdir[PATH_MAX + 16];
-    char env_tmp[PATH_MAX + 16];
-    char env_temp[PATH_MAX + 16];
-    char env_xdg_config[PATH_MAX + 32];
-    char env_xdg_cache[PATH_MAX + 32];
-    char *argv[40];
+    const char *temp_dir = w->cfg->temp_directory[0] ?
+        w->cfg->temp_directory : NULL;
+    char home_env[PATH_MAX + 16];
+    char tmpdir_env[PATH_MAX + 16];
+    char tmp_env[PATH_MAX + 16];
+    char temp_env[PATH_MAX + 16];
+    char xdg_config_env[PATH_MAX + 32];
+    char xdg_cache_env[PATH_MAX + 32];
+    char *argv[48];
     int argc = 0;
-
-    argv[argc++] = (char *)docker_command;
-    argv[argc++] = "exec";
-    argv[argc++] = "-i";
-    if (working_dir && working_dir[0]) {
-        argv[argc++] = "-w";
-        argv[argc++] = (char *)working_dir;
-    }
-    agent_docker_exec_add_standard_env(argv, &argc,
-                                       env_home, sizeof(env_home),
-                                       env_tmpdir, sizeof(env_tmpdir),
-                                       env_tmp, sizeof(env_tmp),
-                                       env_temp, sizeof(env_temp),
-                                       env_xdg_config, sizeof(env_xdg_config),
-                                       env_xdg_cache, sizeof(env_xdg_cache),
-                                       working_dir, temp_dir);
-    argv[argc++] = (char *)w->cfg->docker_container;
-    argv[argc++] = "/bin/sh";
-    argv[argc++] = "-c";
-    argv[argc++] = (char *)(cmd ? cmd : "");
-    argv[argc] = NULL;
+    agent_docker_build_shell_argv(argv, &argc, docker_command,
+                                  w->cfg->docker_container,
+                                  working_dir, temp_dir, cmd,
+                                  home_env, sizeof(home_env),
+                                  tmpdir_env, sizeof(tmpdir_env),
+                                  tmp_env, sizeof(tmp_env),
+                                  temp_env, sizeof(temp_env),
+                                  xdg_config_env, sizeof(xdg_config_env),
+                                  xdg_cache_env, sizeof(xdg_cache_env));
+    (void)argc;
     agent_exec_command(docker_command, argv);
+    dprintf(STDERR_FILENO, "docker bash failed to exec docker: %s\n",
+            strerror(errno));
     _exit(127);
 }
 
@@ -8582,7 +10272,40 @@ static agent_bash_job *agent_bash_start_mode(agent_worker *w, const char *cmd,
     }
 
     const char *working_dir = agent_primary_working_directory(w);
-    if (use_docker) agent_docker_debug_publish_bash(w, working_dir, cmd);
+    if (use_docker && w && w->cfg && w->cfg->docker_debug) {
+        const char *docker_command =
+            (w->cfg->docker_command && w->cfg->docker_command[0]) ?
+            w->cfg->docker_command : "docker";
+        const char *temp_dir = w->cfg->temp_directory[0] ?
+            w->cfg->temp_directory : NULL;
+        char home_env[PATH_MAX + 16];
+        char tmpdir_env[PATH_MAX + 16];
+        char tmp_env[PATH_MAX + 16];
+        char temp_env[PATH_MAX + 16];
+        char xdg_config_env[PATH_MAX + 32];
+        char xdg_cache_env[PATH_MAX + 32];
+        char *argv[48];
+        int argc = 0;
+        agent_docker_build_shell_argv(argv, &argc, docker_command,
+                                      w->cfg->docker_container,
+                                      working_dir, temp_dir, cmd,
+                                      home_env, sizeof(home_env),
+                                      tmpdir_env, sizeof(tmpdir_env),
+                                      tmp_env, sizeof(tmp_env),
+                                      temp_env, sizeof(temp_env),
+                                      xdg_config_env, sizeof(xdg_config_env),
+                                      xdg_cache_env, sizeof(xdg_cache_env));
+        (void)argc;
+        char *cmd_text = agent_docker_debug_command_text(argv);
+        if (cmd_text) {
+            const char *prefix = "\x1b[96m[docker debug] ";
+            const char *suffix = "\x1b[0m\n\n";
+            agent_publish(w, prefix, strlen(prefix));
+            agent_publish(w, cmd_text, strlen(cmd_text));
+            agent_publish(w, suffix, strlen(suffix));
+            free(cmd_text);
+        }
+    }
 
     int pipefd[2];
     if (pipe(pipefd) != 0) {
@@ -8821,6 +10544,7 @@ static char *agent_bash_observation(agent_bash_job *job, bool mark_observed) {
 }
 
 static void agent_bash_publish_observation(agent_worker *w, const char *obs) {
+    if (w && w->cfg && !w->cfg->command_output) return;
     if (!obs || !obs[0]) return;
     const char *body = NULL;
     const char *label = strstr(obs, "\n<head ");
@@ -8834,14 +10558,6 @@ static void agent_bash_publish_observation(agent_worker *w, const char *obs) {
     if (label) {
         const char *tag_end = strstr(label, ">\n");
         if (tag_end) {
-            agent_publish(w, "\x1b[90m", 5);
-            if (strstr(label, "\n<head ") == label)
-                agent_publish(w, "[showing first output lines]\n",
-                              strlen("[showing first output lines]\n"));
-            else
-                agent_publish(w, "[showing last output lines]\n",
-                              strlen("[showing last output lines]\n"));
-            agent_publish(w, "\x1b[0m", 4);
             body = tag_end + 2;
         }
     } else {
@@ -8876,13 +10592,10 @@ static void agent_bash_publish_observation(agent_worker *w, const char *obs) {
         }
         return;
     }
-    if (n) {
-        bool failed = strstr(obs, "status=done") && !strstr(obs, "exit_status=0\n");
-        if (failed) agent_publish(w, "\x1b[38;5;208m", 11);
-        agent_publish(w, body, n);
-        if (body[n - 1] != '\n') agent_publish(w, "\n", 1);
-        if (failed) agent_publish(w, "\x1b[0m", 4);
-    }
+    /* Publish the output body with grey highlighting when command_output is on. */
+    agent_publish(w, "\x1b[90m", 5);
+    agent_publish(w, body, n);
+    agent_publish(w, "\x1b[0m", 4);
 }
 
 static void agent_bash_refresh_for(agent_worker *w, agent_bash_job *job,
@@ -8954,7 +10667,7 @@ static char *agent_execute_tool_call(agent_worker *w, const agent_tool_call *cal
     if (!strcmp(call->name, "list")) return agent_tool_list(w, call);
     if (!strcmp(call->name, "edit")) return agent_tool_edit(w, call);
     if (!strcmp(call->name, "search")) return agent_tool_search(w, call);
-    if (!strcmp(call->name, "web_search")) return agent_tool_web_search(w, call);
+    if (!strcmp(call->name, "web_browse")) return agent_tool_web_browse(w, call);
     if (!strcmp(call->name, "web_fetch")) return agent_tool_web_fetch(w, call);
 
     if (!strcmp(call->name, "bash")) {
@@ -11444,6 +13157,8 @@ static void runtime_help(void) {
     puts("               Require an active Docker sandbox before any tool runs.");
     puts("  /no_strict_sandbox");
     puts("               Allow tools to run without an active Docker sandbox.");
+    puts("  /command_output on|off");
+    puts("               Show or hide command output mirrored in the terminal.");
     puts("  /preserve_agent_files");
     puts("               Preserve agent output files after reading them.");
     puts("  /no_preserve_agent_files");
@@ -11506,68 +13221,15 @@ static void editor_write_welcome_banner(agent_editor *editor,
 static bool agent_docker_capture(const agent_config *cfg,
                                  const char *docker_command, char *const argv[],
                                  const char *op, agent_buf *out) {
-    int pipefd[2];
-    if (pipe(pipefd) != 0) {
-        printf("%s failed: pipe: %s\n", op, strerror(errno));
-        return false;
-    }
-    agent_docker_debug_print_cfg(cfg, argv);
-
-    pid_t pid = fork();
-    if (pid < 0) {
-        close(pipefd[0]);
-        close(pipefd[1]);
-        printf("%s failed: fork: %s\n", op, strerror(errno));
-        return false;
-    }
-    if (pid == 0) {
-        close(pipefd[0]);
-        dup2(pipefd[1], STDOUT_FILENO);
-        dup2(pipefd[1], STDERR_FILENO);
-        close(pipefd[1]);
-        if (strchr(docker_command, '/')) execv(docker_command, argv);
-        else execvp(docker_command, argv);
-        dprintf(STDERR_FILENO, "failed to exec docker: %s\n", strerror(errno));
-        _exit(127);
-    }
-
-    close(pipefd[1]);
-    memset(out, 0, sizeof(*out));
-    char chunk[4096];
-    for (;;) {
-        ssize_t n = read(pipefd[0], chunk, sizeof(chunk));
-        if (n > 0) {
-            agent_buf_append(out, chunk, (size_t)n);
-            continue;
-        }
-        if (n == 0) break;
-        if (errno == EINTR) continue;
-        close(pipefd[0]);
-        while (waitpid(pid, NULL, 0) < 0 && errno == EINTR) {}
-        printf("%s failed: read: %s\n", op, strerror(errno));
-        free(out->ptr);
-        memset(out, 0, sizeof(*out));
-        return false;
-    }
-    close(pipefd[0]);
-
-    int status = 0;
-    while (waitpid(pid, &status, 0) < 0) {
-        if (errno != EINTR) {
-            printf("%s failed: waitpid: %s\n", op, strerror(errno));
-            free(out->ptr);
-            memset(out, 0, sizeof(*out));
-            return false;
-        }
-    }
-    if (!WIFEXITED(status) || WEXITSTATUS(status) != 0) {
-        printf("%s failed:\n%s", op, out->ptr ? out->ptr : "");
-        if (!out->len || out->ptr[out->len - 1] != '\n') printf("\n");
-        free(out->ptr);
-        memset(out, 0, sizeof(*out));
-        return false;
-    }
-    return true;
+    /* Thin wrapper: convert full argv (which includes docker_command at [0])
+     * into an argv_tail and delegate to agent_docker_exec.
+     * Build a temporary config that preserves the caller's docker_command. */
+    if (!cfg || !docker_command || !argv || !argv[0] || !op || !out) return false;
+    agent_config tmp_cfg = *cfg;
+    tmp_cfg.docker_command = docker_command;
+    /* argv_tail starts at argv[1] (skip docker_command which exec prepends) */
+    const char *const *argv_tail = (const char *const *)(argv + 1);
+    return agent_docker_exec(NULL, &tmp_cfg, argv_tail, NULL, 0, false, op, out, NULL);
 }
 
 static bool agent_docker_inspect_sandbox(const agent_config *cfg,
@@ -11586,20 +13248,27 @@ static bool agent_docker_inspect_sandbox(const agent_config *cfg,
     return agent_docker_capture(cfg, docker_command, argv, "docker inspect", out);
 }
 
-static bool agent_docker_inspect_sandbox_sync(const agent_config *cfg,
-                                              const char *docker_command,
-                                              const char *name,
-                                              agent_buf *out) {
-    char *argv[] = {
-        (char *)docker_command,
-        "inspect",
-        "--type", "container",
-        "--format",
-        "{{.Name}}\t{{.Config.Image}}\t{{.State.Status}}\t{{.Path}}\t{{json .Args}}",
-        (char *)(name ? name : ""),
-        NULL,
-    };
-    return agent_docker_capture(cfg, docker_command, argv, "docker inspect", out);
+static bool agent_docker_inspect_sandboxes_sync(const agent_config *cfg,
+                                                const char *docker_command,
+                                                char **names,
+                                                int name_count,
+                                                agent_buf *out) {
+    if (!names || name_count <= 0) return false;
+    int argc = 0;
+    int argv_cap = 7 + name_count;
+    char **argv = xmalloc((size_t)argv_cap * sizeof(char *));
+    argv[argc++] = (char *)docker_command;
+    argv[argc++] = "inspect";
+    argv[argc++] = "--type";
+    argv[argc++] = "container";
+    argv[argc++] = "--format";
+    argv[argc++] =
+        "{{.Name}}\t{{.Config.Image}}\t{{.State.Status}}\t{{.Path}}\t{{json .Args}}";
+    for (int i = 0; i < name_count; i++) argv[argc++] = names[i];
+    argv[argc] = NULL;
+    bool ok = agent_docker_capture(cfg, docker_command, argv, "docker inspect", out);
+    free(argv);
+    return ok;
 }
 
 static bool agent_docker_list_sandbox_names(const agent_config *cfg,
@@ -11750,6 +13419,28 @@ static bool agent_json_parse_string_array(const char *json,
     return true;
 }
 
+static void agent_docker_mount_fingerprint(agent_worker *w,
+                                           char *out, size_t out_len) {
+    if (!out || !out_len) return;
+    out[0] = '\0';
+    if (!w || !w->cfg) return;
+    agent_buf b = {0};
+    agent_buf_puts(&b, "cmd=");
+    agent_buf_puts(&b, w->cfg->docker_command && w->cfg->docker_command[0] ?
+                   w->cfg->docker_command : "docker");
+    agent_buf_puts(&b, "\ncontainer=");
+    agent_buf_puts(&b, w->cfg->docker_container ? w->cfg->docker_container : "");
+    agent_buf_puts(&b, "\ntemp=");
+    agent_buf_puts(&b, w->cfg->temp_directory);
+    agent_buf_puts(&b, "\nworkspaces=");
+    for (int i = 0; i < w->working_directories.len; i++) {
+        if (i) agent_buf_puts(&b, "\n");
+        agent_buf_puts(&b, w->working_directories.v[i]);
+    }
+    snprintf(out, out_len, "%s", b.ptr ? b.ptr : "");
+    free(b.ptr);
+}
+
 static bool agent_docker_refresh_mounts(agent_worker *w,
                                         char *err, size_t err_len) {
     if (!w || !w->cfg) return true;
@@ -11758,6 +13449,10 @@ static bool agent_docker_refresh_mounts(agent_worker *w,
     const char *docker_command =
         (w->cfg->docker_command && w->cfg->docker_command[0]) ?
         w->cfg->docker_command : "docker";
+    char fingerprint[sizeof(w->docker_mount_fingerprint)];
+    agent_docker_mount_fingerprint(w, fingerprint, sizeof(fingerprint));
+    if (fingerprint[0] && !strcmp(w->docker_mount_fingerprint, fingerprint))
+        return true;
 
     agent_buf names = {0};
     if (!agent_docker_list_sandbox_names(w->cfg, docker_command, &names)) {
@@ -11766,54 +13461,85 @@ static bool agent_docker_refresh_mounts(agent_worker *w,
     }
     if (!names.len) {
         free(names.ptr);
+        snprintf(w->docker_mount_fingerprint,
+                 sizeof(w->docker_mount_fingerprint), "%s", fingerprint);
         return true;
     }
 
-    int refreshed = 0;
+    char **name_v = NULL;
+    int name_count = 0;
+    int name_cap = 0;
     char *save = NULL;
     for (char *line = strtok_r(names.ptr, "\n", &save);
          line;
          line = strtok_r(NULL, "\n", &save)) {
-        agent_buf inspect = {0};
-        if (!agent_docker_inspect_sandbox_sync(w->cfg, docker_command, line, &inspect)) {
-            snprintf(err, err_len, "unable to inspect docker sandbox: %s", line);
-            free(names.ptr);
-            return false;
+        if (!line[0]) continue;
+        if (name_count == name_cap) {
+            name_cap = name_cap ? name_cap * 2 : 8;
+            name_v = xrealloc(name_v, (size_t)name_cap * sizeof(name_v[0]));
         }
+        name_v[name_count++] = line;
+    }
+    if (!name_count) {
+        free(name_v);
+        free(names.ptr);
+        snprintf(w->docker_mount_fingerprint,
+                 sizeof(w->docker_mount_fingerprint), "%s", fingerprint);
+        return true;
+    }
 
-        char *row = inspect.ptr ? inspect.ptr : "";
+    agent_buf inspect = {0};
+    if (!agent_docker_inspect_sandboxes_sync(w->cfg, docker_command, name_v,
+                                             name_count, &inspect)) {
+        snprintf(err, err_len, "unable to inspect docker sandboxes");
+        free(inspect.ptr);
+        free(name_v);
+        free(names.ptr);
+        return false;
+    }
+
+    int refreshed = 0;
+    char *inspect_save = NULL;
+    char *inspect_text = inspect.ptr ? inspect.ptr : "";
+    for (char *row = strtok_r(inspect_text, "\n", &inspect_save);
+         row;
+         row = strtok_r(NULL, "\n", &inspect_save)) {
         char *newline = strchr(row, '\n');
         if (newline) *newline = '\0';
         char *name = row;
         if (name[0] == '/') name++;
         char *image = strchr(row, '\t');
         if (!image) {
-            snprintf(err, err_len, "malformed docker inspect output for %s", line);
+            snprintf(err, err_len, "malformed docker inspect output");
             free(inspect.ptr);
+            free(name_v);
             free(names.ptr);
             return false;
         }
         *image++ = '\0';
         char *state = strchr(image, '\t');
         if (!state) {
-            snprintf(err, err_len, "malformed docker inspect output for %s", line);
+            snprintf(err, err_len, "malformed docker inspect output for %s", name);
             free(inspect.ptr);
+            free(name_v);
             free(names.ptr);
             return false;
         }
         *state++ = '\0';
         char *path = strchr(state, '\t');
         if (!path) {
-            snprintf(err, err_len, "malformed docker inspect output for %s", line);
+            snprintf(err, err_len, "malformed docker inspect output for %s", name);
             free(inspect.ptr);
+            free(name_v);
             free(names.ptr);
             return false;
         }
         *path++ = '\0';
         char *args_json = strchr(path, '\t');
         if (!args_json) {
-            snprintf(err, err_len, "malformed docker inspect output for %s", line);
+            snprintf(err, err_len, "malformed docker inspect output for %s", name);
             free(inspect.ptr);
+            free(name_v);
             free(names.ptr);
             return false;
         }
@@ -11824,6 +13550,7 @@ static bool agent_docker_refresh_mounts(agent_worker *w,
         if (!agent_json_parse_string_array(args_json, &args, &arg_count)) {
             snprintf(err, err_len, "unable to parse docker args for %s", name);
             free(inspect.ptr);
+            free(name_v);
             free(names.ptr);
             return false;
         }
@@ -11848,6 +13575,7 @@ static bool agent_docker_refresh_mounts(agent_worker *w,
                 free(mount_args);
                 agent_string_array_free(args, arg_count);
                 free(inspect.ptr);
+                free(name_v);
                 free(names.ptr);
                 return false;
             }
@@ -11863,6 +13591,7 @@ static bool agent_docker_refresh_mounts(agent_worker *w,
             free(mount_args);
             agent_string_array_free(args, arg_count);
             free(inspect.ptr);
+            free(name_v);
             free(names.ptr);
             return false;
         }
@@ -11908,10 +13637,11 @@ static bool agent_docker_refresh_mounts(agent_worker *w,
         free(mount_args);
         free(argv);
         agent_string_array_free(args, arg_count);
-        free(inspect.ptr);
         if (!ok) {
             snprintf(err, err_len, "unable to recreate docker sandbox: %s", name);
             free(create_out.ptr);
+            free(inspect.ptr);
+            free(name_v);
             free(names.ptr);
             return false;
         }
@@ -11919,7 +13649,11 @@ static bool agent_docker_refresh_mounts(agent_worker *w,
         refreshed++;
     }
 
+    free(inspect.ptr);
+    free(name_v);
     free(names.ptr);
+    snprintf(w->docker_mount_fingerprint,
+             sizeof(w->docker_mount_fingerprint), "%s", fingerprint);
     if (refreshed > 0)
         printf("updated docker sandbox mounts for %d container%s\n",
                refreshed, refreshed == 1 ? "" : "s");
@@ -12088,82 +13822,36 @@ static void agent_command_docker_create(agent_worker *w, char *args) {
     argv[argc++] = "-lc";
     argv[argc++] = (char *)command;
     argv[argc] = NULL;
-    agent_docker_debug_print_cfg(w->cfg, argv);
-
-    int pipefd[2];
-    if (pipe(pipefd) != 0) {
-        printf("docker create failed: pipe: %s\n", strerror(errno));
-        for (int i = 0; i < mount_args_len; i++) free(mount_args[i]);
-        free(mount_args);
-        free(argv);
-        return;
-    }
-
-    pid_t pid = fork();
-    if (pid < 0) {
-        close(pipefd[0]);
-        close(pipefd[1]);
-        printf("docker create failed: fork: %s\n", strerror(errno));
-        for (int i = 0; i < mount_args_len; i++) free(mount_args[i]);
-        free(mount_args);
-        free(argv);
-        return;
-    }
-    if (pid == 0) {
-        close(pipefd[0]);
-        dup2(pipefd[1], STDOUT_FILENO);
-        dup2(pipefd[1], STDERR_FILENO);
-        close(pipefd[1]);
-        if (strchr(docker_command, '/')) execv(docker_command, argv);
-        else execvp(docker_command, argv);
-        dprintf(STDERR_FILENO, "failed to exec docker: %s\n", strerror(errno));
-        _exit(127);
-    }
-
-    close(pipefd[1]);
-    agent_buf out = {0};
-    char chunk[4096];
-    for (;;) {
-        ssize_t n = read(pipefd[0], chunk, sizeof(chunk));
-        if (n > 0) {
-            agent_buf_append(&out, chunk, (size_t)n);
-            continue;
+    if (w->cfg && w->cfg->docker_debug) {
+        char *cmd = agent_docker_debug_command_text(argv);
+        if (cmd) {
+            bool color = isatty(STDOUT_FILENO) != 0;
+            if (color) printf("\x1b[96m[docker debug] %s\x1b[0m\n\n", cmd);
+            else printf("[docker debug] %s\n\n", cmd);
+            fflush(stdout);
+            free(cmd);
         }
-        if (n == 0) break;
-        if (errno == EINTR) continue;
-        close(pipefd[0]);
-        while (waitpid(pid, NULL, 0) < 0 && errno == EINTR) {}
-        printf("docker create failed: read: %s\n", strerror(errno));
+    }
+
+    /* Build argv_tail starting at "run" (skip docker_command at argv[0]) */
+    const char *const *argv_tail = (const char *const *)(argv + 1);
+
+    agent_buf out = {0};
+    bool ok = agent_docker_exec(w, w->cfg, argv_tail, NULL, 0, false,
+                                "docker create", &out, NULL);
+    if (!ok) {
+        printf("docker create failed:\n%s", out.ptr ? out.ptr : "");
+        if (!out.len || (out.ptr && out.ptr[out.len - 1] != '\n')) printf("\n");
         free(out.ptr);
         for (int i = 0; i < mount_args_len; i++) free(mount_args[i]);
         free(mount_args);
         free(argv);
         return;
-    }
-    close(pipefd[0]);
-
-    int status = 0;
-    while (waitpid(pid, &status, 0) < 0) {
-        if (errno != EINTR) {
-            printf("docker create failed: waitpid: %s\n", strerror(errno));
-            free(out.ptr);
-            for (int i = 0; i < mount_args_len; i++) free(mount_args[i]);
-            free(mount_args);
-            free(argv);
-            return;
-        }
     }
 
     for (int i = 0; i < mount_args_len; i++) free(mount_args[i]);
     free(mount_args);
     free(argv);
-
-    if (!WIFEXITED(status) || WEXITSTATUS(status) != 0) {
-        printf("docker create failed:\n%s", out.ptr ? out.ptr : "");
-        if (!out.len || out.ptr[out.len - 1] != '\n') printf("\n");
-        free(out.ptr);
-        return;
-    }
 
     w->cfg->docker_container = xstrdup(name);
     w->cfg->docker_image = xstrdup(image);
@@ -12173,7 +13861,15 @@ static void agent_command_docker_create(agent_worker *w, char *args) {
         if (out.ptr[out.len - 1] != '\n') printf("\n");
     }
     free(out.ptr);
+
+    /* Clear stale shell state and start a persistent shell */
+    agent_docker_shell_stop(w);
+    if (!agent_docker_shell_start(w)) {
+        printf("warning: failed to start persistent shell for sandbox %s\n",
+               name);
+    }
 }
+
 
 static void agent_command_docker_use(agent_worker *w, char *args) {
     if (!w || !w->cfg) {
@@ -12313,11 +14009,20 @@ static void agent_command_docker_use(agent_worker *w, char *args) {
         *ip++ = '\0';
     }
 
+    /* Stop the old shell before switching to a new container */
+    agent_docker_shell_stop(w);
+
     w->cfg->docker_container = xstrdup(name);
     w->cfg->docker_image = xstrdup(image);
     printf("docker sandbox switched to %s (%s, ip=%s)\n",
            container_name, state[0] ? state : "unknown", ip[0] ? ip : "-");
     free(out.ptr);
+
+    /* Try to start a persistent shell in the new container */
+    if (!agent_docker_shell_start(w)) {
+        printf("warning: failed to start persistent shell for sandbox %s\n",
+               container_name);
+    }
 }
 
 static void agent_command_docker_describe(agent_worker *w, char *args) {
@@ -12463,18 +14168,23 @@ static void agent_command_docker_stop(agent_worker *w, char *args) {
                w->cfg->docker_container ? w->cfg->docker_container : "(unknown)");
     }
 
-    int argv_cap = 3 + target_count + 1;
-    char **argv = xmalloc((size_t)argv_cap * sizeof(char *));
-    int argc = 0;
-    argv[argc++] = (char *)docker_command;
-    argv[argc++] = "stop";
+    /* Stop the persistent shell before stopping the container */
+    if (stopping_current) {
+        agent_docker_shell_stop(w);
+    }
+
+    /* Build docker stop argv_tail for agent_docker_exec: {"stop", name..., NULL} */
+    int tail_cap = 2 + target_count + 1;
+    const char **tail = xmalloc((size_t)tail_cap * sizeof(char *));
+    int tail_idx = 0;
+    tail[tail_idx++] = "stop";
     for (int i = 0; i < target_count; i++)
-        argv[argc++] = targets[i];
-    argv[argc] = NULL;
+        tail[tail_idx++] = targets[i];
+    tail[tail_idx] = NULL;
 
     agent_buf out = {0};
-    bool ok = agent_docker_capture(w->cfg, docker_command, argv, "docker stop", &out);
-    free(argv);
+    bool ok = agent_docker_exec(w, w->cfg, tail, NULL, 0, false, "docker stop", &out, NULL);
+    free(tail);
     if (!ok) {
         free(names.ptr);
         return;
@@ -12637,6 +14347,9 @@ static int agent_worker_init(agent_worker *w, ds4_engine *engine, agent_config *
     w->wake_fd[1] = -1;
     pthread_mutex_init(&w->mu, NULL);
     pthread_cond_init(&w->cond, NULL);
+    w->docker_shell.stdin_fd = -1;
+    w->docker_shell.stdout_fd = -1;
+    pthread_mutex_init(&w->docker_shell.mu, NULL);
     w->status.state = AGENT_WORKER_IDLE;
     for (int i = 0; i < cfg->working_directories.len; i++)
         agent_path_list_append(&w->working_directories, cfg->working_directories.v[i]);
@@ -12676,6 +14389,13 @@ static int agent_worker_init(agent_worker *w, ds4_engine *engine, agent_config *
             return -1;
         }
     }
+    /* Start persistent Docker shell if a container is already selected. */
+    if (agent_bash_use_docker_sandbox(w)) {
+        if (!agent_docker_shell_start(w)) {
+            fprintf(stderr, "ds4-agent: warning: failed to start persistent "
+                    "Docker shell; bash/file ops will use one-shot exec\n");
+        }
+    }
     if (pthread_create(&w->thread, NULL, worker_main, w) != 0) return -1;
     return 0;
 }
@@ -12686,6 +14406,7 @@ static void agent_worker_free(agent_worker *w) {
     worker_stop(w);
     if (w->thread) pthread_join(w->thread, NULL);
     agent_bash_jobs_free(w);
+    agent_docker_shell_stop(w);
     ds4_web_free(w->web);
     ds4_session_free(w->session);
     ds4_tokens_free(&w->transcript);
@@ -12695,6 +14416,9 @@ static void agent_worker_free(agent_worker *w) {
     free(w->legacy_session_path_to_delete);
     free(w->queued_user_drain_text);
     agent_path_list_free(&w->working_directories);
+    /* Clean up auto-allowed temp files (web_fetch output, bash output, etc.). */
+    for (int i = 0; i < w->auto_allowed_paths.len; i++)
+        unlink(w->auto_allowed_paths.v[i]);
     agent_path_list_free(&w->auto_allowed_paths);
     if (w->wake_fd[0] >= 0) close(w->wake_fd[0]);
     if (w->wake_fd[1] >= 0) close(w->wake_fd[1]);
@@ -12703,6 +14427,7 @@ static void agent_worker_free(agent_worker *w) {
     free(w->out);
     pthread_cond_destroy(&w->cond);
     pthread_mutex_destroy(&w->mu);
+    pthread_mutex_destroy(&w->docker_shell.mu);
 }
 
 typedef enum {
@@ -13357,6 +15082,19 @@ static int run_agent(ds4_engine *engine, agent_config *cfg) {
                 } else if (!strcmp(cmd, "/no_strict_sandbox")) {
                     worker.cfg->strict_sandbox = false;
                     printf("strict sandbox disabled\n");
+                } else if (!strncmp(cmd, "/command_output", 15) &&
+                           (cmd[15] == '\0' || cmd[15] == ' ' || cmd[15] == '\t')) {
+                    char *arg = cmd + 15;
+                    while (*arg == ' ' || *arg == '\t') arg++;
+                    if (!strcmp(arg, "on")) {
+                        worker.cfg->command_output = true;
+                        printf("command output enabled\n");
+                    } else if (!strcmp(arg, "off")) {
+                        worker.cfg->command_output = false;
+                        printf("command output disabled\n");
+                    } else {
+                        printf("usage: /command_output on|off\n");
+                    }
                 } else if (!strcmp(cmd, "/preserve_agent_files")) {
                     worker.cfg->preserve_agent_files = true;
                     printf("agent output files will be preserved\n");
