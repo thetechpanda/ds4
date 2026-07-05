@@ -3,12 +3,14 @@
 #include "ds4_help.h"
 #include "ds4_kvstore.h"
 #include "ds4_web.h"
+#include "ds4_agent_internal.h"
 #include "linenoise.h"
 
 #include <errno.h>
 #include <ctype.h>
 #include <dirent.h>
 #include <fnmatch.h>
+#include <inttypes.h>
 #include <fcntl.h>
 #include <limits.h>
 #include <math.h>
@@ -34,8 +36,6 @@
  * after Enter is pressed while the model is still busy. */
 int linenoiseEditInsert(struct linenoiseState *l, const char *c, size_t clen);
 
-typedef struct agent_worker agent_worker;
-
 static int set_nonblock(int fd, bool on, int *old_flags);
 static bool agent_parse_bool_default(const char *s, bool def);
 static bool agent_executable_exists(const char *path);
@@ -51,158 +51,6 @@ static bool agent_bash_use_docker_sandbox(const agent_worker *w);
  * These types define the shared state and the small streaming state machines
  * used to render sampled assistant text and DSML tool calls as they arrive.
  */
-
-typedef struct {
-    const char *prompt;
-    const char *system;
-    const char *trace_path;
-    int n_predict;
-    int ctx_size;
-    float temperature;
-    float top_p;
-    float min_p;
-    uint64_t seed;
-    ds4_think_mode think_mode;
-} agent_generation_options;
-
-typedef struct {
-    char **v;
-    int len;
-    int cap;
-} agent_path_list;
-
-typedef struct {
-    ds4_engine_options engine;
-    agent_generation_options gen;
-    const char *chdir_path;
-    const char *docker_build;
-    const char *docker_command;
-    const char *docker_container;
-    const char *docker_image;
-    bool docker_available;
-    bool docker_debug;
-    char launch_working_directory[PATH_MAX];
-    agent_path_list working_directory_args;
-    agent_path_list working_directories;
-    char temp_directory[PATH_MAX];
-    char web_cdp_host[256];
-    int web_cdp_port;
-    const char *recover_session;
-    bool non_interactive;
-    bool strict_sandbox;
-    bool docker_auto;
-    bool command_output;
-    bool docker_allow_one_shot;
-    volatile bool preserve_agent_files;
-} agent_config;
-
-typedef enum {
-    AGENT_WORKER_IDLE,
-    AGENT_WORKER_PREFILL,
-    AGENT_WORKER_GENERATING,
-    AGENT_WORKER_COMPACTING,
-    AGENT_WORKER_DRAINING,
-    AGENT_WORKER_SAVING,
-    AGENT_WORKER_ERROR,
-    AGENT_WORKER_STOPPED,
-} agent_worker_state;
-
-typedef struct {
-    agent_worker_state state;
-    int prefill_done;
-    int prefill_total;
-    unsigned prefill_label;
-    double prefill_tps;
-    int generated;
-    double gen_tps;
-    bool greedy_sampling;
-    ds4_think_mode think_mode;
-    int ctx_used;
-    int ctx_size;
-    int power_percent;
-    char error[256];
-    char workspace[PATH_MAX];
-    char docker_container[256];
-    char writable_workspace_paths[2048];
-    char writable_temp_paths[1024];
-    char writable_auto_paths[2048];
-} agent_status;
-
-typedef struct agent_bash_job agent_bash_job;
-
-typedef struct {
-    int stdin_fd;
-    int stdout_fd;
-    pid_t pid;
-    unsigned long long seq;
-    pthread_mutex_t mu;
-    bool active;
-} agent_docker_shell;
-
-struct agent_worker {
-    ds4_engine *engine;
-    agent_config *cfg;
-    ds4_session *session;
-    ds4_tokens transcript;
-    char *cache_dir;
-    char *sysprompt_path;
-    char session_sha[41];
-    char *session_title;
-    uint64_t session_created_at;
-    char *legacy_session_path_to_delete;
-    bool user_activity;
-    bool session_dirty;
-    pthread_t thread;
-    pthread_mutex_t mu;
-    pthread_cond_t cond;
-    int wake_fd[2];
-    FILE *trace;
-    bool wake_pending;
-    bool stop;
-    bool interrupt;
-    bool initialized;
-    bool save_requested;
-    bool compact_requested;
-    bool power_requested;
-    int requested_power;
-    int progress_base;
-    double progress_started_at;
-    int last_system_prompt_reminder_at;
-    char *cmd_text;
-    agent_status status;
-    char *out;
-    size_t out_len;
-    size_t out_cap;
-    ds4_web *web;
-    bool web_approval_pending;
-    bool web_approval_answered;
-    bool web_approval_result;
-    char web_approval_message[256];
-    char web_approval_error[160];
-    bool path_approval_pending;
-    bool path_approval_answered;
-    bool path_approval_result;
-    char path_approval_message[PATH_MAX + 256];
-    char path_approval_options[3][PATH_MAX];
-    int path_approval_option_count;
-    char path_approval_choice[PATH_MAX];
-    char path_approval_error[160];
-    bool queued_user_drain_pending;
-    bool queued_user_drain_answered;
-    char *queued_user_drain_text;
-    bool datetime_context_injected;
-    char more_path[PATH_MAX];
-    int more_next_line;
-    bool more_bare;
-    bool more_valid;
-    char docker_mount_fingerprint[4096];
-    agent_bash_job *bash_jobs;
-    int next_bash_job_id;
-    agent_path_list working_directories;
-    agent_path_list auto_allowed_paths;
-    bool raw_mode_needs_restore;
-    agent_docker_shell docker_shell;
-};
 
 static unsigned agent_next_prefill_label(void);
 static const agent_path_list *agent_working_directories(const agent_worker *w);
@@ -391,6 +239,17 @@ static bool agent_preflight_edit_old(agent_worker *w, const agent_tool_call *cal
 static int agent_worker_sync_tokens(agent_worker *w, const ds4_tokens *tokens,
                                     bool publish_progress,
                                     char *err, size_t err_len);
+static int agent_worker_session_sync(agent_worker *w,
+                                     const ds4_tokens *tokens,
+                                     agent_worker_state resume_state,
+                                     char *err,
+                                     size_t err_len);
+static int agent_worker_session_eval(agent_worker *w,
+                                     int token,
+                                     agent_worker_state resume_state,
+                                     char *err,
+                                     size_t err_len);
+static int agent_worker_session_set_power(agent_worker *w, int power);
 
 /* ============================================================================
  * Small Utilities And Command-Line Parsing
@@ -402,7 +261,7 @@ static void agent_sigint_handler(int sig) {
     agent_sigint = 1;
 }
 
-static void *xmalloc(size_t n) {
+void *xmalloc(size_t n) {
     void *p = malloc(n ? n : 1);
     if (!p) {
         perror("ds4-agent: malloc");
@@ -411,7 +270,7 @@ static void *xmalloc(size_t n) {
     return p;
 }
 
-static char *xstrdup(const char *s) {
+char *xstrdup(const char *s) {
     if (!s) s = "";
     size_t n = strlen(s);
     char *p = xmalloc(n + 1);
@@ -419,14 +278,14 @@ static char *xstrdup(const char *s) {
     return p;
 }
 
-static char *xstrndup(const char *s, size_t n) {
+char *xstrndup(const char *s, size_t n) {
     char *p = xmalloc(n + 1);
     memcpy(p, s, n);
     p[n] = '\0';
     return p;
 }
 
-static void *xrealloc(void *ptr, size_t n) {
+void *xrealloc(void *ptr, size_t n) {
     void *p = realloc(ptr, n ? n : 1);
     if (!p) {
         perror("ds4-agent: realloc");
@@ -435,7 +294,7 @@ static void *xrealloc(void *ptr, size_t n) {
     return p;
 }
 
-static void agent_path_list_append(agent_path_list *list, const char *path) {
+void agent_path_list_append(agent_path_list *list, const char *path) {
     if (list->len == list->cap) {
         list->cap = list->cap ? list->cap * 2 : 4;
         list->v = xrealloc(list->v, (size_t)list->cap * sizeof(list->v[0]));
@@ -481,7 +340,7 @@ static bool agent_path_list_remove(agent_path_list *list, const char *path,
     return removed;
 }
 
-static void agent_path_list_free(agent_path_list *list) {
+void agent_path_list_free(agent_path_list *list) {
     if (!list) return;
     for (int i = 0; i < list->len; i++) free(list->v[i]);
     free(list->v);
@@ -549,7 +408,7 @@ static bool parse_power_percent(const char *arg, int *out) {
     return true;
 }
 
-static bool agent_slash_command_with_args(const char *cmd, const char *name) {
+bool agent_slash_command_with_args(const char *cmd, const char *name) {
     size_t len = strlen(name);
     return !strncmp(cmd, name, len) &&
            (cmd[len] == '\0' || isspace((unsigned char)cmd[len]));
@@ -583,6 +442,7 @@ static bool agent_slash_command_known(const char *cmd) {
            agent_slash_command_with_args(cmd, "/strip") ||
            agent_slash_command_with_args(cmd, "/history") ||
            agent_slash_command_with_args(cmd, "/workspace") ||
+           agent_slash_command_with_args(cmd, "/subagent") ||
            !strcmp(cmd, "/purge_auto_files");
 }
 
@@ -1517,7 +1377,6 @@ static void agent_publish_command_output_chunk(agent_worker *w,
     agent_publish(w, "\x1b[0m", 4);
 }
 
-static bool worker_is_idle(agent_worker *w);
 
 static void agent_set_status(agent_worker *w, agent_worker_state state) {
     pthread_mutex_lock(&w->mu);
@@ -3948,13 +3807,6 @@ static bool worker_cancel_session_cb(void *ud) {
     return worker_should_interrupt(ud);
 }
 
-typedef struct {
-    char *ptr;
-    size_t len;
-    size_t cap;
-    bool truncated;
-} agent_buf;
-
 static void agent_buf_append(agent_buf *b, const char *s, size_t n) {
     if (!n || b->truncated) return;
     const size_t max = 128 * 1024;
@@ -3974,7 +3826,7 @@ static void agent_buf_append(agent_buf *b, const char *s, size_t n) {
     b->ptr[b->len] = '\0';
 }
 
-static void agent_buf_append_full(agent_buf *b, const char *s, size_t n) {
+void agent_buf_append_full(agent_buf *b, const char *s, size_t n) {
     if (!n || b->truncated) return;
     if (b->len + n + 1 > b->cap) {
         size_t cap = b->cap ? b->cap * 2 : 4096;
@@ -3987,11 +3839,11 @@ static void agent_buf_append_full(agent_buf *b, const char *s, size_t n) {
     b->ptr[b->len] = '\0';
 }
 
-static void agent_buf_puts(agent_buf *b, const char *s) {
+void agent_buf_puts(agent_buf *b, const char *s) {
     agent_buf_append(b, s, strlen(s));
 }
 
-static char *agent_buf_take(agent_buf *b) {
+char *agent_buf_take(agent_buf *b) {
     if (!b->ptr) return xstrdup("");
     char *p = b->ptr;
     memset(b, 0, sizeof(*b));
@@ -4503,8 +4355,8 @@ static bool agent_web_cancel(void *privdata) {
     return worker_should_interrupt(privdata);
 }
 
-static bool worker_take_web_approval_request(agent_worker *w,
-                                             char *message, size_t message_len) {
+bool worker_take_web_approval_request(agent_worker *w,
+                                      char *message, size_t message_len) {
     pthread_mutex_lock(&w->mu);
     bool pending = w->web_approval_pending;
     if (pending) {
@@ -4515,8 +4367,8 @@ static bool worker_take_web_approval_request(agent_worker *w,
     return pending;
 }
 
-static void worker_answer_web_approval(agent_worker *w, bool allow,
-                                       const char *deny_error) {
+void worker_answer_web_approval(agent_worker *w, bool allow,
+                                const char *deny_error) {
     pthread_mutex_lock(&w->mu);
     w->web_approval_result = allow;
     w->web_approval_answered = true;
@@ -4529,10 +4381,10 @@ static void worker_answer_web_approval(agent_worker *w, bool allow,
     pthread_mutex_unlock(&w->mu);
 }
 
-static bool worker_take_path_approval_request(agent_worker *w,
-                                              char *message, size_t message_len,
-                                              char options[3][PATH_MAX],
-                                              int *option_count) {
+bool worker_take_path_approval_request(agent_worker *w,
+                                       char *message, size_t message_len,
+                                       char options[3][PATH_MAX],
+                                       int *option_count) {
     pthread_mutex_lock(&w->mu);
     bool pending = w->path_approval_pending;
     if (pending) {
@@ -4548,9 +4400,9 @@ static bool worker_take_path_approval_request(agent_worker *w,
     return pending;
 }
 
-static void worker_answer_path_approval(agent_worker *w, bool allow,
-                                        const char *choice,
-                                        const char *deny_error) {
+void worker_answer_path_approval(agent_worker *w, bool allow,
+                                 const char *choice,
+                                 const char *deny_error) {
     pthread_mutex_lock(&w->mu);
     w->path_approval_result = allow;
     w->path_approval_answered = true;
@@ -4588,7 +4440,7 @@ static char *worker_request_queued_user_drain(agent_worker *w) {
     return text;
 }
 
-static bool worker_take_queued_user_drain_request(agent_worker *w) {
+bool worker_take_queued_user_drain_request(agent_worker *w) {
     pthread_mutex_lock(&w->mu);
     bool pending = w->queued_user_drain_pending;
     if (pending) w->queued_user_drain_pending = false;
@@ -4596,7 +4448,7 @@ static bool worker_take_queued_user_drain_request(agent_worker *w) {
     return pending;
 }
 
-static void worker_answer_queued_user_drain(agent_worker *w, char *text) {
+void worker_answer_queued_user_drain(agent_worker *w, char *text) {
     pthread_mutex_lock(&w->mu);
     free(w->queued_user_drain_text);
     w->queued_user_drain_text = text;
@@ -4604,6 +4456,56 @@ static void worker_answer_queued_user_drain(agent_worker *w, char *text) {
     pthread_cond_signal(&w->cond);
     agent_wake_locked(w);
     pthread_mutex_unlock(&w->mu);
+}
+
+static void agent_worker_model_gate_lock(agent_worker *w,
+                                         agent_worker_state resume_state) {
+    if (!w || !w->model_gate) return;
+    pthread_mutex_lock(&w->mu);
+    w->status.state = AGENT_WORKER_WAITING_MODEL;
+    agent_wake_locked(w);
+    pthread_mutex_unlock(&w->mu);
+
+    pthread_mutex_lock(w->model_gate);
+
+    pthread_mutex_lock(&w->mu);
+    if (w->status.state == AGENT_WORKER_WAITING_MODEL)
+        w->status.state = resume_state;
+    agent_wake_locked(w);
+    pthread_mutex_unlock(&w->mu);
+}
+
+static void agent_worker_model_gate_unlock(agent_worker *w) {
+    if (w && w->model_gate) pthread_mutex_unlock(w->model_gate);
+}
+
+static int agent_worker_session_sync(agent_worker *w,
+                                     const ds4_tokens *tokens,
+                                     agent_worker_state resume_state,
+                                     char *err,
+                                     size_t err_len) {
+    agent_worker_model_gate_lock(w, resume_state);
+    int rc = ds4_session_sync(w->session, tokens, err, err_len);
+    agent_worker_model_gate_unlock(w);
+    return rc;
+}
+
+static int agent_worker_session_eval(agent_worker *w,
+                                     int token,
+                                     agent_worker_state resume_state,
+                                     char *err,
+                                     size_t err_len) {
+    agent_worker_model_gate_lock(w, resume_state);
+    int rc = ds4_session_eval(w->session, token, err, err_len);
+    agent_worker_model_gate_unlock(w);
+    return rc;
+}
+
+static int agent_worker_session_set_power(agent_worker *w, int power) {
+    agent_worker_model_gate_lock(w, AGENT_WORKER_IDLE);
+    int rc = ds4_session_set_power(w->session, power);
+    agent_worker_model_gate_unlock(w);
+    return rc;
 }
 
 /* Synchronize the live DS4 session to a transcript.  This is the agent's main
@@ -4642,7 +4544,8 @@ static int agent_worker_sync_tokens(agent_worker *w, const ds4_tokens *tokens,
                                      publish_progress ? worker_progress_cb : NULL,
                                      publish_progress ? w : NULL);
     ds4_session_set_cancel(w->session, worker_cancel_session_cb, w);
-    int rc = ds4_session_sync(w->session, tokens, err, err_len);
+    int rc = agent_worker_session_sync(w, tokens, AGENT_WORKER_PREFILL,
+                                       err, err_len);
     ds4_session_set_cancel(w->session, NULL, NULL);
     ds4_session_set_progress(w->session, NULL, NULL);
     ds4_session_set_display_progress(w->session, NULL, NULL);
@@ -4793,7 +4696,7 @@ static bool agent_worker_has_user_session(agent_worker *w) {
     return yes;
 }
 
-static bool agent_worker_needs_save(agent_worker *w) {
+bool agent_worker_needs_save(agent_worker *w) {
     pthread_mutex_lock(&w->mu);
     bool yes = w->user_activity && w->session_dirty;
     pthread_mutex_unlock(&w->mu);
@@ -4859,7 +4762,7 @@ static bool agent_worker_save_session_now(agent_worker *w, char sha_out[41],
     return ok;
 }
 
-static bool agent_worker_save_session(agent_worker *w, char *err, size_t err_len) {
+bool agent_worker_save_session(agent_worker *w, char *err, size_t err_len) {
     if (!worker_is_idle(w)) {
         snprintf(err, err_len, "model is busy");
         return false;
@@ -7778,29 +7681,28 @@ static void agent_docker_shell_stop(agent_worker *w) {
 }
 
 #ifdef DS4_AGENT_TEST
-static int agent_test_failures;
+int agent_test_failures;
 
 static bool agent_worker_remove_workspace(agent_worker *w, const char *path,
                                           char *removed, size_t removed_len,
                                           char *err, size_t err_len);
 static void worker_set_think_mode(agent_worker *w, ds4_think_mode mode);
 static ds4_think_mode worker_cycle_think_mode(agent_worker *w);
-static void worker_get_status(agent_worker *w, agent_status *status);
 static void build_status_text(const agent_status *st, char *buf, size_t len);
+static void build_subagent_footer_suffix(const ds_agent_subagent_status *items,
+                                         size_t n, int cols, size_t status_len,
+                                         char *buf, size_t len);
 static bool linenoise_take_queued_sequence(struct linenoiseState *l,
                                            const char *seq, size_t seq_len);
 static bool linenoise_take_queued_alt_tab(struct linenoiseState *l);
 static bool linenoise_queued_alt_tab_prefix_pending(struct linenoiseState *l);
 
-static void agent_test_assert(bool cond, const char *expr,
-                              const char *file, int line) {
+void agent_test_assert(bool cond, const char *expr,
+                       const char *file, int line) {
     if (cond) return;
     fprintf(stderr, "%s:%d: assertion failed: %s\n", file, line, expr);
     agent_test_failures++;
 }
-
-#define AGENT_TEST_ASSERT(expr) \
-    agent_test_assert((expr), #expr, __FILE__, __LINE__)
 
 static void test_agent_edit_upto_tail_newline_is_not_part_of_anchor(void) {
     const char *data =
@@ -8478,6 +8380,44 @@ static void test_agent_status_footer_thinking_mode_updates(void) {
     close(w.wake_fd[0]);
     close(w.wake_fd[1]);
     pthread_mutex_destroy(&w.mu);
+}
+
+static void test_agent_status_footer_subagent_badges(void) {
+    ds_agent_subagent_status items[3];
+    memset(items, 0, sizeof(items));
+    snprintf(items[0].name, sizeof(items[0].name), "%s", "alpha");
+    items[0].queued_output_bytes = 12;
+    items[0].state = DS_AGENT_SUBAGENT_STATE_RUNNING;
+    snprintf(items[1].name, sizeof(items[1].name), "%s", "beta");
+    items[1].queued_output_bytes = 5;
+    items[1].state = DS_AGENT_SUBAGENT_STATE_WAITING_MODEL;
+    items[1].approval_blocked = true;
+    snprintf(items[2].name, sizeof(items[2].name), "%s", "gamma");
+    items[2].queued_output_bytes = 0;
+    items[2].state = DS_AGENT_SUBAGENT_STATE_ERROR;
+
+    char suffix[512];
+    build_subagent_footer_suffix(items, 3, 200, 32, suffix, sizeof(suffix));
+    AGENT_TEST_ASSERT(strstr(suffix, "[s:alpha 12 working]") != NULL);
+    AGENT_TEST_ASSERT(strstr(suffix, "[s:beta 5 approval]") != NULL);
+    AGENT_TEST_ASSERT(strstr(suffix, "gamma") == NULL);
+}
+
+static void test_agent_status_footer_subagent_badge_truncation(void) {
+    ds_agent_subagent_status items[2];
+    memset(items, 0, sizeof(items));
+    snprintf(items[0].name, sizeof(items[0].name), "%s", "alpha");
+    items[0].queued_output_bytes = 12;
+    items[0].state = DS_AGENT_SUBAGENT_STATE_RUNNING;
+    snprintf(items[1].name, sizeof(items[1].name), "%s", "beta");
+    items[1].queued_output_bytes = 3456;
+    items[1].state = DS_AGENT_SUBAGENT_STATE_WAITING_MODEL;
+
+    char suffix[512];
+    build_subagent_footer_suffix(items, 2, 60, 30, suffix, sizeof(suffix));
+    AGENT_TEST_ASSERT(strstr(suffix, "[s:alpha 12 working]") != NULL);
+    AGENT_TEST_ASSERT(strstr(suffix, "[s:beta 3456 waiting]") == NULL);
+    AGENT_TEST_ASSERT(strstr(suffix, "...") != NULL);
 }
 
 static void test_agent_alt_tab_sequence_is_consumed(void) {
@@ -9559,6 +9499,74 @@ static void test_agent_tool_list_shell_argv_quoting(void) {
     pthread_mutex_destroy(&w.docker_shell.mu);
 }
 
+static void test_agent_subagent_api_lifecycle(void) {
+    ds_agent_subagents *mgr = NULL;
+    ds_agent_subagent_options opt = {
+        .default_context_size = 4096,
+        .default_round_budget = 7,
+    };
+    AGENT_TEST_ASSERT(ds_agent_subagents_create(&mgr, NULL, &opt) == 0);
+
+    ds_agent_subagent_id alpha = {0};
+    ds_agent_subagent_create_request alpha_req = {
+        .name = "alpha",
+        .prompt = "inspect the tests",
+        .autonomy = DS_AGENT_SUBAGENT_AUTONOMY_AUTONOMOUS,
+        .round_budget = 3,
+    };
+    AGENT_TEST_ASSERT(ds_agent_subagent_create(mgr, &alpha_req, &alpha) == 0);
+    AGENT_TEST_ASSERT(alpha.value == 1);
+
+    ds_agent_subagent_id beta = {0};
+    ds_agent_subagent_create_request beta_req = {
+        .name = "beta",
+        .autonomy = DS_AGENT_SUBAGENT_AUTONOMY_TAB,
+    };
+    AGENT_TEST_ASSERT(ds_agent_subagent_create(mgr, &beta_req, &beta) == 0);
+    AGENT_TEST_ASSERT(beta.value == 2);
+
+    ds_agent_subagent_status st[4];
+    size_t n = 0;
+    AGENT_TEST_ASSERT(ds_agent_subagent_list(mgr, st, 4, &n) == 0);
+    AGENT_TEST_ASSERT(n == 2);
+    AGENT_TEST_ASSERT(!strcmp(st[0].name, "alpha"));
+    AGENT_TEST_ASSERT(st[0].active);
+    AGENT_TEST_ASSERT(st[0].autonomy == DS_AGENT_SUBAGENT_AUTONOMY_AUTONOMOUS);
+    AGENT_TEST_ASSERT(st[0].budget_limit == 3);
+
+    AGENT_TEST_ASSERT(ds_agent_subagent_switch(mgr, beta) == 0);
+    AGENT_TEST_ASSERT(ds_agent_subagent_send(mgr, beta, "queued prompt") == 0);
+    AGENT_TEST_ASSERT(ds_agent_subagent_stop(mgr, alpha) == 0);
+
+    char report[256];
+    AGENT_TEST_ASSERT(ds_agent_subagent_report(mgr, alpha,
+                                               report, sizeof(report)) == 0);
+    AGENT_TEST_ASSERT(strstr(report, "No subagent report") != NULL);
+    AGENT_TEST_ASSERT(ds_agent_subagent_import_report(mgr, alpha, beta) == 0);
+
+    ds_agent_subagent_event ev;
+    AGENT_TEST_ASSERT(ds_agent_subagent_poll_event(mgr, &ev) == 1);
+    AGENT_TEST_ASSERT(ev.type == DS_AGENT_SUBAGENT_EVENT_CREATED);
+    AGENT_TEST_ASSERT(!strcmp(ev.name, "alpha"));
+
+    AGENT_TEST_ASSERT(ds_agent_subagent_close(mgr, alpha) == 0);
+    AGENT_TEST_ASSERT(ds_agent_subagent_list(mgr, st, 4, &n) == 0);
+    AGENT_TEST_ASSERT(n == 1);
+    AGENT_TEST_ASSERT(!strcmp(st[0].name, "beta"));
+    AGENT_TEST_ASSERT(st[0].active);
+    ds_agent_subagents_destroy(mgr);
+}
+
+static void test_agent_subagent_slash_command_recognition(void) {
+    AGENT_TEST_ASSERT(agent_slash_command_known("/subagent"));
+    AGENT_TEST_ASSERT(agent_slash_command_known("/subagent new tests run"));
+    AGENT_TEST_ASSERT(agent_slash_command_known("/subagent report tests"));
+    AGENT_TEST_ASSERT(!agent_slash_command_known("/subagentry"));
+    AGENT_TEST_ASSERT(agent_slash_command_known("/save"));
+}
+
+static void test_agent_worker_model_gate_serializes(void);
+
 static void ds4_agent_unit_tests_run(void) {
     test_agent_edit_upto_tail_newline_is_not_part_of_anchor();
     test_agent_edit_upto_requires_tail_after_newline_strip();
@@ -9576,6 +9584,8 @@ static void ds4_agent_unit_tests_run(void) {
     test_agent_executable_exists();
     test_agent_command_in_path();
     test_agent_status_footer_thinking_mode_updates();
+    test_agent_status_footer_subagent_badges();
+    test_agent_status_footer_subagent_badge_truncation();
     test_agent_alt_tab_sequence_is_consumed();
     test_agent_docker_exec_rejects_invalid_input();
     test_agent_docker_exec_no_capture();
@@ -9608,6 +9618,10 @@ static void ds4_agent_unit_tests_run(void) {
     test_agent_tool_list_fails_when_shell_inactive();
     test_agent_tool_search_fails_when_shell_inactive();
     test_agent_tool_list_shell_argv_quoting();
+    test_agent_subagent_api_lifecycle();
+    test_agent_subagent_slash_command_recognition();
+    ds_agent_subagent_unit_tests_run();
+    test_agent_worker_model_gate_serializes();
 }
 #endif
 
@@ -11611,7 +11625,9 @@ static bool agent_worker_compact(agent_worker *w, const char *reason,
     ds4_session_set_progress(w->session, worker_progress_cb, w);
     ds4_session_set_display_progress(w->session, worker_progress_cb, w);
     ds4_session_set_cancel(w->session, worker_cancel_session_cb, w);
-    int sync_rc = ds4_session_sync(w->session, &prompt, err, err_len);
+    int sync_rc = agent_worker_session_sync(w, &prompt,
+                                            AGENT_WORKER_COMPACTING,
+                                            err, err_len);
     ds4_session_set_cancel(w->session, NULL, NULL);
     ds4_session_set_progress(w->session, NULL, NULL);
     ds4_session_set_display_progress(w->session, NULL, NULL);
@@ -11665,7 +11681,8 @@ static bool agent_worker_compact(agent_worker *w, const char *reason,
             agent_trace(w, "compaction summary stopped before control token id=%d", token);
             break;
         }
-        if (ds4_session_eval(w->session, token, eval_err, sizeof(eval_err)) != 0) {
+        if (agent_worker_session_eval(w, token, AGENT_WORKER_COMPACTING,
+                                      eval_err, sizeof(eval_err)) != 0) {
             snprintf(err, err_len, "%s", eval_err);
             ds4_session_invalidate(w->session);
             ds4_tokens_free(&prompt);
@@ -11763,7 +11780,8 @@ static int worker_accept_generated_token(agent_worker *w,
                                          agent_stream_renderer *stream,
                                          char *err,
                                          size_t err_len) {
-    if (ds4_session_eval(w->session, token, err, err_len) != 0)
+    if (agent_worker_session_eval(w, token, AGENT_WORKER_GENERATING,
+                                  err, err_len) != 0)
         return 1;
 
     ds4_tokens_push(&w->transcript, token);
@@ -11874,6 +11892,8 @@ static int worker_run_turn(agent_worker *w, const char *user_text) {
     pthread_mutex_lock(&w->mu);
     think_mode = effective_think_mode(cfg);
     w->interrupt = false;
+    w->model_tool_round_used = 0;
+    w->autonomy_stop_reason[0] = '\0';
     w->status.error[0] = '\0';
     agent_wake_locked(w);
     pthread_mutex_unlock(&w->mu);
@@ -11917,6 +11937,19 @@ static int worker_run_turn(agent_worker *w, const char *user_text) {
      * after a DSML stanza completes we terminate that assistant message, append
      * the tool result as a tool message, then ask the model to continue. */
     for (int tool_round = 0; ; tool_round++) {
+        pthread_mutex_lock(&w->mu);
+        w->model_tool_round_used = tool_round;
+        bool budget_exhausted = w->model_tool_round_budget > 0 &&
+            tool_round >= w->model_tool_round_budget;
+        if (budget_exhausted)
+            snprintf(w->autonomy_stop_reason, sizeof(w->autonomy_stop_reason),
+                     "budget-exhausted");
+        pthread_mutex_unlock(&w->mu);
+        if (budget_exhausted) {
+            agent_publish_system_status(w, "Subagent budget exhausted");
+            agent_set_status(w, AGENT_WORKER_IDLE);
+            return 0;
+        }
         if (tool_round > 0 &&
             !agent_worker_compact_if_needed(w, "soft limit before tool continuation",
                                             compact_err, sizeof(compact_err)))
@@ -11963,7 +11996,9 @@ static int worker_run_turn(agent_worker *w, const char *user_text) {
         ds4_session_set_progress(w->session, worker_progress_cb, w);
         ds4_session_set_display_progress(w->session, worker_progress_cb, w);
         ds4_session_set_cancel(w->session, worker_cancel_session_cb, w);
-        int sync_rc = ds4_session_sync(w->session, prompt_for_sync, err, sizeof(err));
+        int sync_rc = agent_worker_session_sync(w, prompt_for_sync,
+                                                AGENT_WORKER_PREFILL,
+                                                err, sizeof(err));
         ds4_session_set_cancel(w->session, NULL, NULL);
         ds4_session_set_progress(w->session, NULL, NULL);
         ds4_session_set_display_progress(w->session, NULL, NULL);
@@ -12083,6 +12118,10 @@ static int worker_run_turn(agent_worker *w, const char *user_text) {
             ds4_tokens_push(&w->transcript, ds4_token_eos(w->engine));
             agent_dsml_parser_free(&dsml);
             agent_publish_system_status(w, "Stopped by user");
+            pthread_mutex_lock(&w->mu);
+            snprintf(w->autonomy_stop_reason, sizeof(w->autonomy_stop_reason),
+                     "interrupted");
+            pthread_mutex_unlock(&w->mu);
             worker_clear_interrupt(w);
             agent_set_status(w, AGENT_WORKER_IDLE);
             return 0;
@@ -12109,6 +12148,11 @@ static int worker_run_turn(agent_worker *w, const char *user_text) {
 
         if (!got_tool && !malformed_tool && !early_tool_error) {
             agent_dsml_parser_free(&dsml);
+            pthread_mutex_lock(&w->mu);
+            if (!w->autonomy_stop_reason[0])
+                snprintf(w->autonomy_stop_reason,
+                         sizeof(w->autonomy_stop_reason), "done");
+            pthread_mutex_unlock(&w->mu);
             agent_set_status(w, AGENT_WORKER_IDLE);
             return 0;
         }
@@ -12265,7 +12309,7 @@ static bool worker_take_power_requested(agent_worker *w, int *power) {
 static void worker_apply_pending_power(agent_worker *w) {
     int power = 0;
     if (!worker_take_power_requested(w, &power)) return;
-    if (ds4_session_set_power(w->session, power) != 0) {
+    if (agent_worker_session_set_power(w, power) != 0) {
         agent_publishf(w, "\npower change failed\n");
         return;
     }
@@ -12398,7 +12442,7 @@ static int set_nonblock(int fd, bool on, int *old_flags) {
 
 /* Check and clear the raw_mode_needs_restore flag under the worker mutex.
  * Returns true if the UI thread should verify/reapply linenoise raw mode. */
-static bool worker_check_raw_mode_restore(agent_worker *w) {
+bool worker_check_raw_mode_restore(agent_worker *w) {
     bool needs = false;
     pthread_mutex_lock(&w->mu);
     if (w->raw_mode_needs_restore) {
@@ -12409,7 +12453,7 @@ static bool worker_check_raw_mode_restore(agent_worker *w) {
     return needs;
 }
 
-static void drain_wake_fd(int fd) {
+void drain_wake_fd(int fd) {
     char buf[128];
     for (;;) {
         ssize_t n = read(fd, buf, sizeof(buf));
@@ -12421,7 +12465,7 @@ static void drain_wake_fd(int fd) {
 
 /* Submit one user turn if the worker is idle.  Busy submissions are rejected so
  * the UI can keep the typed text editable instead of silently queueing it. */
-static bool worker_submit(agent_worker *w, const char *text) {
+bool worker_submit(agent_worker *w, const char *text) {
     pthread_mutex_lock(&w->mu);
     bool ok = w->initialized && w->status.state == AGENT_WORKER_IDLE && !w->cmd_text;
     if (ok) {
@@ -12455,6 +12499,11 @@ static void worker_update_status_config_locked(agent_worker *w) {
     w->status.ctx_size = w->cfg->gen.ctx_size;
     w->status.think_mode = w->cfg->gen.think_mode;
     w->status.power_percent = worker_status_power_locked(w);
+    w->status.session_id = w->session_slot_id;
+    snprintf(w->status.session_name, sizeof(w->status.session_name), "%s",
+             w->session_slot_name);
+    w->status.background_sessions = w->background_sessions;
+    w->status.unread_sessions = w->unread_sessions;
 }
 
 static void worker_update_status_workspace_locked(agent_worker *w) {
@@ -12504,7 +12553,7 @@ static void worker_update_status_writable_locked(agent_worker *w) {
 }
 
 /* Request interruption at the next model/tool polling point. */
-static void worker_interrupt(agent_worker *w) {
+void worker_interrupt(agent_worker *w) {
     pthread_mutex_lock(&w->mu);
     w->interrupt = true;
     if (w->cfg &&
@@ -12531,7 +12580,7 @@ static void worker_stop(agent_worker *w) {
 
 /* The UI thread consumes output in batches.  Taking ownership of w->out under
  * the mutex keeps terminal writes outside the lock while preserving order. */
-static void worker_consume(agent_worker *w, char **out, size_t *out_len, agent_status *status) {
+void worker_consume(agent_worker *w, char **out, size_t *out_len, agent_status *status) {
     pthread_mutex_lock(&w->mu);
     if (out) {
         *out = w->out;
@@ -12549,7 +12598,7 @@ static void worker_consume(agent_worker *w, char **out, size_t *out_len, agent_s
     pthread_mutex_unlock(&w->mu);
 }
 
-static void worker_get_status(agent_worker *w, agent_status *status) {
+void worker_get_status(agent_worker *w, agent_status *status) {
     pthread_mutex_lock(&w->mu);
     worker_update_status_config_locked(w);
     worker_update_status_workspace_locked(w);
@@ -12559,7 +12608,7 @@ static void worker_get_status(agent_worker *w, agent_status *status) {
     pthread_mutex_unlock(&w->mu);
 }
 
-static bool worker_is_idle(agent_worker *w) {
+bool worker_is_idle(agent_worker *w) {
     pthread_mutex_lock(&w->mu);
     bool idle = w->initialized &&
         (w->status.state == AGENT_WORKER_IDLE ||
@@ -12691,7 +12740,6 @@ static char *agent_format_user_prompt_echo(const char *text) {
  * ============================================================================
  */
 
-static void agent_format_ctx_size(int ctx_size, char *buf, size_t len);
 #define AGENT_INPUT_INITIAL_BUFLEN 4096
 #define AGENT_INPUT_MAX_BUFLEN (1024*1024)
 #define AGENT_STATUS_STYLE_START "\x1b[48;5;238;38;5;252m"
@@ -12713,8 +12761,10 @@ static void agent_progress_append(char *buf, size_t len, size_t *pos,
 }
 
 static void build_prompt_text(const agent_status *st, char *buf, size_t len) {
-    (void)st;
-    snprintf(buf, len, "#> ");
+    if (st && st->session_name[0])
+        snprintf(buf, len, "%s#%" PRIu64 "> ", st->session_name, st->session_id);
+    else
+        snprintf(buf, len, "#> ");
 }
 
 static void agent_progress_bar(int done, int total, double tps,
@@ -12787,18 +12837,30 @@ static void build_status_text(const agent_status *st, char *buf, size_t len) {
     char used[32], total_ctx[32];
     char power[32];
     char status_suffix[96];
+    char session_suffix[160];
     char sandbox[512];
     agent_format_ctx_size(st->ctx_used, used, sizeof(used));
     agent_format_ctx_size(st->ctx_size, total_ctx, sizeof(total_ctx));
     agent_power_status_suffix(st, power, sizeof(power));
     snprintf(status_suffix, sizeof(status_suffix), " | thinking: %s%s",
              agent_think_mode_footer_name(st->think_mode), power);
+    if (st->session_name[0]) {
+        snprintf(session_suffix, sizeof(session_suffix),
+                 " | session: %s#%" PRIu64,
+                 st->session_name, st->session_id);
+    } else {
+        session_suffix[0] = '\0';
+    }
     if (st->docker_container[0])
         snprintf(sandbox, sizeof(sandbox), "✅ %s | ", st->docker_container);
     else
         snprintf(sandbox, sizeof(sandbox), "🚨 no-sandbox | ");
 
     switch (st->state) {
+    case AGENT_WORKER_WAITING_MODEL:
+        snprintf(buf, len, "%sctx %s/%s | waiting for shared model%s",
+                 sandbox, used, total_ctx, status_suffix);
+        break;
     case AGENT_WORKER_PREFILL: {
         int done = st->prefill_done;
         int total = st->prefill_total > 0 ? st->prefill_total : 1;
@@ -12843,15 +12905,72 @@ static void build_status_text(const agent_status *st, char *buf, size_t len) {
                  sandbox, used, total_ctx, status_suffix);
         break;
     }
+    if (session_suffix[0]) {
+        size_t used_len = strlen(buf);
+        snprintf(buf + used_len, used_len < len ? len - used_len : 0,
+                 "%s", session_suffix);
+    }
 }
 
-typedef struct {
-    char **v;
-    size_t len;
-    size_t cap;
-} agent_prompt_queue;
+static const char *agent_subagent_footer_state(const ds_agent_subagent_status *st) {
+    if (!st) return "idle";
+    if (st->approval_blocked) return "approval";
+    switch (st->state) {
+    case DS_AGENT_SUBAGENT_STATE_RUNNING: return "working";
+    case DS_AGENT_SUBAGENT_STATE_WAITING_MODEL: return "waiting";
+    case DS_AGENT_SUBAGENT_STATE_APPROVAL_BLOCKED: return "approval";
+    case DS_AGENT_SUBAGENT_STATE_ERROR: return "error";
+    case DS_AGENT_SUBAGENT_STATE_STOPPED: return "stopped";
+    default: return "idle";
+    }
+}
 
-static void agent_prompt_queue_push(agent_prompt_queue *q, const char *text) {
+static void build_subagent_footer_suffix(const ds_agent_subagent_status *items,
+                                         size_t n, int cols, size_t status_len,
+                                         char *buf, size_t len) {
+    if (len == 0) return;
+    buf[0] = '\0';
+    if (!items || n == 0) return;
+    if (cols < 40) cols = 40;
+    if (status_len >= (size_t)cols) return;
+
+    size_t budget = (size_t)cols - status_len;
+    size_t used = 0;
+    bool added = false;
+    bool truncated = false;
+    agent_buf out = {0};
+
+    for (size_t i = 0; i < n; i++) {
+        if (items[i].queued_output_bytes == 0) continue;
+        char badge[160];
+        snprintf(badge, sizeof(badge), "[s:%s %zu %s]",
+                 items[i].name,
+                 items[i].queued_output_bytes,
+                 agent_subagent_footer_state(&items[i]));
+        const char *sep = added ? " " : " | ";
+        size_t piece_len = strlen(sep) + strlen(badge);
+        if (used + piece_len > budget) {
+            truncated = true;
+            break;
+        }
+        agent_buf_puts(&out, sep);
+        agent_buf_puts(&out, badge);
+        used += piece_len;
+        added = true;
+    }
+
+    if (truncated) {
+        const char *marker = added ? " ..." : " | ...";
+        size_t marker_len = strlen(marker);
+        if (used + marker_len <= budget)
+            agent_buf_puts(&out, marker);
+    }
+
+    snprintf(buf, len, "%s", out.ptr ? out.ptr : "");
+    free(out.ptr);
+}
+
+void agent_prompt_queue_push(agent_prompt_queue *q, const char *text) {
     if (q->len == q->cap) {
         q->cap = q->cap ? q->cap * 2 : 4;
         q->v = xrealloc(q->v, q->cap * sizeof(q->v[0]));
@@ -12859,7 +12978,7 @@ static void agent_prompt_queue_push(agent_prompt_queue *q, const char *text) {
     q->v[q->len++] = xstrdup(text ? text : "");
 }
 
-static char *agent_prompt_queue_pop(agent_prompt_queue *q) {
+char *agent_prompt_queue_pop(agent_prompt_queue *q) {
     if (!q->len) return NULL;
     char *text = q->v[0];
     memmove(q->v, q->v + 1, (q->len - 1) * sizeof(q->v[0]));
@@ -12867,7 +12986,7 @@ static char *agent_prompt_queue_pop(agent_prompt_queue *q) {
     return text;
 }
 
-static void agent_prompt_queue_push_front(agent_prompt_queue *q, char *text) {
+void agent_prompt_queue_push_front(agent_prompt_queue *q, char *text) {
     if (q->len == q->cap) {
         q->cap = q->cap ? q->cap * 2 : 4;
         q->v = xrealloc(q->v, q->cap * sizeof(q->v[0]));
@@ -12877,7 +12996,7 @@ static void agent_prompt_queue_push_front(agent_prompt_queue *q, char *text) {
     q->len++;
 }
 
-static char *agent_prompt_queue_take_all(agent_prompt_queue *q) {
+char *agent_prompt_queue_take_all(agent_prompt_queue *q) {
     if (!q->len) return NULL;
     if (q->len == 1) return agent_prompt_queue_pop(q);
 
@@ -12894,11 +13013,11 @@ static char *agent_prompt_queue_take_all(agent_prompt_queue *q) {
     return agent_buf_take(&b);
 }
 
-static const char *agent_prompt_queue_peek(const agent_prompt_queue *q) {
+const char *agent_prompt_queue_peek(const agent_prompt_queue *q) {
     return q->len ? q->v[0] : NULL;
 }
 
-static void agent_prompt_queue_free(agent_prompt_queue *q) {
+void agent_prompt_queue_free(agent_prompt_queue *q) {
     for (size_t i = 0; i < q->len; i++) free(q->v[i]);
     free(q->v);
     memset(q, 0, sizeof(*q));
@@ -13021,15 +13140,29 @@ static void build_writable_footer_suffix(const agent_status *st, int cols,
 
 /* Build the editable footer.  With queued prompts, the footer becomes multiple
  * rows: a compact queue preview first, then the normal status row. */
-static void build_footer_text(const agent_status *st, const agent_prompt_queue *queue,
-                              int cols, char *buf, size_t len) {
+static void build_footer_text(const agent_status *st, ds_agent_subagents *subagents,
+                              const agent_prompt_queue *queue, int cols,
+                              char *buf, size_t len) {
     char status[512];
+    char badges[1024];
     char writable[1024];
-    char footer[1536];
+    char footer[2560];
     bool color = stdout_is_tty();
     build_status_text(st, status, sizeof(status));
-    build_writable_footer_suffix(st, cols, strlen(status), writable, sizeof(writable));
-    snprintf(footer, sizeof(footer), "%s%s", status, writable);
+    badges[0] = '\0';
+    if (subagents) {
+        size_t n = 0;
+        if (ds_agent_subagent_list(subagents, NULL, 0, &n) == 0 && n > 0) {
+            ds_agent_subagent_status *items = xmalloc(n * sizeof(items[0]));
+            if (ds_agent_subagent_list(subagents, items, n, &n) == 0)
+                build_subagent_footer_suffix(items, n, cols, strlen(status),
+                                             badges, sizeof(badges));
+            free(items);
+        }
+    }
+    build_writable_footer_suffix(st, cols, strlen(status) + strlen(badges),
+                                 writable, sizeof(writable));
+    snprintf(footer, sizeof(footer), "%s%s%s", status, badges, writable);
     if (!queue || !queue->len) {
         snprintf(buf, len, "%s", footer);
         return;
@@ -13997,6 +14130,7 @@ static void runtime_help(void) {
     puts("  /thinking off|default|max");
     puts("               Set thinking effort level.");
     puts("  /workspace   List workspace roots; +PATH adds, -PATH removes. The first root is the active workspace.");
+    puts("  /subagent    Manage resident subagents: new, list, switch, send, stop, close, report, import.");
     puts("  /purge_auto_files");
     puts("               Delete auto-created files. Lists files, gives 5s to abort.");
     puts("  /new         Start a fresh session from the system prompt.");
@@ -14016,7 +14150,7 @@ static void runtime_docker_help(void) {
     runtime_docker_help_body();
 }
 
-static void agent_format_ctx_size(int ctx_size, char *buf, size_t len) {
+void agent_format_ctx_size(int ctx_size, char *buf, size_t len) {
     if (ctx_size >= 1000) {
         if (ctx_size % 1000 == 0) snprintf(buf, len, "%dk", ctx_size / 1000);
         else snprintf(buf, len, "%.1fk", (double)ctx_size / 1000.0);
@@ -15244,7 +15378,7 @@ malformed:
 /* Initialize the worker, cache directory, sysprompt checkpoint path, trace file,
  * and model thread.  After this returns, all DS4 session mutation happens on
  * the worker thread. */
-static int agent_worker_init(agent_worker *w, ds4_engine *engine, agent_config *cfg) {
+int agent_worker_init(agent_worker *w, ds4_engine *engine, agent_config *cfg) {
     memset(w, 0, sizeof(*w));
     w->engine = engine;
     w->cfg = cfg;
@@ -15308,7 +15442,7 @@ static int agent_worker_init(agent_worker *w, ds4_engine *engine, agent_config *
 
 /* Shut down the worker and release owned resources, including any live bash
  * process groups. */
-static void agent_worker_free(agent_worker *w) {
+void agent_worker_free(agent_worker *w) {
     worker_stop(w);
     if (w->thread) pthread_join(w->thread, NULL);
     agent_bash_jobs_free(w);
@@ -15485,7 +15619,7 @@ static bool agent_prompt_working_directory_choice(const char *prompt,
     }
 }
 
-static bool agent_prompt_yes_no(const char *prompt) {
+bool agent_prompt_yes_no(const char *prompt) {
     return agent_prompt_yes_no_ex(prompt, NULL, NULL);
 }
 
@@ -15704,12 +15838,80 @@ static int run_agent_non_interactive(ds4_engine *engine, agent_config *cfg) {
     return rc;
 }
 
+#ifdef DS4_AGENT_TEST
+static void test_agent_fake_worker_init(agent_worker *w, agent_config *cfg) {
+    memset(w, 0, sizeof(*w));
+    w->cfg = cfg;
+    w->wake_fd[0] = -1;
+    w->wake_fd[1] = -1;
+    w->docker_shell.stdin_fd = -1;
+    w->docker_shell.stdout_fd = -1;
+    pthread_mutex_init(&w->mu, NULL);
+    pthread_cond_init(&w->cond, NULL);
+    pthread_mutex_init(&w->docker_shell.mu, NULL);
+    AGENT_TEST_ASSERT(pipe(w->wake_fd) == 0);
+    w->status.state = AGENT_WORKER_IDLE;
+}
+
+typedef struct {
+    agent_worker *worker;
+    bool acquired;
+} agent_gate_test_ctx;
+
+static void *test_agent_gate_thread(void *arg) {
+    agent_gate_test_ctx *ctx = arg;
+    agent_worker_model_gate_lock(ctx->worker, AGENT_WORKER_IDLE);
+    ctx->acquired = true;
+    agent_worker_model_gate_unlock(ctx->worker);
+    return NULL;
+}
+
+static void test_agent_worker_model_gate_serializes(void) {
+    agent_config cfg = {0};
+    agent_worker w;
+    test_agent_fake_worker_init(&w, &cfg);
+    pthread_mutex_t gate;
+    pthread_mutex_init(&gate, NULL);
+    w.model_gate = &gate;
+    pthread_mutex_lock(&gate);
+
+    agent_gate_test_ctx ctx = {.worker = &w};
+    pthread_t thread;
+    AGENT_TEST_ASSERT(pthread_create(&thread, NULL,
+                                     test_agent_gate_thread, &ctx) == 0);
+    usleep(20000);
+    AGENT_TEST_ASSERT(!ctx.acquired);
+    pthread_mutex_lock(&w.mu);
+    AGENT_TEST_ASSERT(w.status.state == AGENT_WORKER_WAITING_MODEL);
+    pthread_mutex_unlock(&w.mu);
+
+    pthread_mutex_unlock(&gate);
+    pthread_join(thread, NULL);
+    AGENT_TEST_ASSERT(ctx.acquired);
+    pthread_mutex_destroy(&gate);
+    agent_worker_free(&w);
+}
+#endif
+
 /* Main UI loop.  poll() multiplexes stdin with the worker wake pipe; all
  * terminal writes go through editor_write_async() so linenoise, status footer,
  * model output, and tool output never race each other. */
 static int run_agent(ds4_engine *engine, agent_config *cfg) {
-    agent_worker worker;
-    if (agent_worker_init(&worker, engine, cfg) != 0) return 1;
+    ds_agent_subagents *subagents = NULL;
+    if (ds_agent_subagents_create_for_agent(&subagents, engine, cfg) != 0) {
+        fprintf(stderr, "ds4-agent: %s\n",
+                ds_agent_subagents_last_error(subagents));
+        ds_agent_subagents_destroy(subagents);
+        return 1;
+    }
+    agent_worker *worker_ptr = ds_agent_subagents_active_worker(subagents);
+    agent_prompt_queue *queue_ptr = ds_agent_subagents_active_queue(subagents);
+    if (!worker_ptr || !queue_ptr) {
+        ds_agent_subagents_destroy(subagents);
+        return 1;
+    }
+#define worker (*worker_ptr)
+#define queue (*queue_ptr)
 
     char hist[PATH_MAX];
     const char *home = getenv("HOME");
@@ -15725,18 +15927,18 @@ static int run_agent(ds4_engine *engine, agent_config *cfg) {
     agent_completion_worker = &worker;
     linenoiseSetCompletionCallback(agent_switch_completion_callback);
 
+    ds_agent_subagents_update_worker_metadata(subagents);
     agent_status st;
     worker_get_status(&worker, &st);
     char prompt[160];
     char statusline[4096];
     build_prompt_text(&st, prompt, sizeof(prompt));
-    build_footer_text(&st, NULL, 80, statusline, sizeof(statusline));
+    build_footer_text(&st, subagents, NULL, 80, statusline, sizeof(statusline));
 
     agent_editor editor = {0};
-    agent_prompt_queue queue = {0};
     if (editor_start(&editor, prompt, statusline, NULL) != 0) {
         fprintf(stderr, "ds4-agent: failed to start line editor\n");
-        agent_worker_free(&worker);
+        ds_agent_subagents_destroy(subagents);
         return 1;
     }
     editor_write_welcome_banner(&editor, cfg, prompt, statusline);
@@ -15750,23 +15952,36 @@ static int run_agent(ds4_engine *engine, agent_config *cfg) {
     bool force_status_redraw_after_restart = false;
     char *restore_line = NULL;
     while (running) {
+        ds_agent_subagents_update_worker_metadata(subagents);
+        worker_ptr = ds_agent_subagents_active_worker(subagents);
+        queue_ptr = ds_agent_subagents_active_queue(subagents);
+        if (!worker_ptr || !queue_ptr) break;
+        agent_completion_worker = worker_ptr;
         /* If a bash child process changed the terminal mode (e.g., from raw
          * to cooked), restore raw mode so linenoise continues to work. */
-        if (worker_check_raw_mode_restore(&worker)) {
+        if (ds_agent_subagents_check_raw_mode_restore(subagents)) {
             linenoiseRestoreRawMode();
         }
-        struct pollfd pfd[2] = {
-            {.fd = STDIN_FILENO, .events = POLLIN},
-            {.fd = worker.wake_fd[0], .events = POLLIN},
-        };
+        size_t subagent_fds = ds_agent_subagents_worker_count(subagents);
+        struct pollfd *pfd = xmalloc((1 + subagent_fds) * sizeof(pfd[0]));
+        pfd[0] = (struct pollfd){.fd = STDIN_FILENO, .events = POLLIN};
+        for (size_t i = 0; i < subagent_fds; i++) {
+            pfd[1 + i] = (struct pollfd){
+                .fd = ds_agent_subagents_worker_fd_at(subagents, i),
+                .events = POLLIN,
+            };
+        }
         bool alt_tab_prefix_waiting =
             editor_alt_tab_prefix_waiting(&editor, now_sec());
         int timeout = (!editor.paste_open && !editor.paste_start_pending &&
                        linenoiseEditQueuedInput(&editor.edit) > 0 &&
                        !alt_tab_prefix_waiting) ? 0 :
                       (alt_tab_prefix_waiting ? 10 : 100);
-        int rc = poll(pfd, 2, timeout);
-        if (rc < 0 && errno != EINTR) break;
+        int rc = poll(pfd, (nfds_t)(1 + subagent_fds), timeout);
+        if (rc < 0 && errno != EINTR) {
+            free(pfd);
+            break;
+        }
 
         if (agent_sigint) {
             agent_sigint = 0;
@@ -15791,14 +16006,22 @@ static int run_agent(ds4_engine *engine, agent_config *cfg) {
             }
         }
 
-        if (rc > 0 && (pfd[1].revents & POLLIN)) drain_wake_fd(worker.wake_fd[0]);
+        if (rc > 0)
+            ds_agent_subagents_drain_wake_fds(subagents, pfd + 1, subagent_fds);
+        free(pfd);
 
         char *out = NULL;
         size_t out_len = 0;
-        worker_consume(&worker, &out, &out_len, &st);
+        char *notifications = NULL;
+        ds_agent_subagents_drain_outputs(subagents, &out, &out_len, &st,
+                                         &notifications);
         build_prompt_text(&st, prompt, sizeof(prompt));
         int footer_cols = editor.edit.cols > 0 ? (int)editor.edit.cols : 80;
-        build_footer_text(&st, &queue, footer_cols, statusline, sizeof(statusline));
+        build_footer_text(&st, subagents, &queue, footer_cols, statusline, sizeof(statusline));
+        if (notifications && notifications[0]) {
+            editor_write_async(&editor, notifications, strlen(notifications),
+                               prompt, statusline, true);
+        }
         if (out && out_len) {
             bool force_show = st.state == AGENT_WORKER_IDLE ||
                               st.state == AGENT_WORKER_ERROR ||
@@ -15823,17 +16046,18 @@ static int run_agent(ds4_engine *engine, agent_config *cfg) {
             worker.status.error[0] = '\0';
             pthread_mutex_unlock(&worker.mu);
         }
+        free(notifications);
         free(out);
 
-        if (worker_take_queued_user_drain_request(&worker)) {
-            char *queued = agent_prompt_queue_take_all(&queue);
-            worker_answer_queued_user_drain(&worker, queued);
+        if (ds_agent_subagents_take_queued_user_drain(subagents)) {
             continue;
         }
 
         char web_approval_msg[256];
-        if (worker_take_web_approval_request(&worker, web_approval_msg,
-                                             sizeof(web_approval_msg)))
+        ds_agent_subagent_id web_approval_id = {0};
+        if (ds_agent_subagents_take_web_approval(subagents, &web_approval_id,
+                                                 web_approval_msg,
+                                                 sizeof(web_approval_msg)))
         {
             char *saved_input = NULL;
             if (editor.active && editor.edit.buf && editor.edit.len)
@@ -15848,12 +16072,15 @@ static int run_agent(ds4_engine *engine, agent_config *cfg) {
             bool allow = agent_prompt_yes_no_ex(web_approval_msg,
                                                 &approval_opts,
                                                 &approval_timed_out);
-            worker_answer_web_approval(&worker, allow,
+            ds_agent_subagents_answer_web_approval(subagents, web_approval_id,
+                allow,
                 approval_timed_out ? "Chrome browser start approval timed out" : NULL);
+            worker_ptr = ds_agent_subagents_active_worker(subagents);
+            queue_ptr = ds_agent_subagents_active_queue(subagents);
             worker_get_status(&worker, &st);
             build_prompt_text(&st, prompt, sizeof(prompt));
             int restart_cols = editor.edit.cols > 0 ? (int)editor.edit.cols : 80;
-            build_footer_text(&st, &queue, restart_cols, statusline, sizeof(statusline));
+            build_footer_text(&st, subagents, &queue, restart_cols, statusline, sizeof(statusline));
             editor_start(&editor, prompt, statusline, saved_input);
             free(saved_input);
             continue;
@@ -15862,10 +16089,12 @@ static int run_agent(ds4_engine *engine, agent_config *cfg) {
         char path_approval_msg[PATH_MAX + 256];
         char path_approval_options[3][PATH_MAX];
         int path_approval_option_count = 0;
-        if (worker_take_path_approval_request(&worker, path_approval_msg,
-                                             sizeof(path_approval_msg),
-                                             path_approval_options,
-                                             &path_approval_option_count))
+        ds_agent_subagent_id path_approval_id = {0};
+        if (ds_agent_subagents_take_path_approval(subagents, &path_approval_id,
+                                                  path_approval_msg,
+                                                  sizeof(path_approval_msg),
+                                                  path_approval_options,
+                                                  &path_approval_option_count))
         {
             char *saved_input = NULL;
             if (editor.active && editor.edit.buf && editor.edit.len)
@@ -15877,16 +16106,24 @@ static int run_agent(ds4_engine *engine, agent_config *cfg) {
             bool allow = agent_prompt_working_directory_choice(
                 path_approval_msg, path_approval_options,
                 path_approval_option_count, approved_dir, &approval_timed_out);
-            worker_answer_path_approval(&worker, allow, approved_dir,
+            ds_agent_subagents_answer_path_approval(subagents, path_approval_id,
+                allow, approved_dir,
                 approval_timed_out ? "working directory approval timed out" : NULL);
+            worker_ptr = ds_agent_subagents_active_worker(subagents);
+            queue_ptr = ds_agent_subagents_active_queue(subagents);
             worker_get_status(&worker, &st);
             build_prompt_text(&st, prompt, sizeof(prompt));
             int restart_cols = editor.edit.cols > 0 ? (int)editor.edit.cols : 80;
-            build_footer_text(&st, &queue, restart_cols, statusline, sizeof(statusline));
+            build_footer_text(&st, subagents, &queue, restart_cols, statusline, sizeof(statusline));
             editor_start(&editor, prompt, statusline, saved_input);
             free(saved_input);
             continue;
         }
+
+        ds_agent_subagents_submit_ready(subagents);
+        worker_ptr = ds_agent_subagents_active_worker(subagents);
+        queue_ptr = ds_agent_subagents_active_queue(subagents);
+        if (!worker_ptr || !queue_ptr) break;
 
         if (initial_pending && worker_is_idle(&worker)) {
             if (worker_submit(&worker, initial_pending)) {
@@ -15913,7 +16150,7 @@ static int run_agent(ds4_engine *engine, agent_config *cfg) {
             worker_get_status(&worker, &st);
             build_prompt_text(&st, prompt, sizeof(prompt));
             footer_cols = editor.edit.cols > 0 ? (int)editor.edit.cols : 80;
-            build_footer_text(&st, &queue, footer_cols, statusline, sizeof(statusline));
+            build_footer_text(&st, subagents, &queue, footer_cols, statusline, sizeof(statusline));
             editor_set_prompt_status(&editor, prompt, statusline);
             free(queued);
         }
@@ -15926,7 +16163,7 @@ static int run_agent(ds4_engine *engine, agent_config *cfg) {
             worker_get_status(&worker, &st);
             build_prompt_text(&st, prompt, sizeof(prompt));
             footer_cols = editor.edit.cols > 0 ? (int)editor.edit.cols : 80;
-            build_footer_text(&st, &queue, footer_cols, statusline, sizeof(statusline));
+            build_footer_text(&st, subagents, &queue, footer_cols, statusline, sizeof(statusline));
             char msg[96];
             int n = snprintf(msg, sizeof(msg), "\n%s\n",
                              agent_think_mode_confirmation(mode));
@@ -16237,6 +16474,16 @@ static int run_agent(ds4_engine *engine, agent_config *cfg) {
                         for (int i = 0; i < n; i++) free(paths[i]);
                         free(paths);
                     }
+                } else if (ds_agent_subagents_handle_command(subagents, cmd, busy)) {
+                    worker_ptr = ds_agent_subagents_active_worker(subagents);
+                    queue_ptr = ds_agent_subagents_active_queue(subagents);
+                    char *replay = ds_agent_subagents_take_active_replay(subagents);
+                    if (replay) {
+                        printf("%s", replay);
+                        if (replay[0] && replay[strlen(replay) - 1] != '\n')
+                            printf("\n");
+                        free(replay);
+                    }
                 } else if (cmd[0] == '/' && !agent_slash_command_known(cmd)) {
                     ssize_t ignored = write(STDOUT_FILENO, "\a", 1);
                     (void)ignored;
@@ -16359,7 +16606,7 @@ static int run_agent(ds4_engine *engine, agent_config *cfg) {
                     worker_get_status(&worker, &st);
                     build_prompt_text(&st, prompt, sizeof(prompt));
                     int restart_cols = editor.edit.cols > 0 ? (int)editor.edit.cols : 80;
-                    build_footer_text(&st, &queue, restart_cols, statusline, sizeof(statusline));
+                    build_footer_text(&st, subagents, &queue, restart_cols, statusline, sizeof(statusline));
                     editor_start(&editor, prompt, statusline, restore_line);
                     if (!editor.scroll_region && was_below_output) {
                         editor.output_line_open = had_output_line_open;
@@ -16383,17 +16630,19 @@ static int run_agent(ds4_engine *engine, agent_config *cfg) {
 
     free(initial_pending);
     free(restore_line);
-    agent_prompt_queue_free(&queue);
     editor_stop(&editor);
     editor_restore_terminal_layout(&editor);
     linenoiseSetCompletionCallback(NULL);
     agent_completion_worker = NULL;
-    if (!exit_save_handled) {
+    worker_ptr = ds_agent_subagents_active_worker(subagents);
+    if (!exit_save_handled && worker_ptr) {
         agent_exit_save_result exit_save =
             agent_maybe_save_before_exiting(&worker);
         if (exit_save == AGENT_EXIT_NOW) exit(0);
     }
-    agent_worker_free(&worker);
+    ds_agent_subagents_destroy(subagents);
+#undef queue
+#undef worker
     return 0;
 }
 
