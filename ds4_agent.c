@@ -6352,6 +6352,49 @@ static void agent_worker_set_more(agent_worker *w, const char *path,
     w->more_valid = path && path[0] && next_line > 0;
 }
 
+/* What: choose the workspace path Docker-backed tools should treat as cwd.
+ * Why: worker status snapshots can lag initialization, but the configured
+ * working-directory roots are available immediately and are the source of
+ * truth for relative tool paths and Docker `-w`.
+ * Callers: agent_docker_shell_start(); unit tests cover the primary-root
+ * fallback directly. */
+static const char *agent_docker_effective_working_directory(
+        const agent_worker *w) {
+    const char *working_dir = agent_primary_working_directory(w);
+    if (working_dir && working_dir[0]) return working_dir;
+    if (w && w->status.workspace[0]) return w->status.workspace;
+    return NULL;
+}
+
+static void agent_buf_trim_one_trailing_newline(agent_buf *b) {
+    if (!b || !b->ptr || b->len == 0) return;
+    if (b->ptr[b->len - 1] == '\n') {
+        b->len--;
+        b->ptr[b->len] = '\0';
+    }
+}
+
+static void agent_tool_append_stderr_warning(agent_buf *b,
+                                             const agent_buf *stderr_out) {
+    if (!b || !stderr_out || !stderr_out->ptr || stderr_out->len == 0) return;
+    if (b->len > 0 && b->ptr[b->len - 1] != '\n') agent_buf_puts(b, "\n");
+    agent_buf_puts(b, "Tool stderr (warnings):\n");
+    agent_buf_append(b, stderr_out->ptr, stderr_out->len);
+    if (b->len == 0 || b->ptr[b->len - 1] != '\n') agent_buf_puts(b, "\n");
+}
+
+static char *agent_tool_error_with_stderr(const char *fallback,
+                                          const agent_buf *stderr_out) {
+    agent_buf b = {0};
+    agent_buf_puts(&b, "Tool error: ");
+    if (stderr_out && stderr_out->ptr && stderr_out->len > 0)
+        agent_buf_append(&b, stderr_out->ptr, stderr_out->len);
+    else
+        agent_buf_puts(&b, fallback ? fallback : "command failed");
+    if (b.len == 0 || b.ptr[b.len - 1] != '\n') agent_buf_puts(&b, "\n");
+    return agent_buf_take(&b);
+}
+
 static bool agent_tool_use_docker_filesystem(const agent_worker *w);
 static bool agent_docker_exec(agent_worker *w,
                                const agent_config *cfg,
@@ -6391,19 +6434,31 @@ static void agent_docker_build_shell_argv(char **argv, int *argc,
                                           char *xdg_cache_env, size_t xdg_cache_len);
 static bool agent_docker_read_file_bytes(agent_worker *w, const char *path,
                                          char **data, size_t *len,
-                                         char *err, size_t err_len);
+                                         char *err, size_t err_len,
+                                         agent_buf *stderr_out);
 static char *agent_docker_read_range(agent_worker *w, const char *path,
                                      int start_line, int max_lines,
-                                     bool bare, bool set_more);
+                                     bool bare, bool set_more,
+                                     agent_buf *stderr_out);
 static bool agent_docker_write_file_bytes(agent_worker *w, const char *path,
                                           const char *data, size_t len,
-                                          char *err, size_t err_len);
+                                          char *err, size_t err_len,
+                                          agent_buf *stderr_out);
+#ifdef DS4_AGENT_TEST
 static bool agent_docker_shell_exec_argv(agent_worker *w,
                                           char *const cmd_argv[],
                                            bool unbounded_output,
                                           const char *op,
                                           agent_buf *out,
                                           int *exit_status);
+#endif
+static bool agent_docker_shell_exec_argv_stderr(agent_worker *w,
+                                                char *const cmd_argv[],
+                                                bool unbounded_output,
+                                                const char *op,
+                                                agent_buf *stdout_out,
+                                                agent_buf *stderr_out,
+                                                int *exit_status);
 static char *agent_tool_edit(agent_worker *w, const agent_tool_call *call);
 static char *agent_tool_list(agent_worker *w, const agent_tool_call *call);
 static char *agent_tool_search(agent_worker *w, const agent_tool_call *call);
@@ -6428,7 +6483,8 @@ static bool agent_tool_result_fits_context(agent_worker *w, const char *result,
  * harness exercises it through test_agent_docker_read_range_uses_shell_slice(). */
 static char *agent_docker_read_range(agent_worker *w, const char *path,
                                      int start_line, int max_lines,
-                                     bool bare, bool set_more) {
+                                     bool bare, bool set_more,
+                                     agent_buf *stderr_out) {
     if (!path || !path[0]) return xstrdup("Tool error: read requires path\n");
     if (start_line < 1) start_line = 1;
     if (max_lines <= 0) max_lines = AGENT_READ_DEFAULT_LINES;
@@ -6448,16 +6504,16 @@ static char *agent_docker_read_range(agent_worker *w, const char *path,
         NULL,
     };
     agent_buf shell_out = {0};
+    agent_buf shell_err = {0};
     int status = 0;
-    if (!agent_docker_shell_exec_argv(w, argv, true, "docker read", &shell_out,
-                                      &status) || status != 0) {
-        agent_buf b = {0};
-        agent_buf_puts(&b, "Tool error: ");
-        agent_buf_puts(&b, shell_out.ptr && shell_out.ptr[0] ?
-                       shell_out.ptr : "docker read failed");
-        agent_buf_puts(&b, "\n");
+    if (!agent_docker_shell_exec_argv_stderr(w, argv, true, "docker read",
+                                             &shell_out, &shell_err,
+                                             &status) || status != 0) {
+        char *msg = agent_tool_error_with_stderr("docker read failed",
+                                                 &shell_err);
         free(shell_out.ptr);
-        return agent_buf_take(&b);
+        free(shell_err.ptr);
+        return msg;
     }
 
     agent_buf lines = {0};
@@ -6553,6 +6609,8 @@ static char *agent_docker_read_range(agent_worker *w, const char *path,
         if (lines.ptr) agent_buf_append(&out, lines.ptr, lines.len);
     }
     free(lines.ptr);
+    if (stderr_out) *stderr_out = shell_err;
+    else free(shell_err.ptr);
     if (set_more) {
         if (truncated) agent_worker_set_more(w, path, end_idx + 1, bare);
         else agent_worker_set_more(w, NULL, 0, false);
@@ -6572,14 +6630,49 @@ static char *agent_read_range(agent_worker *w, const char *path, int start_line,
     const char *display_path = path;
     if (!path || !path[0]) return xstrdup("Tool error: read requires path\n");
     char *file_path = NULL;
+    agent_buf stderr_out = {0};
     if (agent_tool_use_docker_filesystem(w) && !whole_file) {
-        return agent_docker_read_range(w, path, start_line, max_lines, bare, set_more);
-    } else if (agent_tool_use_docker_filesystem(w)) {
-        if (!agent_docker_read_file_bytes(w, path, &data, &len, err, sizeof(err))) {
+        file_path = agent_resolve_tool_path(w, path, AGENT_PATH_EXISTING,
+                                            err, sizeof(err));
+        if (!file_path) {
             agent_buf b = {0};
             agent_buf_puts(&b, "Tool error: ");
             agent_buf_puts(&b, err);
             agent_buf_puts(&b, "\n");
+            return agent_buf_take(&b);
+        }
+        char *result = agent_docker_read_range(w, file_path, start_line,
+                                               max_lines, bare, set_more,
+                                               &stderr_out);
+        free(file_path);
+        if (stderr_out.ptr && result && strncmp(result, "Tool error:", 11) != 0) {
+            agent_buf b = {0};
+            agent_buf_puts(&b, result);
+            free(result);
+            agent_tool_append_stderr_warning(&b, &stderr_out);
+            free(stderr_out.ptr);
+            return agent_buf_take(&b);
+        }
+        free(stderr_out.ptr);
+        return result;
+    } else if (agent_tool_use_docker_filesystem(w)) {
+        file_path = agent_resolve_tool_path(w, path, AGENT_PATH_EXISTING,
+                                            err, sizeof(err));
+        if (!file_path) {
+            agent_buf b = {0};
+            agent_buf_puts(&b, "Tool error: ");
+            agent_buf_puts(&b, err);
+            agent_buf_puts(&b, "\n");
+            return agent_buf_take(&b);
+        }
+        display_path = file_path;
+        if (!agent_docker_read_file_bytes(w, file_path, &data, &len, err,
+                                          sizeof(err), &stderr_out)) {
+            agent_buf b = {0};
+            agent_buf_puts(&b, "Tool error: ");
+            agent_buf_puts(&b, err);
+            agent_buf_puts(&b, "\n");
+            free(file_path);
             return agent_buf_take(&b);
         }
     } else {
@@ -6668,6 +6761,8 @@ static char *agent_read_range(agent_worker *w, const char *path, int start_line,
     agent_line_spans_free(&spans);
     free(data);
     free(file_path);
+    agent_tool_append_stderr_warning(&out, &stderr_out);
+    free(stderr_out.ptr);
     return agent_buf_take(&out);
 }
 
@@ -6702,12 +6797,25 @@ static char *agent_tool_write(agent_worker *w, const agent_tool_call *call) {
     size_t len = strlen(content);
     char *file_path = NULL;
     const char *display_path = path;
+    agent_buf stderr_out = {0};
     if (agent_tool_use_docker_filesystem(w)) {
-        if (!agent_docker_write_file_bytes(w, path, content, len, err, sizeof(err))) {
+        file_path = agent_resolve_tool_path(w, path, AGENT_PATH_PARENT,
+                                            err, sizeof(err));
+        if (!file_path) {
+            agent_buf b = {0};
+            agent_buf_puts(&b, "Tool error: ");
+            agent_buf_puts(&b, err);
+            agent_buf_puts(&b, "\n");
+            return agent_buf_take(&b);
+        }
+        display_path = file_path;
+        if (!agent_docker_write_file_bytes(w, file_path, content, len, err,
+                                           sizeof(err), &stderr_out)) {
             agent_buf b = {0};
             agent_buf_puts(&b, "Tool error: write failed: ");
             agent_buf_puts(&b, err);
             agent_buf_puts(&b, "\n");
+            free(file_path);
             return agent_buf_take(&b);
         }
     } else {
@@ -6745,36 +6853,59 @@ static char *agent_tool_write(agent_worker *w, const agent_tool_call *call) {
     }
     char msg[PATH_MAX + 160];
     snprintf(msg, sizeof(msg), "Wrote %zu bytes to %s\n", len, display_path);
+    agent_buf result = {0};
+    agent_buf_puts(&result, msg);
+    agent_tool_append_stderr_warning(&result, &stderr_out);
+    free(stderr_out.ptr);
     free(file_path);
-    return xstrdup(msg);
+    return agent_buf_take(&result);
 }
 
 static char *agent_tool_list(agent_worker *w, const agent_tool_call *call) {
     const char *path = agent_tool_arg_value(call, "path");
     if (!path || !path[0]) path = ".";
     if (agent_tool_use_docker_filesystem(w)) {
+        char err[256];
+        char *dir_path = agent_resolve_tool_path(w, path, AGENT_PATH_EXISTING,
+                                                 err, sizeof(err));
+        if (!dir_path) {
+            agent_buf b = {0};
+            agent_buf_puts(&b, "Tool error: ");
+            agent_buf_puts(&b, err);
+            agent_buf_puts(&b, "\n");
+            return agent_buf_take(&b);
+        }
         char *argv[] = {
             "/bin/sh", "-c",
-            "find \"$1\" -mindepth 1 -maxdepth 1 -printf '%y %s %f\\n' 2>/dev/null | "
+            "[ -e \"$1\" ] || { printf 'No such file or directory'; exit 1; }; "
+            "[ -d \"$1\" ] || { printf 'Not a directory'; exit 1; }; "
+            "find \"$1\" -mindepth 1 -maxdepth 1 -printf '%y %s %f\\n' | "
             "sort | sed -n '1,300p'",
-            "sh", (char *)path, NULL
+            "sh", dir_path, NULL
         };
         agent_buf out = {0};
+        agent_buf stderr_out = {0};
+        int status = 0;
         char hdr[PATH_MAX + 64];
-        snprintf(hdr, sizeof(hdr), "%s:\n", path);
-        if (!agent_docker_shell_exec_argv(w, argv, false,
-                                       "docker list", &out, NULL)) {
-            agent_buf b = {0};
-            agent_buf_puts(&b, "Tool error: opendir failed: ");
-            agent_buf_puts(&b, out.ptr && out.ptr[0] ? out.ptr : "docker list failed");
-            agent_buf_puts(&b, "\n");
+        snprintf(hdr, sizeof(hdr), "%s:\n", dir_path);
+        if (!agent_docker_shell_exec_argv_stderr(w, argv, false,
+                                                 "docker list", &out,
+                                                 &stderr_out, &status) ||
+            status != 0) {
+            char *msg = agent_tool_error_with_stderr("docker list failed",
+                                                     &stderr_out);
             free(out.ptr);
-            return agent_buf_take(&b);
+            free(stderr_out.ptr);
+            free(dir_path);
+            return msg;
         }
         agent_buf result = {0};
         agent_buf_puts(&result, hdr);
         if (out.ptr && out.ptr[0]) agent_buf_append(&result, out.ptr, out.len);
+        agent_tool_append_stderr_warning(&result, &stderr_out);
         free(out.ptr);
+        free(stderr_out.ptr);
+        free(dir_path);
         return agent_buf_take(&result);
     }
     char err[256];
@@ -7281,8 +7412,7 @@ static bool agent_docker_shell_start(agent_worker *w) {
         w->cfg->docker_command : "docker";
     const char *temp_dir = w->cfg->temp_directory[0] ?
         w->cfg->temp_directory : NULL;
-    const char *working_dir = w->status.workspace[0] ?
-        w->status.workspace : NULL;
+    const char *working_dir = agent_docker_effective_working_directory(w);
 
     char home_env[PATH_MAX + 16];
     char tmpdir_env[PATH_MAX + 16];
@@ -7624,11 +7754,10 @@ static bool agent_docker_shell_exec(agent_worker *w,
 
 /* What: shell-quote an argv vector and execute it through the persistent Docker
  * shell.
- * Why: file tools build argv-style commands for safety, but the persistent
- * shell accepts text; this keeps quoting centralized.
- * Callers: agent_docker_read_range(), agent_docker_read_file_bytes(),
- * agent_docker_write_file_bytes(), agent_tool_list(), and agent_tool_search();
- * tests also call it for quoting and debug-output coverage. */
+ * Why: tests still exercise the plain argv-to-shell quoting path directly even
+ * though production tools now route through the stderr-capturing wrapper.
+ * Callers: DS4_AGENT_TEST-only quoting and debug-output tests. */
+#ifdef DS4_AGENT_TEST
 static bool agent_docker_shell_exec_argv(agent_worker *w,
                                          char *const cmd_argv[],
                                          bool unbounded_output,
@@ -7648,6 +7777,111 @@ static bool agent_docker_shell_exec_argv(agent_worker *w,
     bool ok = agent_docker_shell_exec(w, b.ptr, unbounded_output, op, out, exit_status);
     free(b.ptr);
     return ok;
+}
+#endif
+
+static bool agent_docker_shell_exec_argv_stderr(agent_worker *w,
+                                                char *const cmd_argv[],
+                                                bool unbounded_output,
+                                                const char *op,
+                                                agent_buf *stdout_out,
+                                                agent_buf *stderr_out,
+                                                int *exit_status) {
+    if (stdout_out) memset(stdout_out, 0, sizeof(*stdout_out));
+    if (stderr_out) memset(stderr_out, 0, sizeof(*stderr_out));
+    if (exit_status) *exit_status = -1;
+    if (!cmd_argv || !cmd_argv[0]) return false;
+
+    agent_buf cmd = {0};
+    for (int i = 0; cmd_argv[i]; i++) {
+        if (i > 0) agent_buf_puts(&cmd, " ");
+        agent_buf_append_shell_quoted(&cmd, cmd_argv[i]);
+    }
+
+    unsigned long long tag_seq =
+        (unsigned long long)(w ? w->docker_shell.seq : 0ULL);
+    int tag_pid = w ? (int)w->docker_shell.pid : 0;
+    char begin_tag[96];
+    char end_tag[96];
+    snprintf(begin_tag, sizeof(begin_tag), "__DS4_STDERR_BEGIN_%d_%llu__",
+             tag_pid, tag_seq);
+    snprintf(end_tag, sizeof(end_tag), "__DS4_STDERR_END_%d_%llu__",
+             tag_pid, tag_seq);
+
+    char label[64];
+    size_t li = 0;
+    const char *src = (op && op[0]) ? op : "tool";
+    while (*src && li + 1 < sizeof(label)) {
+        unsigned char ch = (unsigned char)*src++;
+        if (isalnum(ch)) label[li++] = (char)tolower(ch);
+        else if (li == 0 || label[li - 1] != '_') label[li++] = '_';
+    }
+    if (li == 0) label[li++] = 't';
+    label[li] = '\0';
+
+    const char *temp_dir =
+        (w && w->cfg && w->cfg->temp_directory[0]) ?
+        w->cfg->temp_directory : "/tmp";
+    char err_path[PATH_MAX];
+    snprintf(err_path, sizeof(err_path), "%s/ds4_%s_%d_%llu.err",
+             temp_dir, label, tag_pid, tag_seq);
+
+    agent_buf wrapped = {0};
+    agent_buf_puts(&wrapped, "err_path=");
+    agent_buf_append_shell_quoted(&wrapped, err_path);
+    agent_buf_puts(&wrapped, "; rm -f \"$err_path\"; { ");
+    agent_buf_append(&wrapped, cmd.ptr, cmd.len);
+    agent_buf_puts(&wrapped,
+                   "; } 2>\"$err_path\"; cmd_rc=$?; "
+                   "if [ -s \"$err_path\" ]; then "
+                   "printf '\\n");
+    agent_buf_puts(&wrapped, begin_tag);
+    agent_buf_puts(&wrapped, "\\n'; "
+                   "cat \"$err_path\"; "
+                   "printf '\\n");
+    agent_buf_puts(&wrapped, end_tag);
+    agent_buf_puts(&wrapped, "\\n'; "
+                   "fi; rm -f \"$err_path\"; (exit \"$cmd_rc\")");
+
+    agent_buf combined = {0};
+    int status = 0;
+    bool ok = agent_docker_shell_exec(w, wrapped.ptr, unbounded_output, op,
+                                      &combined, &status);
+    free(cmd.ptr);
+    free(wrapped.ptr);
+    if (exit_status) *exit_status = status;
+    if (!ok) {
+        if (stdout_out) *stdout_out = combined;
+        else free(combined.ptr);
+        return false;
+    }
+
+    const char *begin = combined.ptr ? strstr(combined.ptr, begin_tag) : NULL;
+    const char *end = begin && combined.ptr ? strstr(begin, end_tag) : NULL;
+    if (!begin || !end) {
+        if (stdout_out) *stdout_out = combined;
+        else free(combined.ptr);
+        return true;
+    }
+
+    const char *stdout_end = begin;
+    if (stdout_end > combined.ptr && stdout_end[-1] == '\n') stdout_end--;
+    if (stdout_out)
+        agent_buf_append(stdout_out, combined.ptr,
+                         (size_t)(stdout_end - combined.ptr));
+
+    const char *stderr_start = begin + strlen(begin_tag);
+    if (*stderr_start == '\n') stderr_start++;
+    const char *stderr_end = end;
+    if (stderr_end > stderr_start && stderr_end[-1] == '\n') stderr_end--;
+    if (stderr_out)
+        agent_buf_append(stderr_out, stderr_start,
+                         (size_t)(stderr_end - stderr_start));
+
+    agent_buf_trim_one_trailing_newline(stdout_out);
+    agent_buf_trim_one_trailing_newline(stderr_out);
+    free(combined.ptr);
+    return true;
 }
 
 /* What: terminate and clear the worker's persistent Docker shell process.
@@ -9302,6 +9536,18 @@ static void test_agent_docker_shell_stop_is_idempotent(void) {
 /* --- agent_tool_list / agent_tool_search persistent shell tests --- */
 
 static void test_agent_tool_list_with_fake_shell(void) {
+    char root_tmpl[] = "/tmp/ds4_agent_list_root_XXXXXX";
+    char *root_tmp = mkdtemp(root_tmpl);
+    AGENT_TEST_ASSERT(root_tmp != NULL);
+    if (!root_tmp) return;
+    char root[PATH_MAX];
+    AGENT_TEST_ASSERT(realpath(root_tmp, root) != NULL);
+    char child_file[PATH_MAX];
+    snprintf(child_file, sizeof(child_file), "%s/visible.txt", root);
+    char err[256];
+    AGENT_TEST_ASSERT(agent_write_file_bytes(child_file, "hello\n", 6,
+                                             err, sizeof(err)) == 0);
+
     int stdin_pipe[2], stdout_pipe[2];
     AGENT_TEST_ASSERT(pipe(stdin_pipe) == 0);
     AGENT_TEST_ASSERT(pipe(stdout_pipe) == 0);
@@ -9325,6 +9571,7 @@ static void test_agent_tool_list_with_fake_shell(void) {
     agent_config cfg = {.docker_available = true, .docker_container = "test"};
     agent_worker w = {0};
     w.cfg = &cfg;
+    agent_path_list_append(&w.working_directories, root);
     w.docker_shell.stdin_fd = stdin_pipe[1];
     w.docker_shell.stdout_fd = stdout_pipe[0];
     w.docker_shell.pid = child;
@@ -9333,7 +9580,7 @@ static void test_agent_tool_list_with_fake_shell(void) {
     pthread_mutex_init(&w.docker_shell.mu, NULL);
 
     agent_tool_arg args[] = {
-        {.name = "path", .value = "/tmp", .is_string = true},
+        {.name = "path", .value = ".", .is_string = true},
     };
     agent_tool_call call = {
         .name = "list",
@@ -9342,14 +9589,30 @@ static void test_agent_tool_list_with_fake_shell(void) {
     };
     char *result = agent_tool_list(&w, &call);
     AGENT_TEST_ASSERT(result != NULL);
-    AGENT_TEST_ASSERT(strstr(result, "/tmp:") != NULL);
+    AGENT_TEST_ASSERT(strstr(result, root) != NULL);
     free(result);
+
+    agent_tool_arg missing_args[] = {
+        {.name = "path", .value = "missing", .is_string = true},
+    };
+    agent_tool_call missing_call = {
+        .name = "list",
+        .args = missing_args,
+        .argc = 1,
+    };
+    char *missing_result = agent_tool_list(&w, &missing_call);
+    AGENT_TEST_ASSERT(missing_result != NULL);
+    AGENT_TEST_ASSERT(strstr(missing_result, "Tool error:") != NULL);
+    free(missing_result);
 
     close(stdin_pipe[1]);
     close(stdout_pipe[0]);
     kill(child, SIGKILL);
     waitpid(child, NULL, 0);
     pthread_mutex_destroy(&w.docker_shell.mu);
+    agent_path_list_free(&w.working_directories);
+    unlink(child_file);
+    rmdir(root);
 }
 
 static void test_agent_tool_search_with_fake_shell(void) {
@@ -9488,8 +9751,6 @@ static void test_agent_tool_list_shell_argv_quoting(void) {
     };
     char *result = agent_tool_list(&w, &call);
     AGENT_TEST_ASSERT(result != NULL);
-    AGENT_TEST_ASSERT(strstr(result, "Tool error") == NULL ||
-                      strstr(result, "/tmp/test") != NULL);
     free(result);
 
     close(stdin_pipe[1]);
@@ -9497,6 +9758,19 @@ static void test_agent_tool_list_shell_argv_quoting(void) {
     kill(child, SIGKILL);
     waitpid(child, NULL, 0);
     pthread_mutex_destroy(&w.docker_shell.mu);
+}
+
+static void test_agent_docker_effective_working_directory_prefers_primary_root(void) {
+    agent_worker w = {0};
+    agent_path_list_append(&w.working_directories, "/tmp/primary-root");
+    snprintf(w.status.workspace, sizeof(w.status.workspace), "%s",
+             "/tmp/status-root");
+
+    const char *working_dir = agent_docker_effective_working_directory(&w);
+    AGENT_TEST_ASSERT(working_dir != NULL);
+    AGENT_TEST_ASSERT(!strcmp(working_dir, "/tmp/primary-root"));
+
+    agent_path_list_free(&w.working_directories);
 }
 
 static void test_agent_subagent_api_lifecycle(void) {
@@ -9608,6 +9882,7 @@ static void ds4_agent_unit_tests_run(void) {
     test_agent_docker_shell_unbounded_output();
     test_agent_docker_read_range_uses_shell_slice();
     test_agent_docker_refresh_mounts_skips_unchanged_fingerprint();
+    test_agent_docker_effective_working_directory_prefers_primary_root();
     test_agent_bash_publish_observation_command_output_on();
     test_agent_bash_publish_observation_command_output_off();
     test_agent_docker_bash_publishes_command_output();
@@ -9640,8 +9915,15 @@ static bool agent_preflight_edit_old(agent_worker *w, const agent_tool_call *cal
     size_t len = 0;
     char *file_path = NULL;
     if (agent_tool_use_docker_filesystem(w)) {
-        if (!agent_docker_read_file_bytes(w, path, &data, &len, err, err_len))
+        file_path = agent_resolve_tool_path(w, path, AGENT_PATH_EXISTING,
+                                            err, err_len);
+        if (!file_path)
             return false;
+        if (!agent_docker_read_file_bytes(w, file_path, &data, &len, err,
+                                          err_len, NULL)) {
+            free(file_path);
+            return false;
+        }
     } else {
         file_path = agent_resolve_tool_path(w, path, AGENT_PATH_EXISTING,
                                             err, err_len);
@@ -9666,8 +9948,10 @@ static bool agent_preflight_edit_old(agent_worker *w, const agent_tool_call *cal
 static char *agent_apply_file_splice(agent_worker *w, const char *path,
                                      const char *data, size_t len,
                                      size_t offset, size_t remove_len,
-                                     const char *insert, const char *kind) {
+                                     const char *insert, const char *kind,
+                                     const agent_buf *stderr_out) {
     char err[256];
+    agent_buf write_stderr = {0};
     if (!insert) insert = "";
     size_t insert_len = strlen(insert);
     size_t out_len = offset + insert_len + (len - offset - remove_len);
@@ -9680,11 +9964,13 @@ static char *agent_apply_file_splice(agent_worker *w, const char *path,
 
     int rc = 0;
     if (agent_tool_use_docker_filesystem(w))
-        rc = agent_docker_write_file_bytes(w, path, out, out_len, err, sizeof(err)) ? 0 : -1;
+        rc = agent_docker_write_file_bytes(w, path, out, out_len, err,
+                                           sizeof(err), &write_stderr) ? 0 : -1;
     else
         rc = agent_write_file_bytes(path, out, out_len, err, sizeof(err));
     if (rc != 0) {
         free(out);
+        free(write_stderr.ptr);
         agent_buf b = {0};
         agent_buf_puts(&b, "Tool error: ");
         agent_buf_puts(&b, err);
@@ -9697,6 +9983,21 @@ static char *agent_apply_file_splice(agent_worker *w, const char *path,
                               &start_line, &end_line, &delta);
     char *result = agent_edit_result(path, start_line, end_line, delta,
                                      out, out_len, kind);
+    if (stderr_out && stderr_out->ptr && stderr_out->len > 0 && result) {
+        agent_buf b = {0};
+        agent_buf_puts(&b, result);
+        free(result);
+        agent_tool_append_stderr_warning(&b, stderr_out);
+        result = agent_buf_take(&b);
+    }
+    if (write_stderr.ptr && write_stderr.len > 0 && result) {
+        agent_buf b = {0};
+        agent_buf_puts(&b, result);
+        free(result);
+        agent_tool_append_stderr_warning(&b, &write_stderr);
+        result = agent_buf_take(&b);
+    }
+    free(write_stderr.ptr);
     free(out);
     return result;
 }
@@ -9720,11 +10021,23 @@ static char *agent_tool_edit(agent_worker *w, const agent_tool_call *call) {
     char *file_path = NULL;
     const char *display_path = path;
     if (agent_tool_use_docker_filesystem(w)) {
-        if (!agent_docker_read_file_bytes(w, path, &data, &len, err, sizeof(err))) {
+        file_path = agent_resolve_tool_path(w, path, AGENT_PATH_EXISTING,
+                                            err, sizeof(err));
+        if (!file_path) {
             agent_buf b = {0};
             agent_buf_puts(&b, "Tool error: ");
             agent_buf_puts(&b, err);
             agent_buf_puts(&b, "\n");
+            return agent_buf_take(&b);
+        }
+        display_path = file_path;
+        if (!agent_docker_read_file_bytes(w, file_path, &data, &len, err,
+                                          sizeof(err), NULL)) {
+            agent_buf b = {0};
+            agent_buf_puts(&b, "Tool error: ");
+            agent_buf_puts(&b, err);
+            agent_buf_puts(&b, "\n");
+            free(file_path);
             return agent_buf_take(&b);
         }
     } else {
@@ -9784,7 +10097,8 @@ static char *agent_tool_edit(agent_worker *w, const agent_tool_call *call) {
                                            resolved_new,
                                            new_used_upto ? "anchored old/new merge"
                                            : anchored ? "anchored old/new replacement"
-                                                      : "old/new replacement");
+                                                      : "old/new replacement",
+                                           NULL);
     free(resolved_new);
     free(file_path);
     free(data);
@@ -9930,6 +10244,16 @@ static char *agent_tool_search(agent_worker *w, const agent_tool_call *call) {
     int max_results = agent_parse_int_default(agent_tool_arg_value(call, "max_results"), 50, 1, 500);
     const char *glob = agent_tool_arg_value(call, "glob");
     if (agent_tool_use_docker_filesystem(w)) {
+        char err[256];
+        char *search_path = agent_resolve_tool_path(w, path, AGENT_PATH_EXISTING,
+                                                    err, sizeof(err));
+        if (!search_path) {
+            agent_buf b = {0};
+            agent_buf_puts(&b, "Tool error: ");
+            agent_buf_puts(&b, err);
+            agent_buf_puts(&b, "\n");
+            return agent_buf_take(&b);
+        }
         char grep_flags[32] = "-nI";
         if (use_regex) strcat(grep_flags, "E");
         else strcat(grep_flags, "F");
@@ -9941,32 +10265,44 @@ static char *agent_tool_search(agent_worker *w, const agent_tool_call *call) {
         const char *script =
             "{ if [ -d \"$1\" ]; then "
             "  if [ -n \"$4\" ]; then "
-            "    find \"$1\" \\( -name .git -o -name node_modules -o -name .agents -o -name .codex -o -name build -o -name target -o -name .cache \\) -type d -prune -o -type f -name \"$4\" -print0 | xargs -0 grep \"$2\" -C \"$3\" -- \"$5\" 2>/dev/null; "
+            "    find \"$1\" \\( -name .git -o -name node_modules -o -name .agents -o -name .codex -o -name build -o -name target -o -name .cache \\) -type d -prune -o -type f -name \"$4\" -print0 | xargs -0 grep \"$2\" -C \"$3\" -- \"$5\"; "
             "  else "
-            "    find \"$1\" \\( -name .git -o -name node_modules -o -name .agents -o -name .codex -o -name build -o -name target -o -name .cache \\) -type d -prune -o -type f -print0 | xargs -0 grep \"$2\" -C \"$3\" -- \"$5\" 2>/dev/null; "
+            "    find \"$1\" \\( -name .git -o -name node_modules -o -name .agents -o -name .codex -o -name build -o -name target -o -name .cache \\) -type d -prune -o -type f -print0 | xargs -0 grep \"$2\" -C \"$3\" -- \"$5\"; "
             "  fi; "
             "else "
-            "  grep \"$2\" -C \"$3\" -- \"$5\" \"$1\" 2>/dev/null; "
+            "  grep \"$2\" -C \"$3\" -- \"$5\" \"$1\"; "
             "fi; } | sed -n \"1,${6}p;${6}q\"";
         char *argv[] = {
             "/bin/sh", "-c", (char *)script, "sh",
-            (char *)path, grep_flags, context_arg, (char *)(glob ? glob : ""),
+            search_path, grep_flags, context_arg, (char *)(glob ? glob : ""),
             (char *)query, max_arg, NULL
         };
         agent_buf out = {0};
-        if (!agent_docker_shell_exec_argv(w, argv, false,
-                                       "docker search", &out, NULL)) {
-            agent_buf b = {0};
-            agent_buf_puts(&b, "Tool error: ");
-            agent_buf_puts(&b, out.ptr && out.ptr[0] ? out.ptr : "docker search failed");
-            agent_buf_puts(&b, "\n");
+        agent_buf stderr_out = {0};
+        int status = 0;
+        if (!agent_docker_shell_exec_argv_stderr(w, argv, false,
+                                                 "docker search", &out,
+                                                 &stderr_out, &status) ||
+            status != 0) {
+            char *msg = agent_tool_error_with_stderr("docker search failed",
+                                                     &stderr_out);
             free(out.ptr);
-            return agent_buf_take(&b);
+            free(stderr_out.ptr);
+            free(search_path);
+            return msg;
         }
         if (!out.ptr || !out.ptr[0]) {
+            agent_buf result = {0};
+            agent_buf_puts(&result, "No matches.\n");
+            agent_tool_append_stderr_warning(&result, &stderr_out);
             free(out.ptr);
-            return xstrdup("No matches.\n");
+            free(stderr_out.ptr);
+            free(search_path);
+            return agent_buf_take(&result);
         }
+        agent_tool_append_stderr_warning(&out, &stderr_out);
+        free(stderr_out.ptr);
+        free(search_path);
         return agent_buf_take(&out);
     }
     char err[256];
@@ -10844,9 +11180,11 @@ static bool agent_docker_exec(agent_worker *w,
  * agent_tool_list(), and agent_tool_search(). */
 static bool agent_docker_read_file_bytes(agent_worker *w, const char *path,
                                          char **data, size_t *len,
-                                         char *err, size_t err_len) {
+                                         char *err, size_t err_len,
+                                         agent_buf *stderr_out) {
     if (data) *data = NULL;
     if (len) *len = 0;
+    if (stderr_out) memset(stderr_out, 0, sizeof(*stderr_out));
     if (!path || !path[0]) {
         snprintf(err, err_len, "%s", 
                  "docker read failed, path is empty");
@@ -10854,17 +11192,24 @@ static bool agent_docker_read_file_bytes(agent_worker *w, const char *path,
     }
     char *argv[] = {"cat", (char *)(path), NULL};
     agent_buf out = {0};
-    bool ok = agent_docker_shell_exec_argv(w, argv, true,
-                                           "docker read", &out, NULL);
-    if (!ok) {
+    agent_buf shell_err = {0};
+    int status = 0;
+    bool ok = agent_docker_shell_exec_argv_stderr(w, argv, true,
+                                                  "docker read", &out,
+                                                  &shell_err, &status);
+    if (!ok || status != 0) {
         snprintf(err, err_len, "%s",
-                 out.ptr && out.ptr[0] ? out.ptr : "docker read failed");
+                 shell_err.ptr && shell_err.ptr[0] ? shell_err.ptr :
+                 (out.ptr && out.ptr[0] ? out.ptr : "docker read failed"));
         free(out.ptr);
+        free(shell_err.ptr);
         return false;
     }
     if (data) *data = out.ptr ? out.ptr : xstrdup("");
     else free(out.ptr);
     if (len) *len = out.len;
+    if (stderr_out) *stderr_out = shell_err;
+    else free(shell_err.ptr);
     return true;
 }
 
@@ -10875,7 +11220,8 @@ static bool agent_docker_read_file_bytes(agent_worker *w, const char *path,
  * Callers: agent_tool_write() and agent_tool_edit(). */
 static bool agent_docker_write_file_bytes(agent_worker *w, const char *path,
                                           const char *data, size_t len,
-                                          char *err, size_t err_len) {
+                                          char *err, size_t err_len,
+                                          agent_buf *stderr_out) {
     const char *working_dir = agent_primary_working_directory(w);
     const char *temp_dir = (w && w->cfg && w->cfg->temp_directory[0]) ?
         w->cfg->temp_directory : NULL;
@@ -10889,16 +11235,24 @@ static bool agent_docker_write_file_bytes(agent_worker *w, const char *path,
 
     char *dir_argv[] = {"test", "-d", parent, NULL};
     agent_buf out = {0};
-    bool ok = agent_docker_shell_exec_argv(w, dir_argv, false,
-                                           "docker write", &out, NULL);
+    agent_buf dir_err = {0};
+    int dir_status = 0;
+    bool ok = agent_docker_shell_exec_argv_stderr(w, dir_argv, false,
+                                                  "docker write", &out,
+                                                  &dir_err, &dir_status);
     free(out.ptr);
     out.ptr = NULL;
     out.len = 0;
     out.cap = 0;
-    if (!ok) {
-        snprintf(err, err_len, "parent directory does not exist: %s", parent);
+    if (!ok || dir_status != 0) {
+        snprintf(err, err_len, "%s",
+                 dir_err.ptr && dir_err.ptr[0] ? dir_err.ptr :
+                 "parent directory does not exist");
+        free(dir_err.ptr);
         return false;
     }
+    if (stderr_out) *stderr_out = dir_err;
+    else free(dir_err.ptr);
 
     char home_env[PATH_MAX + 16];
     char tmpdir_env[PATH_MAX + 16];
