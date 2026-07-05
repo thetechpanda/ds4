@@ -52,6 +52,33 @@ static const char *ds_agent_subagent_autonomy_name(ds_agent_subagent_autonomy mo
     }
 }
 
+static const char *ds_agent_subagent_think_mode_name(ds4_think_mode mode) {
+    switch (mode) {
+    case DS4_THINK_NONE: return "off";
+    case DS4_THINK_HIGH: return "default";
+    case DS4_THINK_MAX: return "max";
+    default: return ds4_think_mode_name(mode);
+    }
+}
+
+static bool ds_agent_subagent_parse_think_mode(const char *text,
+                                               ds4_think_mode *out) {
+    if (!text || !text[0] || !out) return false;
+    if (!strcmp(text, "off")) {
+        *out = DS4_THINK_NONE;
+        return true;
+    }
+    if (!strcmp(text, "default")) {
+        *out = DS4_THINK_HIGH;
+        return true;
+    }
+    if (!strcmp(text, "max")) {
+        *out = DS4_THINK_MAX;
+        return true;
+    }
+    return false;
+}
+
 static void ds_agent_subagents_set_error(ds_agent_subagents *mgr,
                                          const char *fmt, ...) {
     if (!mgr) return;
@@ -392,13 +419,16 @@ int ds_agent_subagent_create(ds_agent_subagents *mgr,
         req->round_budget : mgr->default_round_budget;
     snprintf(slot->name, sizeof(slot->name), "%s", requested);
 
+    agent_session_slot *active = ds_agent_subagents_active_slot(mgr);
+    const agent_config *base = active ?
+        (active->has_worker ? active->worker.cfg : &active->cfg) : NULL;
+    ds_agent_subagent_config_copy(&slot->cfg, base);
+    if (req && req->think_mode_set)
+        slot->cfg.gen.think_mode = req->think_mode;
+    if (slot->cfg.gen.ctx_size <= 0 && mgr->default_ctx_size > 0)
+        slot->cfg.gen.ctx_size = mgr->default_ctx_size;
+
     if (mgr->engine) {
-        agent_session_slot *active = ds_agent_subagents_active_slot(mgr);
-        const agent_config *base = active && active->has_worker ?
-            active->worker.cfg : NULL;
-        ds_agent_subagent_config_copy(&slot->cfg, base);
-        if (slot->cfg.gen.ctx_size <= 0 && mgr->default_ctx_size > 0)
-            slot->cfg.gen.ctx_size = mgr->default_ctx_size;
         if (agent_worker_init(&slot->worker, mgr->engine, &slot->cfg) != 0) {
             ds_agent_subagents_set_error(mgr, "failed to initialize subagent %s",
                                          slot->name);
@@ -542,6 +572,7 @@ int ds_agent_subagent_list(ds_agent_subagents *mgr,
         out[i].budget_used = slot->has_worker ?
             slot->worker.model_tool_round_used : slot->budget_used;
         out[i].budget_limit = slot->budget_limit;
+        out[i].think_mode = slot->has_worker ? st.think_mode : slot->cfg.gen.think_mode;
         out[i].report_available = slot->report_available;
         snprintf(out[i].stop_reason, sizeof(out[i].stop_reason), "%s",
                  slot->stop_reason[0] ? slot->stop_reason :
@@ -837,6 +868,8 @@ static void ds_agent_subagent_print_list(ds_agent_subagents *mgr) {
                items[i].queued_output ? " unread" : "",
                items[i].approval_blocked ? " approval" : "",
                items[i].report_available ? " report" : "");
+        printf(" thinking %s",
+               ds_agent_subagent_think_mode_name(items[i].think_mode));
         if (items[i].budget_limit > 0)
             printf(" budget %d/%d", items[i].budget_used, items[i].budget_limit);
         printf("\n");
@@ -846,7 +879,7 @@ static void ds_agent_subagent_print_list(ds_agent_subagents *mgr) {
 
 static void ds_agent_subagent_usage(void) {
     puts("usage:");
-    puts("  /subagent new [--tab|--background|--auto] [name] [prompt]");
+    puts("  /subagent new [--tab|--background|--auto] [--thinking off|default|max] [name] [prompt]");
     puts("  /subagent list");
     puts("  /subagent switch <id|name>");
     puts("  /subagent send <id|name> <prompt>");
@@ -892,16 +925,43 @@ bool ds_agent_subagents_handle_command(ds_agent_subagents *mgr,
             return true;
         }
         ds_agent_subagent_autonomy mode = DS_AGENT_SUBAGENT_AUTONOMY_BACKGROUND;
-        char *name = ds_agent_subagent_next_arg(&args);
-        if (name && !strcmp(name, "--tab")) {
-            mode = DS_AGENT_SUBAGENT_AUTONOMY_TAB;
-            name = ds_agent_subagent_next_arg(&args);
-        } else if (name && !strcmp(name, "--background")) {
-            mode = DS_AGENT_SUBAGENT_AUTONOMY_BACKGROUND;
-            name = ds_agent_subagent_next_arg(&args);
-        } else if (name && !strcmp(name, "--auto")) {
-            mode = DS_AGENT_SUBAGENT_AUTONOMY_AUTONOMOUS;
-            name = ds_agent_subagent_next_arg(&args);
+        ds4_think_mode think_mode = DS4_THINK_HIGH;
+        bool think_mode_set = false;
+        char *name = NULL;
+        for (;;) {
+            char *arg = ds_agent_subagent_next_arg(&args);
+            if (!arg) break;
+            if (!strcmp(arg, "--tab")) {
+                mode = DS_AGENT_SUBAGENT_AUTONOMY_TAB;
+                continue;
+            }
+            if (!strcmp(arg, "--background")) {
+                mode = DS_AGENT_SUBAGENT_AUTONOMY_BACKGROUND;
+                continue;
+            }
+            if (!strcmp(arg, "--auto")) {
+                mode = DS_AGENT_SUBAGENT_AUTONOMY_AUTONOMOUS;
+                continue;
+            }
+            if (!strcmp(arg, "--thinking")) {
+                char *value = ds_agent_subagent_next_arg(&args);
+                if (!ds_agent_subagent_parse_think_mode(value, &think_mode)) {
+                    printf("usage: /subagent new [--tab|--background|--auto] [--thinking off|default|max] [name] [prompt]\n");
+                    return true;
+                }
+                think_mode_set = true;
+                continue;
+            }
+            if (!strncmp(arg, "--thinking=", 11)) {
+                if (!ds_agent_subagent_parse_think_mode(arg + 11, &think_mode)) {
+                    printf("usage: /subagent new [--tab|--background|--auto] [--thinking off|default|max] [name] [prompt]\n");
+                    return true;
+                }
+                think_mode_set = true;
+                continue;
+            }
+            name = arg;
+            break;
         }
         while (args && (*args == ' ' || *args == '\t')) args++;
         const char *prompt = args && args[0] ? args : NULL;
@@ -911,6 +971,8 @@ bool ds_agent_subagents_handle_command(ds_agent_subagents *mgr,
             .name = name,
             .prompt = prompt,
             .autonomy = mode,
+            .think_mode = think_mode,
+            .think_mode_set = think_mode_set,
         };
         ds_agent_subagent_id id = {0};
         if (ds_agent_subagent_create(mgr, &req, &id) != 0)
@@ -1043,9 +1105,103 @@ static agent_session_slot *test_agent_subagent_add_fake_slot(
     slot->budget_limit = 9;
     snprintf(slot->name, sizeof(slot->name), "%s", name);
     slot->cfg.gen.ctx_size = 1234;
+    slot->cfg.gen.think_mode = DS4_THINK_HIGH;
     test_agent_fake_worker_init(&slot->worker, &slot->cfg);
     slot->has_worker = true;
     return slot;
+}
+
+static void test_agent_subagent_create_think_mode_inherits_or_overrides(void) {
+    ds_agent_subagents *mgr = NULL;
+    AGENT_TEST_ASSERT(ds_agent_subagents_create(&mgr, NULL, NULL) == 0);
+
+    ds_agent_subagent_id main_id = {0};
+    ds_agent_subagent_create_request main_req = {
+        .name = "main",
+        .autonomy = DS_AGENT_SUBAGENT_AUTONOMY_TAB,
+        .think_mode = DS4_THINK_MAX,
+        .think_mode_set = true,
+    };
+    AGENT_TEST_ASSERT(ds_agent_subagent_create(mgr, &main_req, &main_id) == 0);
+
+    ds_agent_subagent_id inherited_id = {0};
+    ds_agent_subagent_create_request inherited_req = {
+        .name = "inherit",
+        .autonomy = DS_AGENT_SUBAGENT_AUTONOMY_TAB,
+    };
+    AGENT_TEST_ASSERT(ds_agent_subagent_create(mgr, &inherited_req, &inherited_id) == 0);
+
+    ds_agent_subagent_id explicit_id = {0};
+    ds_agent_subagent_create_request explicit_req = {
+        .name = "explicit",
+        .autonomy = DS_AGENT_SUBAGENT_AUTONOMY_TAB,
+        .think_mode = DS4_THINK_NONE,
+        .think_mode_set = true,
+    };
+    AGENT_TEST_ASSERT(ds_agent_subagent_create(mgr, &explicit_req, &explicit_id) == 0);
+
+    ds_agent_subagent_status st[4];
+    size_t n = 0;
+    AGENT_TEST_ASSERT(ds_agent_subagent_list(mgr, st, 4, &n) == 0);
+    AGENT_TEST_ASSERT(n == 3);
+    AGENT_TEST_ASSERT(st[0].think_mode == DS4_THINK_MAX);
+    AGENT_TEST_ASSERT(st[1].think_mode == DS4_THINK_MAX);
+    AGENT_TEST_ASSERT(st[2].think_mode == DS4_THINK_NONE);
+    ds_agent_subagents_destroy(mgr);
+}
+
+static void test_agent_subagent_new_command_accepts_thinking_flag(void) {
+    ds_agent_subagents *mgr = NULL;
+    AGENT_TEST_ASSERT(ds_agent_subagents_create(&mgr, NULL, NULL) == 0);
+
+    ds_agent_subagent_id main_id = {0};
+    ds_agent_subagent_create_request main_req = {
+        .name = "main",
+        .autonomy = DS_AGENT_SUBAGENT_AUTONOMY_TAB,
+        .think_mode = DS4_THINK_MAX,
+        .think_mode_set = true,
+    };
+    AGENT_TEST_ASSERT(ds_agent_subagent_create(mgr, &main_req, &main_id) == 0);
+
+    char cmd1[] = "/subagent new --thinking off explicit";
+    AGENT_TEST_ASSERT(ds_agent_subagents_handle_command(mgr, cmd1, false));
+    AGENT_TEST_ASSERT(mgr->len == 2);
+    AGENT_TEST_ASSERT(mgr->slots[1].cfg.gen.think_mode == DS4_THINK_NONE);
+
+    char cmd2[] = "/subagent new inherited";
+    AGENT_TEST_ASSERT(ds_agent_subagents_handle_command(mgr, cmd2, false));
+    AGENT_TEST_ASSERT(mgr->len == 3);
+    AGENT_TEST_ASSERT(mgr->slots[2].cfg.gen.think_mode == DS4_THINK_MAX);
+
+    ds_agent_subagents_destroy(mgr);
+}
+
+static void test_agent_subagent_switch_preserves_thinking_modes(void) {
+    ds_agent_subagents *mgr = NULL;
+    AGENT_TEST_ASSERT(ds_agent_subagents_create(&mgr, NULL, NULL) == 0);
+    agent_session_slot *main_slot =
+        test_agent_subagent_add_fake_slot(mgr, "main", 1);
+    agent_session_slot *beta =
+        test_agent_subagent_add_fake_slot(mgr, "beta", 2);
+    mgr->active_id = main_slot->id.value;
+
+    main_slot->cfg.gen.think_mode = DS4_THINK_MAX;
+    main_slot->worker.status.think_mode = DS4_THINK_MAX;
+    beta->cfg.gen.think_mode = DS4_THINK_NONE;
+    beta->worker.status.think_mode = DS4_THINK_NONE;
+
+    AGENT_TEST_ASSERT(ds_agent_subagent_switch(mgr, beta->id) == 0);
+
+    ds_agent_subagent_status st[2];
+    size_t n = 0;
+    AGENT_TEST_ASSERT(ds_agent_subagent_list(mgr, st, 2, &n) == 0);
+    AGENT_TEST_ASSERT(n == 2);
+    AGENT_TEST_ASSERT(!st[0].active);
+    AGENT_TEST_ASSERT(st[0].think_mode == DS4_THINK_MAX);
+    AGENT_TEST_ASSERT(st[1].active);
+    AGENT_TEST_ASSERT(st[1].think_mode == DS4_THINK_NONE);
+
+    ds_agent_subagents_destroy(mgr);
 }
 
 static void test_agent_subagent_slot_isolation(void) {
@@ -1146,5 +1302,8 @@ void ds_agent_subagent_unit_tests_run(void) {
     test_agent_subagent_slot_isolation();
     test_agent_subagent_background_replay();
     test_agent_subagent_error_notifications_remain_visible();
+    test_agent_subagent_create_think_mode_inherits_or_overrides();
+    test_agent_subagent_new_command_accepts_thinking_flag();
+    test_agent_subagent_switch_preserves_thinking_modes();
 }
 #endif

@@ -9996,6 +9996,8 @@ static void test_agent_subagent_api_lifecycle(void) {
         .name = "alpha",
         .prompt = "inspect the tests",
         .autonomy = DS_AGENT_SUBAGENT_AUTONOMY_AUTONOMOUS,
+        .think_mode = DS4_THINK_MAX,
+        .think_mode_set = true,
         .round_budget = 3,
     };
     AGENT_TEST_ASSERT(ds_agent_subagent_create(mgr, &alpha_req, &alpha) == 0);
@@ -10017,6 +10019,8 @@ static void test_agent_subagent_api_lifecycle(void) {
     AGENT_TEST_ASSERT(st[0].active);
     AGENT_TEST_ASSERT(st[0].autonomy == DS_AGENT_SUBAGENT_AUTONOMY_AUTONOMOUS);
     AGENT_TEST_ASSERT(st[0].budget_limit == 3);
+    AGENT_TEST_ASSERT(st[0].think_mode == DS4_THINK_MAX);
+    AGENT_TEST_ASSERT(st[1].think_mode == DS4_THINK_MAX);
 
     AGENT_TEST_ASSERT(ds_agent_subagent_switch(mgr, beta) == 0);
     AGENT_TEST_ASSERT(ds_agent_subagent_send(mgr, beta, "queued prompt") == 0);
@@ -10044,6 +10048,7 @@ static void test_agent_subagent_api_lifecycle(void) {
 static void test_agent_subagent_slash_command_recognition(void) {
     AGENT_TEST_ASSERT(agent_slash_command_known("/subagent"));
     AGENT_TEST_ASSERT(agent_slash_command_known("/subagent new tests run"));
+    AGENT_TEST_ASSERT(agent_slash_command_known("/subagent new --thinking off tests run"));
     AGENT_TEST_ASSERT(agent_slash_command_known("/subagent report tests"));
     AGENT_TEST_ASSERT(!agent_slash_command_known("/subagentry"));
     AGENT_TEST_ASSERT(agent_slash_command_known("/save"));

@@ -52,6 +52,8 @@ typedef struct {
     const char *name;
     const char *prompt;
     ds_agent_subagent_autonomy autonomy;
+    ds4_think_mode think_mode;
+    bool think_mode_set;
     const char *allowed_tools;
     const char *write_policy;
     int round_budget;
@@ -73,6 +75,7 @@ typedef struct {
     bool approval_blocked;
     int budget_used;
     int budget_limit;
+    ds4_think_mode think_mode;
     bool report_available;
     char stop_reason[DS_AGENT_SUBAGENT_TEXT_MAX];
 } ds_agent_subagent_status;
