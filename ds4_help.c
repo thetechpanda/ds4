@@ -292,7 +292,6 @@ static void print_agent_specific(FILE *fp, const help_colors *c) {
     opt(fp, c, "--temp-directory DIR", "Temporary file directory (default: /tmp).");
     opt(fp, c, "--web-cdp-host HOST", "Use an existing Chrome DevTools Protocol host instead of starting Chrome.");
     opt(fp, c, "--web-cdp-port N", "Use an existing Chrome DevTools Protocol port instead of starting Chrome.");
-    opt(fp, c, "--docker-allow-one-shot", "Enable one-shot docker exec for bash tools (default: disabled).");
     fputc('\n', fp);
 }
 

@@ -522,7 +522,6 @@ static agent_config parse_options(int argc, char **argv) {
         .strict_sandbox = true,
         .docker_auto = true,
         .command_output = false,
-        .docker_allow_one_shot = false,
         .preserve_agent_files = false,
     };
     if (!getcwd(c.launch_working_directory, sizeof(c.launch_working_directory))) {
@@ -566,8 +565,6 @@ static agent_config parse_options(int argc, char **argv) {
             c.strict_sandbox = false;
         } else if (!strcmp(arg, "--no-docker-auto")) {
             c.docker_auto = false;
-        } else if (!strcmp(arg, "--docker-allow-one-shot")) {
-            c.docker_allow_one_shot = true;
         } else if (!strcmp(arg, "--preserve-agent-files")) {
             c.preserve_agent_files = true;
         } else if (!strcmp(arg, "-sys") || !strcmp(arg, "--system")) {
@@ -612,8 +609,6 @@ static agent_config parse_options(int argc, char **argv) {
             c.engine.n_threads = parse_int(need_arg(&i, argc, argv, arg), arg);
         } else if (!strcmp(arg, "--chdir")) {
             c.chdir_path = need_arg(&i, argc, argv, arg);
-        } else if (!strcmp(arg, "--docker-build")) {
-            c.docker_build = need_arg(&i, argc, argv, arg);
         } else if (!strcmp(arg, "--docker-command")) {
             c.docker_command = need_arg(&i, argc, argv, arg);
         } else if (!strcmp(arg, "--docker-container")) {
@@ -6408,6 +6403,9 @@ static bool agent_docker_exec(agent_worker *w,
 static bool agent_docker_capture(const agent_config *cfg,
                                   const char *docker_command, char *const argv[],
                                   const char *op, agent_buf *out);
+static void agent_config_prepare_startup_docker_sandbox_with_streams(agent_config *cfg,
+                                                                     FILE *input,
+                                                                     FILE *output);
 static void agent_config_prepare_startup_docker_sandbox_with_input(agent_config *cfg,
                                                                    FILE *input);
 static void agent_config_prepare_startup_docker_sandbox(agent_config *cfg);
@@ -8020,7 +8018,7 @@ static bool agent_worker_remove_workspace(agent_worker *w, const char *path,
 static void worker_set_think_mode(agent_worker *w, ds4_think_mode mode);
 static ds4_think_mode worker_cycle_think_mode(agent_worker *w);
 static void build_status_text(const agent_status *st, char *buf, size_t len);
-static void build_subagent_footer_suffix(const ds_agent_subagent_status *items,
+static void build_subagent_footer_suffix(const ds4_agent_subagent_status *items,
                                          size_t n, int cols, size_t status_len,
                                          char *buf, size_t len);
 static bool linenoise_take_queued_sequence(struct linenoiseState *l,
@@ -8571,6 +8569,8 @@ static void test_agent_remove_workspace_clears_auto_allowed(void) {
 
     agent_config cfg = {.non_interactive = true};
     agent_worker w = {.cfg = &cfg};
+    AGENT_TEST_ASSERT(pipe(w.wake_fd) == 0);
+    pthread_mutex_init(&w.mu, NULL);
     agent_path_list_append(&w.working_directories, root1);
     agent_path_list_append(&w.working_directories, root2);
     AGENT_TEST_ASSERT(w.working_directories.len == 2);
@@ -8594,6 +8594,9 @@ static void test_agent_remove_workspace_clears_auto_allowed(void) {
     AGENT_TEST_ASSERT(!strcmp(w.working_directories.v[0], root2));
 
     /* Clean up. */
+    close(w.wake_fd[0]);
+    close(w.wake_fd[1]);
+    pthread_mutex_destroy(&w.mu);
     agent_path_list_free(&w.working_directories);
     agent_path_list_free(&w.auto_allowed_paths);
     rmdir(root1_tmp);
@@ -8714,18 +8717,18 @@ static void test_agent_status_footer_thinking_mode_updates(void) {
 }
 
 static void test_agent_status_footer_subagent_badges(void) {
-    ds_agent_subagent_status items[3];
+    ds4_agent_subagent_status items[3];
     memset(items, 0, sizeof(items));
     snprintf(items[0].name, sizeof(items[0].name), "%s", "alpha");
     items[0].queued_output_bytes = 12;
-    items[0].state = DS_AGENT_SUBAGENT_STATE_RUNNING;
+    items[0].state = DS4_AGENT_SUBAGENT_STATE_RUNNING;
     snprintf(items[1].name, sizeof(items[1].name), "%s", "beta");
     items[1].queued_output_bytes = 5;
-    items[1].state = DS_AGENT_SUBAGENT_STATE_WAITING_MODEL;
+    items[1].state = DS4_AGENT_SUBAGENT_STATE_WAITING_MODEL;
     items[1].approval_blocked = true;
     snprintf(items[2].name, sizeof(items[2].name), "%s", "gamma");
     items[2].queued_output_bytes = 0;
-    items[2].state = DS_AGENT_SUBAGENT_STATE_ERROR;
+    items[2].state = DS4_AGENT_SUBAGENT_STATE_ERROR;
 
     char suffix[512];
     build_subagent_footer_suffix(items, 3, 200, 32, suffix, sizeof(suffix));
@@ -8735,14 +8738,14 @@ static void test_agent_status_footer_subagent_badges(void) {
 }
 
 static void test_agent_status_footer_subagent_badge_truncation(void) {
-    ds_agent_subagent_status items[2];
+    ds4_agent_subagent_status items[2];
     memset(items, 0, sizeof(items));
     snprintf(items[0].name, sizeof(items[0].name), "%s", "alpha");
     items[0].queued_output_bytes = 12;
-    items[0].state = DS_AGENT_SUBAGENT_STATE_RUNNING;
+    items[0].state = DS4_AGENT_SUBAGENT_STATE_RUNNING;
     snprintf(items[1].name, sizeof(items[1].name), "%s", "beta");
     items[1].queued_output_bytes = 3456;
-    items[1].state = DS_AGENT_SUBAGENT_STATE_WAITING_MODEL;
+    items[1].state = DS4_AGENT_SUBAGENT_STATE_WAITING_MODEL;
 
     char suffix[512];
     build_subagent_footer_suffix(items, 2, 60, 30, suffix, sizeof(suffix));
@@ -9002,6 +9005,32 @@ static void test_agent_docker_shell_start_rejects_unavailable_docker(void) {
     AGENT_TEST_ASSERT(!w.docker_shell.active);
 }
 
+static char *test_agent_startup_docker_capture_output(agent_config *cfg,
+                                                      const char *input_text) {
+    FILE *input = tmpfile();
+    FILE *output = tmpfile();
+    AGENT_TEST_ASSERT(output != NULL);
+    if (input_text) {
+        AGENT_TEST_ASSERT(input != NULL);
+        AGENT_TEST_ASSERT(fputs(input_text, input) >= 0);
+        rewind(input);
+    }
+
+    agent_config_prepare_startup_docker_sandbox_with_streams(cfg, input, output);
+
+    if (input) fclose(input);
+    fflush(output);
+    rewind(output);
+
+    agent_buf captured = {0};
+    char chunk[256];
+    size_t nread = 0;
+    while ((nread = fread(chunk, 1, sizeof(chunk), output)) > 0)
+        agent_buf_append_full(&captured, chunk, nread);
+    fclose(output);
+    return agent_buf_take(&captured);
+}
+
 static void test_agent_startup_docker_prompt_skip_leaves_no_active_sandbox(void) {
     agent_fake_docker_env env;
     agent_test_fake_docker_setup(&env, "alpha\nbeta\n", "running\n", false);
@@ -9011,15 +9040,14 @@ static void test_agent_startup_docker_prompt_skip_leaves_no_active_sandbox(void)
     cfg.docker_auto = true;
     cfg.docker_command = env.docker_path;
 
-    FILE *input = tmpfile();
-    AGENT_TEST_ASSERT(input != NULL);
-    AGENT_TEST_ASSERT(fputs("n\n", input) >= 0);
-    rewind(input);
-    agent_config_prepare_startup_docker_sandbox_with_input(&cfg, input);
-    fclose(input);
+    char *captured = test_agent_startup_docker_capture_output(&cfg, "n\n");
 
     AGENT_TEST_ASSERT(cfg.docker_container == NULL);
     AGENT_TEST_ASSERT(cfg.docker_image == NULL);
+    AGENT_TEST_ASSERT(captured != NULL);
+    AGENT_TEST_ASSERT(strstr(captured, "Select docker sandbox for this launch:") != NULL);
+    AGENT_TEST_ASSERT(strstr(captured, "Choose 1-2 or n/skip:") != NULL);
+    free(captured);
     agent_test_fake_docker_cleanup(&env);
 }
 
@@ -9033,12 +9061,14 @@ static void test_agent_startup_docker_noninteractive_autoloads_first_sandbox(voi
     cfg.non_interactive = true;
     cfg.docker_command = env.docker_path;
 
-    agent_config_prepare_startup_docker_sandbox(&cfg);
+    char *captured = test_agent_startup_docker_capture_output(&cfg, NULL);
 
     AGENT_TEST_ASSERT(cfg.docker_container != NULL);
     AGENT_TEST_ASSERT(!strcmp(cfg.docker_container, "alpha"));
     AGENT_TEST_ASSERT(cfg.docker_image != NULL);
     AGENT_TEST_ASSERT(!strcmp(cfg.docker_image, "image"));
+    AGENT_TEST_ASSERT(captured == NULL || strstr(captured, "Select docker sandbox for this launch:") == NULL);
+    free(captured);
     agent_test_fake_docker_cleanup(&env);
 }
 
@@ -9051,17 +9081,15 @@ static void test_agent_startup_docker_prompt_selects_running_sandbox(void) {
     cfg.docker_auto = true;
     cfg.docker_command = env.docker_path;
 
-    FILE *input = tmpfile();
-    AGENT_TEST_ASSERT(input != NULL);
-    AGENT_TEST_ASSERT(fputs("1\n", input) >= 0);
-    rewind(input);
-    agent_config_prepare_startup_docker_sandbox_with_input(&cfg, input);
-    fclose(input);
+    char *captured = test_agent_startup_docker_capture_output(&cfg, "1\n");
 
     AGENT_TEST_ASSERT(cfg.docker_container != NULL);
     AGENT_TEST_ASSERT(!strcmp(cfg.docker_container, "alpha"));
     AGENT_TEST_ASSERT(cfg.docker_image != NULL);
     AGENT_TEST_ASSERT(!strcmp(cfg.docker_image, "image"));
+    AGENT_TEST_ASSERT(captured != NULL);
+    AGENT_TEST_ASSERT(strstr(captured, "Select docker sandbox for this launch:") != NULL);
+    free(captured);
     agent_test_fake_docker_cleanup(&env);
 }
 
@@ -9074,15 +9102,12 @@ static void test_agent_startup_docker_prompt_starts_stopped_sandbox(void) {
     cfg.docker_auto = true;
     cfg.docker_command = env.docker_path;
 
-    FILE *input = tmpfile();
-    AGENT_TEST_ASSERT(input != NULL);
-    AGENT_TEST_ASSERT(fputs("1\n", input) >= 0);
-    rewind(input);
-    agent_config_prepare_startup_docker_sandbox_with_input(&cfg, input);
-    fclose(input);
+    char *captured = test_agent_startup_docker_capture_output(&cfg, "1\n");
 
     AGENT_TEST_ASSERT(cfg.docker_container != NULL);
     AGENT_TEST_ASSERT(!strcmp(cfg.docker_container, "alpha"));
+    AGENT_TEST_ASSERT(captured != NULL);
+    AGENT_TEST_ASSERT(strstr(captured, "Select docker sandbox for this launch:") != NULL);
     FILE *fp = fopen(env.state_path, "r");
     AGENT_TEST_ASSERT(fp != NULL);
     if (fp) {
@@ -9091,6 +9116,7 @@ static void test_agent_startup_docker_prompt_starts_stopped_sandbox(void) {
         AGENT_TEST_ASSERT(!strcmp(buf, "running\n"));
         fclose(fp);
     }
+    free(captured);
     agent_test_fake_docker_cleanup(&env);
 }
 
@@ -9103,15 +9129,13 @@ static void test_agent_startup_docker_activation_failure_leaves_no_sandbox(void)
     cfg.docker_auto = true;
     cfg.docker_command = env.docker_path;
 
-    FILE *input = tmpfile();
-    AGENT_TEST_ASSERT(input != NULL);
-    AGENT_TEST_ASSERT(fputs("1\n", input) >= 0);
-    rewind(input);
-    agent_config_prepare_startup_docker_sandbox_with_input(&cfg, input);
-    fclose(input);
+    char *captured = test_agent_startup_docker_capture_output(&cfg, "1\n");
 
     AGENT_TEST_ASSERT(cfg.docker_container == NULL);
     AGENT_TEST_ASSERT(cfg.docker_image == NULL);
+    AGENT_TEST_ASSERT(captured != NULL);
+    AGENT_TEST_ASSERT(strstr(captured, "startup docker sandbox activation failed:") != NULL);
+    free(captured);
     agent_test_fake_docker_cleanup(&env);
 }
 
@@ -9423,7 +9447,7 @@ static void test_agent_docker_shell_exec_argv_debug_publish(void) {
 
     agent_config cfg = {.docker_debug = true};
     agent_worker w = {0};
-    w.cfg = &cfg;
+     w.cfg = &cfg;
     w.docker_shell.stdin_fd = stdin_pipe[1];
     w.docker_shell.stdout_fd = stdout_pipe[0];
     w.docker_shell.pid = child;
@@ -9432,6 +9456,7 @@ static void test_agent_docker_shell_exec_argv_debug_publish(void) {
     pthread_mutex_init(&w.mu, NULL);
     pthread_cond_init(&w.cond, NULL);
     pthread_mutex_init(&w.docker_shell.mu, NULL);
+    AGENT_TEST_ASSERT(pipe(w.wake_fd) == 0);
 
     char *const argv[] = {
         (char *)"cat",
@@ -9449,6 +9474,8 @@ static void test_agent_docker_shell_exec_argv_debug_publish(void) {
 
     free(out.ptr);
     free(w.out);
+    close(w.wake_fd[0]);
+    close(w.wake_fd[1]);
     close(stdin_pipe[1]);
     close(stdout_pipe[0]);
     kill(child, SIGKILL);
@@ -9984,65 +10011,65 @@ static void test_agent_docker_effective_working_directory_prefers_primary_root(v
 }
 
 static void test_agent_subagent_api_lifecycle(void) {
-    ds_agent_subagents *mgr = NULL;
-    ds_agent_subagent_options opt = {
+    ds4_agent_subagents *mgr = NULL;
+    ds4_agent_subagent_options opt = {
         .default_context_size = 4096,
         .default_round_budget = 7,
     };
-    AGENT_TEST_ASSERT(ds_agent_subagents_create(&mgr, NULL, &opt) == 0);
+    AGENT_TEST_ASSERT(ds4_agent_subagents_create(&mgr, NULL, &opt) == 0);
 
-    ds_agent_subagent_id alpha = {0};
-    ds_agent_subagent_create_request alpha_req = {
+    ds4_agent_subagent_id alpha = {0};
+    ds4_agent_subagent_create_request alpha_req = {
         .name = "alpha",
         .prompt = "inspect the tests",
-        .autonomy = DS_AGENT_SUBAGENT_AUTONOMY_AUTONOMOUS,
+        .autonomy = DS4_AGENT_SUBAGENT_AUTONOMY_AUTONOMOUS,
         .think_mode = DS4_THINK_MAX,
         .think_mode_set = true,
         .round_budget = 3,
     };
-    AGENT_TEST_ASSERT(ds_agent_subagent_create(mgr, &alpha_req, &alpha) == 0);
+    AGENT_TEST_ASSERT(ds4_agent_subagent_create(mgr, &alpha_req, &alpha) == 0);
     AGENT_TEST_ASSERT(alpha.value == 1);
 
-    ds_agent_subagent_id beta = {0};
-    ds_agent_subagent_create_request beta_req = {
+    ds4_agent_subagent_id beta = {0};
+    ds4_agent_subagent_create_request beta_req = {
         .name = "beta",
-        .autonomy = DS_AGENT_SUBAGENT_AUTONOMY_TAB,
+        .autonomy = DS4_AGENT_SUBAGENT_AUTONOMY_TAB,
     };
-    AGENT_TEST_ASSERT(ds_agent_subagent_create(mgr, &beta_req, &beta) == 0);
+    AGENT_TEST_ASSERT(ds4_agent_subagent_create(mgr, &beta_req, &beta) == 0);
     AGENT_TEST_ASSERT(beta.value == 2);
 
-    ds_agent_subagent_status st[4];
+    ds4_agent_subagent_status st[4];
     size_t n = 0;
-    AGENT_TEST_ASSERT(ds_agent_subagent_list(mgr, st, 4, &n) == 0);
+    AGENT_TEST_ASSERT(ds4_agent_subagent_list(mgr, st, 4, &n) == 0);
     AGENT_TEST_ASSERT(n == 2);
     AGENT_TEST_ASSERT(!strcmp(st[0].name, "alpha"));
     AGENT_TEST_ASSERT(st[0].active);
-    AGENT_TEST_ASSERT(st[0].autonomy == DS_AGENT_SUBAGENT_AUTONOMY_AUTONOMOUS);
+    AGENT_TEST_ASSERT(st[0].autonomy == DS4_AGENT_SUBAGENT_AUTONOMY_AUTONOMOUS);
     AGENT_TEST_ASSERT(st[0].budget_limit == 3);
     AGENT_TEST_ASSERT(st[0].think_mode == DS4_THINK_MAX);
     AGENT_TEST_ASSERT(st[1].think_mode == DS4_THINK_MAX);
 
-    AGENT_TEST_ASSERT(ds_agent_subagent_switch(mgr, beta) == 0);
-    AGENT_TEST_ASSERT(ds_agent_subagent_send(mgr, beta, "queued prompt") == 0);
-    AGENT_TEST_ASSERT(ds_agent_subagent_stop(mgr, alpha) == 0);
+    AGENT_TEST_ASSERT(ds4_agent_subagent_switch(mgr, beta) == 0);
+    AGENT_TEST_ASSERT(ds4_agent_subagent_send(mgr, beta, "queued prompt") == 0);
+    AGENT_TEST_ASSERT(ds4_agent_subagent_stop(mgr, alpha) == 0);
 
     char report[256];
-    AGENT_TEST_ASSERT(ds_agent_subagent_report(mgr, alpha,
+    AGENT_TEST_ASSERT(ds4_agent_subagent_report(mgr, alpha,
                                                report, sizeof(report)) == 0);
     AGENT_TEST_ASSERT(strstr(report, "No subagent report") != NULL);
-    AGENT_TEST_ASSERT(ds_agent_subagent_import_report(mgr, alpha, beta) == 0);
+    AGENT_TEST_ASSERT(ds4_agent_subagent_import_report(mgr, alpha, beta) == 0);
 
-    ds_agent_subagent_event ev;
-    AGENT_TEST_ASSERT(ds_agent_subagent_poll_event(mgr, &ev) == 1);
-    AGENT_TEST_ASSERT(ev.type == DS_AGENT_SUBAGENT_EVENT_CREATED);
+    ds4_agent_subagent_event ev;
+    AGENT_TEST_ASSERT(ds4_agent_subagent_poll_event(mgr, &ev) == 1);
+    AGENT_TEST_ASSERT(ev.type == DS4_AGENT_SUBAGENT_EVENT_CREATED);
     AGENT_TEST_ASSERT(!strcmp(ev.name, "alpha"));
 
-    AGENT_TEST_ASSERT(ds_agent_subagent_close(mgr, alpha) == 0);
-    AGENT_TEST_ASSERT(ds_agent_subagent_list(mgr, st, 4, &n) == 0);
+    AGENT_TEST_ASSERT(ds4_agent_subagent_close(mgr, alpha) == 0);
+    AGENT_TEST_ASSERT(ds4_agent_subagent_list(mgr, st, 4, &n) == 0);
     AGENT_TEST_ASSERT(n == 1);
     AGENT_TEST_ASSERT(!strcmp(st[0].name, "beta"));
     AGENT_TEST_ASSERT(st[0].active);
-    ds_agent_subagents_destroy(mgr);
+    ds4_agent_subagents_destroy(mgr);
 }
 
 static void test_agent_subagent_slash_command_recognition(void) {
@@ -10115,7 +10142,7 @@ static void ds4_agent_unit_tests_run(void) {
     test_agent_tool_list_shell_argv_quoting();
     test_agent_subagent_api_lifecycle();
     test_agent_subagent_slash_command_recognition();
-    ds_agent_subagent_unit_tests_run();
+    ds4_agent_subagent_unit_tests_run();
     test_agent_worker_model_gate_serializes();
 }
 #endif
@@ -11051,7 +11078,7 @@ static bool agent_tool_requires_docker_sandbox(const agent_worker *w,
 }
 
 static char *agent_tool_sandbox_required_error(void) {
-    return xstrdup("sandbox not set, /no_string_sandbox to disable this error\n");
+    return xstrdup("sandbox not set, /no_strict_sandbox to disable this error\n");
 }
 
 static void agent_buf_append_shell_quoted(agent_buf *b, const char *s) {
@@ -13486,20 +13513,20 @@ static void build_status_text(const agent_status *st, char *buf, size_t len) {
     }
 }
 
-static const char *agent_subagent_footer_state(const ds_agent_subagent_status *st) {
+static const char *agent_subagent_footer_state(const ds4_agent_subagent_status *st) {
     if (!st) return "idle";
     if (st->approval_blocked) return "approval";
     switch (st->state) {
-    case DS_AGENT_SUBAGENT_STATE_RUNNING: return "working";
-    case DS_AGENT_SUBAGENT_STATE_WAITING_MODEL: return "waiting";
-    case DS_AGENT_SUBAGENT_STATE_APPROVAL_BLOCKED: return "approval";
-    case DS_AGENT_SUBAGENT_STATE_ERROR: return "error";
-    case DS_AGENT_SUBAGENT_STATE_STOPPED: return "stopped";
+    case DS4_AGENT_SUBAGENT_STATE_RUNNING: return "working";
+    case DS4_AGENT_SUBAGENT_STATE_WAITING_MODEL: return "waiting";
+    case DS4_AGENT_SUBAGENT_STATE_APPROVAL_BLOCKED: return "approval";
+    case DS4_AGENT_SUBAGENT_STATE_ERROR: return "error";
+    case DS4_AGENT_SUBAGENT_STATE_STOPPED: return "stopped";
     default: return "idle";
     }
 }
 
-static void build_subagent_footer_suffix(const ds_agent_subagent_status *items,
+static void build_subagent_footer_suffix(const ds4_agent_subagent_status *items,
                                          size_t n, int cols, size_t status_len,
                                          char *buf, size_t len) {
     if (len == 0) return;
@@ -13714,7 +13741,7 @@ static void build_writable_footer_suffix(const agent_status *st, int cols,
 
 /* Build the editable footer.  With queued prompts, the footer becomes multiple
  * rows: a compact queue preview first, then the normal status row. */
-static void build_footer_text(const agent_status *st, ds_agent_subagents *subagents,
+static void build_footer_text(const agent_status *st, ds4_agent_subagents *subagents,
                               const agent_prompt_queue *queue, int cols,
                               char *buf, size_t len) {
     char status[512];
@@ -13726,9 +13753,9 @@ static void build_footer_text(const agent_status *st, ds_agent_subagents *subage
     badges[0] = '\0';
     if (subagents) {
         size_t n = 0;
-        if (ds_agent_subagent_list(subagents, NULL, 0, &n) == 0 && n > 0) {
-            ds_agent_subagent_status *items = xmalloc(n * sizeof(items[0]));
-            if (ds_agent_subagent_list(subagents, items, n, &n) == 0)
+        if (ds4_agent_subagent_list(subagents, NULL, 0, &n) == 0 && n > 0) {
+            ds4_agent_subagent_status *items = xmalloc(n * sizeof(items[0]));
+            if (ds4_agent_subagent_list(subagents, items, n, &n) == 0)
                 build_subagent_footer_suffix(items, n, cols, strlen(status),
                                              badges, sizeof(badges));
             free(items);
@@ -14978,6 +15005,7 @@ static bool agent_docker_activate_named_sandbox(agent_worker *w,
 static bool agent_prompt_startup_docker_sandbox(agent_config *cfg,
                                                 const char *docker_command,
                                                 FILE *input,
+                                                FILE *output,
                                                 char *choice,
                                                 size_t choice_len) {
     if (choice && choice_len > 0) choice[0] = '\0';
@@ -15013,16 +15041,17 @@ static bool agent_prompt_startup_docker_sandbox(agent_config *cfg,
     free(out.ptr);
     if (count <= 0) return false;
 
-    printf("Select docker sandbox for this launch:\n");
+    FILE *out_stream = output ? output : stdout;
+    fprintf(out_stream, "Select docker sandbox for this launch:\n");
     for (int i = 0; i < count; i++)
-        printf("  %d) %s (%s)\n", i + 1, options[i], states[i]);
-    printf("  n) none for this launch\n");
-    fflush(stdout);
+        fprintf(out_stream, "  %d) %s (%s)\n", i + 1, options[i], states[i]);
+    fprintf(out_stream, "  n) none for this launch\n");
+    fflush(out_stream);
 
     char buf[32];
     for (;;) {
-        printf("Choose 1-%d or n/skip: ", count);
-        fflush(stdout);
+        fprintf(out_stream, "Choose 1-%d or n/skip: ", count);
+        fflush(out_stream);
         FILE *in = input ? input : stdin;
         int input_fd = input ? fileno(input) : STDIN_FILENO;
         int saved_flags = fcntl(input_fd, F_GETFL, 0);
@@ -15054,8 +15083,9 @@ static bool agent_prompt_startup_docker_sandbox(agent_config *cfg,
  * container has been validated and is running.
  * Callers: main(); startup tests exercise prompt, skip, stopped-start, and
  * failure behavior through this helper. */
-static void agent_config_prepare_startup_docker_sandbox_with_input(agent_config *cfg,
-                                                                   FILE *input) {
+static void agent_config_prepare_startup_docker_sandbox_with_streams(agent_config *cfg,
+                                                                     FILE *input,
+                                                                     FILE *output) {
     if (!cfg) return;
     if (!agent_docker_feature_available_cfg(cfg)) return;
     const char *docker_command =
@@ -15080,7 +15110,7 @@ static void agent_config_prepare_startup_docker_sandbox_with_input(agent_config 
             }
             free(out.ptr);
         } else if (agent_prompt_startup_docker_sandbox(cfg, docker_command,
-                                                       input, chosen,
+                                                       input, output, chosen,
                                                        sizeof(chosen))) {
             target = chosen;
         } else {
@@ -15092,14 +15122,20 @@ static void agent_config_prepare_startup_docker_sandbox_with_input(agent_config 
     char err[256];
     if (!agent_docker_activate_named_sandbox(NULL, cfg, target, false,
                                              err, sizeof(err))) {
-        printf("startup docker sandbox activation failed: %s\n", err);
+        FILE *out_stream = output ? output : stdout;
+        fprintf(out_stream, "startup docker sandbox activation failed: %s\n", err);
         cfg->docker_container = NULL;
         cfg->docker_image = NULL;
     }
 }
 
+static void agent_config_prepare_startup_docker_sandbox_with_input(agent_config *cfg,
+                                                                   FILE *input) {
+    agent_config_prepare_startup_docker_sandbox_with_streams(cfg, input, stdout);
+}
+
 static void agent_config_prepare_startup_docker_sandbox(agent_config *cfg) {
-    agent_config_prepare_startup_docker_sandbox_with_input(cfg, stdin);
+    agent_config_prepare_startup_docker_sandbox_with_streams(cfg, stdin, stdout);
 }
 
 /* What: worker-scoped wrapper for Docker feature availability.
@@ -16582,17 +16618,17 @@ static void test_agent_worker_model_gate_serializes(void) {
  * terminal writes go through editor_write_async() so linenoise, status footer,
  * model output, and tool output never race each other. */
 static int run_agent(ds4_engine *engine, agent_config *cfg) {
-    ds_agent_subagents *subagents = NULL;
-    if (ds_agent_subagents_create_for_agent(&subagents, engine, cfg) != 0) {
+    ds4_agent_subagents *subagents = NULL;
+    if (ds4_agent_subagents_create_for_agent(&subagents, engine, cfg) != 0) {
         fprintf(stderr, "ds4-agent: %s\n",
-                ds_agent_subagents_last_error(subagents));
-        ds_agent_subagents_destroy(subagents);
+                ds4_agent_subagents_last_error(subagents));
+        ds4_agent_subagents_destroy(subagents);
         return 1;
     }
-    agent_worker *worker_ptr = ds_agent_subagents_active_worker(subagents);
-    agent_prompt_queue *queue_ptr = ds_agent_subagents_active_queue(subagents);
+    agent_worker *worker_ptr = ds4_agent_subagents_active_worker(subagents);
+    agent_prompt_queue *queue_ptr = ds4_agent_subagents_active_queue(subagents);
     if (!worker_ptr || !queue_ptr) {
-        ds_agent_subagents_destroy(subagents);
+        ds4_agent_subagents_destroy(subagents);
         return 1;
     }
 #define worker (*worker_ptr)
@@ -16612,7 +16648,7 @@ static int run_agent(ds4_engine *engine, agent_config *cfg) {
     agent_completion_worker = &worker;
     linenoiseSetCompletionCallback(agent_switch_completion_callback);
 
-    ds_agent_subagents_update_worker_metadata(subagents);
+    ds4_agent_subagents_update_worker_metadata(subagents);
     agent_status st;
     worker_get_status(&worker, &st);
     char prompt[160];
@@ -16623,7 +16659,7 @@ static int run_agent(ds4_engine *engine, agent_config *cfg) {
     agent_editor editor = {0};
     if (editor_start(&editor, prompt, statusline, NULL) != 0) {
         fprintf(stderr, "ds4-agent: failed to start line editor\n");
-        ds_agent_subagents_destroy(subagents);
+        ds4_agent_subagents_destroy(subagents);
         return 1;
     }
     editor_write_welcome_banner(&editor, cfg, prompt, statusline);
@@ -16637,22 +16673,22 @@ static int run_agent(ds4_engine *engine, agent_config *cfg) {
     bool force_status_redraw_after_restart = false;
     char *restore_line = NULL;
     while (running) {
-        ds_agent_subagents_update_worker_metadata(subagents);
-        worker_ptr = ds_agent_subagents_active_worker(subagents);
-        queue_ptr = ds_agent_subagents_active_queue(subagents);
+        ds4_agent_subagents_update_worker_metadata(subagents);
+        worker_ptr = ds4_agent_subagents_active_worker(subagents);
+        queue_ptr = ds4_agent_subagents_active_queue(subagents);
         if (!worker_ptr || !queue_ptr) break;
         agent_completion_worker = worker_ptr;
         /* If a bash child process changed the terminal mode (e.g., from raw
          * to cooked), restore raw mode so linenoise continues to work. */
-        if (ds_agent_subagents_check_raw_mode_restore(subagents)) {
+        if (ds4_agent_subagents_check_raw_mode_restore(subagents)) {
             linenoiseRestoreRawMode();
         }
-        size_t subagent_fds = ds_agent_subagents_worker_count(subagents);
+        size_t subagent_fds = ds4_agent_subagents_worker_count(subagents);
         struct pollfd *pfd = xmalloc((1 + subagent_fds) * sizeof(pfd[0]));
         pfd[0] = (struct pollfd){.fd = STDIN_FILENO, .events = POLLIN};
         for (size_t i = 0; i < subagent_fds; i++) {
             pfd[1 + i] = (struct pollfd){
-                .fd = ds_agent_subagents_worker_fd_at(subagents, i),
+                .fd = ds4_agent_subagents_worker_fd_at(subagents, i),
                 .events = POLLIN,
             };
         }
@@ -16692,13 +16728,13 @@ static int run_agent(ds4_engine *engine, agent_config *cfg) {
         }
 
         if (rc > 0)
-            ds_agent_subagents_drain_wake_fds(subagents, pfd + 1, subagent_fds);
+            ds4_agent_subagents_drain_wake_fds(subagents, pfd + 1, subagent_fds);
         free(pfd);
 
         char *out = NULL;
         size_t out_len = 0;
         char *notifications = NULL;
-        ds_agent_subagents_drain_outputs(subagents, &out, &out_len, &st,
+        ds4_agent_subagents_drain_outputs(subagents, &out, &out_len, &st,
                                          &notifications);
         build_prompt_text(&st, prompt, sizeof(prompt));
         int footer_cols = editor.edit.cols > 0 ? (int)editor.edit.cols : 80;
@@ -16734,13 +16770,13 @@ static int run_agent(ds4_engine *engine, agent_config *cfg) {
         free(notifications);
         free(out);
 
-        if (ds_agent_subagents_take_queued_user_drain(subagents)) {
+        if (ds4_agent_subagents_take_queued_user_drain(subagents)) {
             continue;
         }
 
         char web_approval_msg[256];
-        ds_agent_subagent_id web_approval_id = {0};
-        if (ds_agent_subagents_take_web_approval(subagents, &web_approval_id,
+        ds4_agent_subagent_id web_approval_id = {0};
+        if (ds4_agent_subagents_take_web_approval(subagents, &web_approval_id,
                                                  web_approval_msg,
                                                  sizeof(web_approval_msg)))
         {
@@ -16757,11 +16793,11 @@ static int run_agent(ds4_engine *engine, agent_config *cfg) {
             bool allow = agent_prompt_yes_no_ex(web_approval_msg,
                                                 &approval_opts,
                                                 &approval_timed_out);
-            ds_agent_subagents_answer_web_approval(subagents, web_approval_id,
+            ds4_agent_subagents_answer_web_approval(subagents, web_approval_id,
                 allow,
                 approval_timed_out ? "Chrome browser start approval timed out" : NULL);
-            worker_ptr = ds_agent_subagents_active_worker(subagents);
-            queue_ptr = ds_agent_subagents_active_queue(subagents);
+            worker_ptr = ds4_agent_subagents_active_worker(subagents);
+            queue_ptr = ds4_agent_subagents_active_queue(subagents);
             worker_get_status(&worker, &st);
             build_prompt_text(&st, prompt, sizeof(prompt));
             int restart_cols = editor.edit.cols > 0 ? (int)editor.edit.cols : 80;
@@ -16774,8 +16810,8 @@ static int run_agent(ds4_engine *engine, agent_config *cfg) {
         char path_approval_msg[PATH_MAX + 256];
         char path_approval_options[3][PATH_MAX];
         int path_approval_option_count = 0;
-        ds_agent_subagent_id path_approval_id = {0};
-        if (ds_agent_subagents_take_path_approval(subagents, &path_approval_id,
+        ds4_agent_subagent_id path_approval_id = {0};
+        if (ds4_agent_subagents_take_path_approval(subagents, &path_approval_id,
                                                   path_approval_msg,
                                                   sizeof(path_approval_msg),
                                                   path_approval_options,
@@ -16791,11 +16827,11 @@ static int run_agent(ds4_engine *engine, agent_config *cfg) {
             bool allow = agent_prompt_working_directory_choice(
                 path_approval_msg, path_approval_options,
                 path_approval_option_count, approved_dir, &approval_timed_out);
-            ds_agent_subagents_answer_path_approval(subagents, path_approval_id,
+            ds4_agent_subagents_answer_path_approval(subagents, path_approval_id,
                 allow, approved_dir,
                 approval_timed_out ? "working directory approval timed out" : NULL);
-            worker_ptr = ds_agent_subagents_active_worker(subagents);
-            queue_ptr = ds_agent_subagents_active_queue(subagents);
+            worker_ptr = ds4_agent_subagents_active_worker(subagents);
+            queue_ptr = ds4_agent_subagents_active_queue(subagents);
             worker_get_status(&worker, &st);
             build_prompt_text(&st, prompt, sizeof(prompt));
             int restart_cols = editor.edit.cols > 0 ? (int)editor.edit.cols : 80;
@@ -16805,9 +16841,9 @@ static int run_agent(ds4_engine *engine, agent_config *cfg) {
             continue;
         }
 
-        ds_agent_subagents_submit_ready(subagents);
-        worker_ptr = ds_agent_subagents_active_worker(subagents);
-        queue_ptr = ds_agent_subagents_active_queue(subagents);
+        ds4_agent_subagents_submit_ready(subagents);
+        worker_ptr = ds4_agent_subagents_active_worker(subagents);
+        queue_ptr = ds4_agent_subagents_active_queue(subagents);
         if (!worker_ptr || !queue_ptr) break;
 
         if (initial_pending && worker_is_idle(&worker)) {
@@ -17159,16 +17195,9 @@ static int run_agent(ds4_engine *engine, agent_config *cfg) {
                         for (int i = 0; i < n; i++) free(paths[i]);
                         free(paths);
                     }
-                } else if (ds_agent_subagents_handle_command(subagents, cmd, busy)) {
-                    worker_ptr = ds_agent_subagents_active_worker(subagents);
-                    queue_ptr = ds_agent_subagents_active_queue(subagents);
-                    char *replay = ds_agent_subagents_take_active_replay(subagents);
-                    if (replay) {
-                        printf("%s", replay);
-                        if (replay[0] && replay[strlen(replay) - 1] != '\n')
-                            printf("\n");
-                        free(replay);
-                    }
+                } else if (ds4_agent_subagents_handle_command(subagents, cmd, busy)) {
+                    worker_ptr = ds4_agent_subagents_active_worker(subagents);
+                    queue_ptr = ds4_agent_subagents_active_queue(subagents);
                 } else if (cmd[0] == '/' && !agent_slash_command_known(cmd)) {
                     ssize_t ignored = write(STDOUT_FILENO, "\a", 1);
                     (void)ignored;
@@ -17319,13 +17348,13 @@ static int run_agent(ds4_engine *engine, agent_config *cfg) {
     editor_restore_terminal_layout(&editor);
     linenoiseSetCompletionCallback(NULL);
     agent_completion_worker = NULL;
-    worker_ptr = ds_agent_subagents_active_worker(subagents);
+    worker_ptr = ds4_agent_subagents_active_worker(subagents);
     if (!exit_save_handled && worker_ptr) {
         agent_exit_save_result exit_save =
             agent_maybe_save_before_exiting(&worker);
         if (exit_save == AGENT_EXIT_NOW) exit(0);
     }
-    ds_agent_subagents_destroy(subagents);
+    ds4_agent_subagents_destroy(subagents);
 #undef queue
 #undef worker
     return 0;

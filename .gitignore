@@ -17,4 +17,5 @@ __pycache__/
 .*.swp
 .DS_Store
 /ds4_agent_test
-tasks/prompt_processing_review
+openspec/
+.codex/

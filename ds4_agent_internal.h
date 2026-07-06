@@ -3,7 +3,7 @@
 
 #include "ds4.h"
 #include "ds4_web.h"
-#include "ds_agent_subagent.h"
+#include "ds4_agent_subagent.h"
 
 #include <limits.h>
 #include <pthread.h>
@@ -39,7 +39,6 @@ typedef struct {
     ds4_engine_options engine;
     agent_generation_options gen;
     const char *chdir_path;
-    const char *docker_build;
     const char *docker_command;
     const char *docker_container;
     const char *docker_image;
@@ -56,7 +55,6 @@ typedef struct {
     bool strict_sandbox;
     bool docker_auto;
     bool command_output;
-    bool docker_allow_one_shot;
     volatile bool preserve_agent_files;
 } agent_config;
 
@@ -86,7 +84,7 @@ typedef struct {
     int ctx_size;
     int power_percent;
     uint64_t session_id;
-    char session_name[DS_AGENT_SUBAGENT_NAME_MAX];
+    char session_name[DS4_AGENT_SUBAGENT_NAME_MAX];
     int background_sessions;
     int unread_sessions;
     char error[256];
@@ -175,9 +173,9 @@ struct agent_worker {
     int model_tool_round_budget;
     int model_tool_round_used;
     bool subagents_disabled;
-    char autonomy_stop_reason[DS_AGENT_SUBAGENT_TEXT_MAX];
+    char autonomy_stop_reason[DS4_AGENT_SUBAGENT_TEXT_MAX];
     uint64_t session_slot_id;
-    char session_slot_name[DS_AGENT_SUBAGENT_NAME_MAX];
+    char session_slot_name[DS4_AGENT_SUBAGENT_NAME_MAX];
     int background_sessions;
     int unread_sessions;
 };
@@ -243,46 +241,46 @@ bool worker_take_queued_user_drain_request(agent_worker *w);
 void worker_answer_queued_user_drain(agent_worker *w, char *text);
 void drain_wake_fd(int fd);
 
-int ds_agent_subagents_create_for_agent(ds_agent_subagents **out,
+int ds4_agent_subagents_create_for_agent(ds4_agent_subagents **out,
                                         ds4_engine *engine,
                                         const agent_config *cfg);
-agent_worker *ds_agent_subagents_active_worker(ds_agent_subagents *mgr);
-void ds_agent_subagents_update_worker_metadata(ds_agent_subagents *mgr);
-agent_prompt_queue *ds_agent_subagents_active_queue(ds_agent_subagents *mgr);
-size_t ds_agent_subagents_worker_count(ds_agent_subagents *mgr);
-int ds_agent_subagents_worker_fd_at(ds_agent_subagents *mgr, size_t worker_idx);
-void ds_agent_subagents_drain_wake_fds(ds_agent_subagents *mgr,
+agent_worker *ds4_agent_subagents_active_worker(ds4_agent_subagents *mgr);
+void ds4_agent_subagents_update_worker_metadata(ds4_agent_subagents *mgr);
+agent_prompt_queue *ds4_agent_subagents_active_queue(ds4_agent_subagents *mgr);
+size_t ds4_agent_subagents_worker_count(ds4_agent_subagents *mgr);
+int ds4_agent_subagents_worker_fd_at(ds4_agent_subagents *mgr, size_t worker_idx);
+void ds4_agent_subagents_drain_wake_fds(ds4_agent_subagents *mgr,
                                        struct pollfd *pfd,
                                        size_t count);
-bool ds_agent_subagents_check_raw_mode_restore(ds_agent_subagents *mgr);
-void ds_agent_subagents_drain_outputs(ds_agent_subagents *mgr,
+bool ds4_agent_subagents_check_raw_mode_restore(ds4_agent_subagents *mgr);
+void ds4_agent_subagents_drain_outputs(ds4_agent_subagents *mgr,
                                       char **active_out,
                                       size_t *active_out_len,
                                       agent_status *active_status,
                                       char **notifications);
-char *ds_agent_subagents_take_active_replay(ds_agent_subagents *mgr);
-bool ds_agent_subagents_take_web_approval(ds_agent_subagents *mgr,
-                                          ds_agent_subagent_id *id,
+char *ds4_agent_subagents_take_active_replay(ds4_agent_subagents *mgr);
+bool ds4_agent_subagents_take_web_approval(ds4_agent_subagents *mgr,
+                                          ds4_agent_subagent_id *id,
                                           char *msg,
                                           size_t msg_len);
-void ds_agent_subagents_answer_web_approval(ds_agent_subagents *mgr,
-                                            ds_agent_subagent_id id,
+void ds4_agent_subagents_answer_web_approval(ds4_agent_subagents *mgr,
+                                            ds4_agent_subagent_id id,
                                             bool allow,
                                             const char *err);
-bool ds_agent_subagents_take_path_approval(ds_agent_subagents *mgr,
-                                           ds_agent_subagent_id *id,
+bool ds4_agent_subagents_take_path_approval(ds4_agent_subagents *mgr,
+                                           ds4_agent_subagent_id *id,
                                            char *msg,
                                            size_t msg_len,
                                            char options[3][PATH_MAX],
                                            int *option_count);
-void ds_agent_subagents_answer_path_approval(ds_agent_subagents *mgr,
-                                             ds_agent_subagent_id id,
+void ds4_agent_subagents_answer_path_approval(ds4_agent_subagents *mgr,
+                                             ds4_agent_subagent_id id,
                                              bool allow,
                                              const char *choice,
                                              const char *err);
-bool ds_agent_subagents_take_queued_user_drain(ds_agent_subagents *mgr);
-void ds_agent_subagents_submit_ready(ds_agent_subagents *mgr);
-bool ds_agent_subagents_handle_command(ds_agent_subagents *mgr,
+bool ds4_agent_subagents_take_queued_user_drain(ds4_agent_subagents *mgr);
+void ds4_agent_subagents_submit_ready(ds4_agent_subagents *mgr);
+bool ds4_agent_subagents_handle_command(ds4_agent_subagents *mgr,
                                        char *cmd,
                                        bool busy);
 
@@ -290,7 +288,7 @@ bool ds_agent_subagents_handle_command(ds_agent_subagents *mgr,
 extern int agent_test_failures;
 void agent_test_assert(bool cond, const char *expr,
                        const char *file, int line);
-void ds_agent_subagent_unit_tests_run(void);
+void ds4_agent_subagent_unit_tests_run(void);
 #define AGENT_TEST_ASSERT(expr) \
     agent_test_assert((expr), #expr, __FILE__, __LINE__)
 #endif
