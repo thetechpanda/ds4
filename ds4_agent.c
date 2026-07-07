@@ -6011,6 +6011,22 @@ static bool agent_join_path(char *dst, size_t dst_len,
     return true;
 }
 
+static bool agent_tool_use_docker_filesystem(const agent_worker *w);
+static void agent_buf_append_shell_quoted(agent_buf *b, const char *s);
+static bool agent_docker_shell_exec(agent_worker *w,
+                                    const char *cmd,
+                                    bool unbounded_output,
+                                    const char *op,
+                                    agent_buf *out,
+                                    int *exit_status);
+static bool agent_docker_shell_exec_argv_stderr(agent_worker *w,
+                                                char *const cmd_argv[],
+                                                bool unbounded_output,
+                                                const char *op,
+                                                agent_buf *stdout_out,
+                                                agent_buf *stderr_out,
+                                                int *exit_status);
+
 static bool agent_resolve_existing_candidate(const char *base, const char *path,
                                              char out[PATH_MAX],
                                              char root_out[PATH_MAX],
@@ -6121,6 +6137,122 @@ static bool agent_resolve_parent_candidate(const char *base, const char *path,
     return true;
 }
 
+static void agent_trim_trailing_whitespace(char *s) {
+    if (!s) return;
+    size_t len = strlen(s);
+    while (len > 0 && isspace((unsigned char)s[len - 1]))
+        s[--len] = '\0';
+}
+
+static bool agent_copy_line(char *dst, size_t dst_len,
+                            const char *start, const char *end,
+                            char *err, size_t err_len) {
+    if (!dst || dst_len == 0 || !start || !end || end < start) {
+        snprintf(err, err_len, "invalid path normalization output");
+        return false;
+    }
+    size_t len = (size_t)(end - start);
+    while (len > 0 && (start[len - 1] == '\r' || start[len - 1] == '\n'))
+        len--;
+    if (len == 0 || len >= dst_len) {
+        snprintf(err, err_len, len == 0 ?
+                 "invalid path normalization output" : "path is too long");
+        return false;
+    }
+    memcpy(dst, start, len);
+    dst[len] = '\0';
+    return true;
+}
+
+static bool agent_parse_two_line_paths(const agent_buf *out,
+                                       char first[PATH_MAX],
+                                       char second[PATH_MAX],
+                                       char *err, size_t err_len) {
+    if (!out || !out->ptr || out->len == 0) {
+        snprintf(err, err_len, "docker path normalization produced no output");
+        return false;
+    }
+    const char *p = out->ptr;
+    const char *end = out->ptr + out->len;
+    const char *nl = memchr(p, '\n', (size_t)(end - p));
+    if (!nl) {
+        snprintf(err, err_len, "docker path normalization produced one line");
+        return false;
+    }
+    if (!agent_copy_line(first, PATH_MAX, p, nl, err, err_len))
+        return false;
+    p = nl + 1;
+    nl = memchr(p, '\n', (size_t)(end - p));
+    if (!nl) nl = end;
+    return agent_copy_line(second, PATH_MAX, p, nl, err, err_len);
+}
+
+static bool agent_resolve_docker_candidate(agent_worker *w, const char *base,
+                                           const char *path,
+                                           agent_path_resolution mode,
+                                           char out[PATH_MAX],
+                                           char root_out[PATH_MAX],
+                                           char *err, size_t err_len) {
+    char candidate[PATH_MAX];
+    if (!agent_join_path(candidate, sizeof(candidate), base, path, err, err_len))
+        return false;
+
+    const char *mode_arg = mode == AGENT_PATH_PARENT ? "parent" : "existing";
+    const char *script =
+        "ds4_resolve_path() { "
+        "case \"$mode\" in "
+        "existing) "
+        "  resolved=$(realpath -- \"$target\" 2>/dev/null) || "
+        "    { printf 'resolve %s: No such file or directory\\n' \"$target\" >&2; return 1; }; "
+        "  if [ -d \"$resolved\" ]; then root=$resolved; "
+        "  else root=$(dirname -- \"$resolved\") || return 1; fi; "
+        "  printf '%s\\n%s\\n' \"$resolved\" \"$root\"; "
+        "  ;; "
+        "parent) "
+        "  if resolved=$(realpath -- \"$target\" 2>/dev/null); then "
+        "    if [ -d \"$resolved\" ]; then root=$resolved; "
+        "    else root=$(dirname -- \"$resolved\") || return 1; fi; "
+        "    printf '%s\\n%s\\n' \"$resolved\" \"$root\"; return 0; "
+        "  fi; "
+        "  leaf=$(basename -- \"$target\") || return 1; "
+        "  case \"$leaf\" in ''|'.'|'..') printf 'invalid path: %s\\n' \"$target\" >&2; return 1;; esac; "
+        "  parent=$(dirname -- \"$target\") || return 1; "
+        "  root=$(realpath -- \"$parent\" 2>/dev/null) || "
+        "    { printf 'resolve parent for %s: No such file or directory\\n' \"$target\" >&2; return 1; }; "
+        "  if [ \"$root\" = / ]; then resolved=/$leaf; else resolved=$root/$leaf; fi; "
+        "  printf '%s\\n%s\\n' \"$resolved\" \"$root\"; "
+        "  ;; "
+        "*) printf 'invalid path resolution mode\\n' >&2; return 1;; "
+        "esac; "
+        "}; ds4_resolve_path; ds4_rc=$?; unset -f ds4_resolve_path; "
+        "(exit \"$ds4_rc\")";
+    agent_buf cmd = {0};
+    agent_buf_puts(&cmd, "mode=");
+    agent_buf_append_shell_quoted(&cmd, mode_arg);
+    agent_buf_puts(&cmd, "; target=");
+    agent_buf_append_shell_quoted(&cmd, candidate);
+    agent_buf_puts(&cmd, "; ");
+    agent_buf_puts(&cmd, script);
+    agent_buf stdout_out = {0};
+    int status = 0;
+    bool ok = agent_docker_shell_exec(w, cmd.ptr, false, "docker path resolve",
+                                      &stdout_out, &status);
+    free(cmd.ptr);
+    if (!ok || status != 0) {
+        if (stdout_out.ptr && stdout_out.ptr[0]) {
+            agent_trim_trailing_whitespace(stdout_out.ptr);
+            snprintf(err, err_len, "%s", stdout_out.ptr);
+        } else {
+            snprintf(err, err_len, "docker path resolve failed");
+        }
+        free(stdout_out.ptr);
+        return false;
+    }
+    ok = agent_parse_two_line_paths(&stdout_out, out, root_out, err, err_len);
+    free(stdout_out.ptr);
+    return ok;
+}
+
 static bool agent_request_working_directory(agent_worker *w,
                                             const char *path,
                                             const char *dir,
@@ -6198,17 +6330,24 @@ static char *agent_resolve_tool_path(agent_worker *w, const char *path,
     const char *base = agent_primary_working_directory(w);
     char resolved[PATH_MAX];
     char requested_dir[PATH_MAX];
-    bool ok = mode == AGENT_PATH_PARENT ?
-        agent_resolve_parent_candidate(base, path, resolved, requested_dir,
-                                       err, err_len) :
-        agent_resolve_existing_candidate(base, path, resolved, requested_dir,
-                                         err, err_len);
+    bool docker_fs = agent_tool_use_docker_filesystem(w);
+    bool ok = false;
+    if (docker_fs) {
+        ok = agent_resolve_docker_candidate(w, base, path, mode, resolved,
+                                            requested_dir, err, err_len);
+    } else {
+        ok = mode == AGENT_PATH_PARENT ?
+            agent_resolve_parent_candidate(base, path, resolved, requested_dir,
+                                           err, err_len) :
+            agent_resolve_existing_candidate(base, path, resolved, requested_dir,
+                                             err, err_len);
+    }
     if (!ok) return NULL;
     /* Auto-allowed paths (e.g. files created by the agent's own tools) bypass
      * workspace root checks.  If the file no longer exists on disk the entry
      * is stale — remove it and fall through to normal workspace-root checks. */
     if (agent_path_list_contains(&w->auto_allowed_paths, resolved)) {
-        if (access(resolved, F_OK) == 0)
+        if (docker_fs || access(resolved, F_OK) == 0)
             return xstrdup(resolved);
         /* Stale entry — file was deleted externally.  Remove it. */
         agent_path_list_remove(&w->auto_allowed_paths, resolved, false);
@@ -6815,6 +6954,8 @@ static char *agent_tool_write(agent_worker *w, const agent_tool_call *call) {
             free(file_path);
             return agent_buf_take(&b);
         }
+        if (!agent_path_list_contains(&w->auto_allowed_paths, file_path))
+            agent_path_list_append(&w->auto_allowed_paths, file_path);
     } else {
         file_path = agent_resolve_tool_path(w, path, AGENT_PATH_PARENT,
                                             err, sizeof(err));
