@@ -552,6 +552,8 @@ in order to make it ready for prime time. When finally the agent will reach
 the wanted shape, we will *likely* split the server and the client creating a stateful
 session-based protocol that can recreate all that in a client-server way.
 
+Dedicated documentation is available [here](DS4_AGENT.md).
+
 ## Benchmarking
 
 `ds4-bench` measures instantaneous prefill and generation throughput at context

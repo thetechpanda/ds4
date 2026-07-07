@@ -8,8 +8,9 @@ It is intentionally verbose and provisional. The final condensed document will b
 - Base: `main`
 - Branch: `feat/agent-updates`
 - Range reviewed: `main...HEAD`
-- Head commit: `d4bdc87`
-- Local worktree note: unrelated local modification exists in `.gitignore`; do not treat it as branch evidence
+- Head commit: `7782bf4`
+- Local worktree note: clean as of the post-`7782bf4` review pass
+- Verification: `make test` passed after reviewing `7782bf4`
 
 ## Changed files
 
@@ -32,6 +33,7 @@ It is intentionally verbose and provisional. The final condensed document will b
 
 Commit subjects are useful hints only. The code is the source of truth.
 
+- `7782bf4` code cleanup and fixes
 - `d4bdc87` feat: subagent new now accepts a thinking override flag with the same user-facing values as /thinking (off|default|max), new subagents still inherit the active session’s thinking mode when no override is provided, and subagent status/list surfaces now carry and display each session’s thinking mode
 - `2bd26c1` fix: docker sandbox is not initialised on model start
 - `6bcc809` ds4_agent: surface Docker tool stderr and resolve sandbox paths consistently
@@ -121,7 +123,6 @@ Commit subjects are useful hints only. The code is the source of truth.
 - Config fields include:
   - `--docker-command`
   - `--docker-container`
-  - `--docker-image`
   - `--no-docker-auto`
 - Runtime Docker commands include:
   - `/docker help`
@@ -145,7 +146,7 @@ Commit subjects are useful hints only. The code is the source of truth.
 - Otherwise, if auto-selection is enabled, interactive startup can prompt for a sandbox.
 - In non-interactive mode, auto-selection chooses the first listed tagged sandbox.
 - The code now attempts real activation at startup, not just name selection.
-- On activation failure, it clears `docker_container` and `docker_image`.
+- On activation failure, it clears `docker_container`.
 
 ### 6. Persistent Docker shell plus direct exec split
 
@@ -303,6 +304,61 @@ Commit subjects are useful hints only. The code is the source of truth.
   - macOS read restrictions
 - `ds4_help.c` adds CLI help for the new agent options and slash commands.
 
+## Post-draft changes from `7782bf4`
+
+`7782bf4` was committed after the original draft was written. It changes the review picture in these areas:
+
+- Renames the resident-subagent public/internal surface from `ds_agent_subagent*` / `DS_AGENT_SUBAGENT_*` to `ds4_agent_subagent*` / `DS4_AGENT_SUBAGENT_*`.
+- Renames the implementation and header files from `ds_agent_subagent.c/.h` to `ds4_agent_subagent.c/.h` and updates `Makefile` object names.
+- Removes the parsed startup options and config fields for `--docker-build`, `--docker-image`, and `--docker-allow-one-shot`.
+- Removes `--docker-build` and `--docker-image` from agent help and `DS4_AGENT.md`; image-backed sandbox creation is now represented by runtime `/docker create IMAGE NAME [COMMAND]`.
+- Removes runtime `docker_image` state from `agent_config`; the active sandbox is tracked by container name and `/docker describe` can inspect image metadata when needed.
+- Changes subagent slash-command output from direct `printf` replay to per-slot `manager_output` buffers that are drained through the same session output path as worker output.
+- Adds tests for session-scoped subagent command output:
+  - active-slot command output drains through the active session
+  - `/subagent send` acknowledgments stay on the invoking session and do not mark the target as unread
+- Adds startup Docker prompt output capture tests by routing startup prompt text through an injectable output stream.
+- Commits this draft file and `DS4_AGENT.md` into the branch.
+
+## Bug backlog / follow-up OpenSpec candidates
+
+These are review findings that are suitable inputs for follow-up OpenSpec changes. `make test` passes, so these are not currently caught by the automated suite.
+
+### 1. Startup Docker sandbox prompt cannot select entries 10 through 32
+
+- Evidence:
+  - The startup prompt can list up to 32 sandbox names (`ds4_agent.c:15019-15025`).
+  - Selection parsing reads only the first digit and maps `'1'..'9'` to indexes 0..8 (`ds4_agent.c:15069-15075`).
+- Impact:
+  - If there are ten or more tagged sandboxes, entries 10-32 are shown but cannot be selected interactively.
+  - The prompt can loop forever for valid-looking input such as `10`.
+- OpenSpec shape:
+  - Parse the full integer token, validate the full range, and add a startup prompt test with at least 10 fake sandboxes.
+
+### 2. OpenSpec and Codex planning directories are now ignored by Git
+
+- Evidence:
+  - `.gitignore:20-21` ignores `openspec/` and `.codex/`.
+  - This branch already relies on repo-local `.codex/skills/*` for workflow, and follow-up bug specs are expected to live under OpenSpec-managed paths.
+- Impact:
+  - Future OpenSpec proposals or repo-local agent workflow changes can become invisible to `git status`, making it easy to lose or fail to review planning artifacts.
+  - This conflicts with the review objective of turning these bugs into additional OpenSpec changes unless the ignore is deliberate local hygiene.
+- OpenSpec shape:
+  - Decide which planning artifacts are intentionally versioned in this repo.
+  - Replace broad ignores with narrower local-output ignores, or document that OpenSpec artifacts are deliberately external/untracked.
+
+### 3. `DRAFT_DS4_AGENT.md` and `DS4_AGENT.md` are now committed branch artifacts
+
+- Evidence:
+  - `7782bf4` adds both files.
+  - The original draft described `DRAFT_DS4_AGENT.md` as verbose/provisional and `DS4_AGENT.md` as final condensed documentation.
+- Impact:
+  - This may be intended, but if drafts are supposed to remain working notes, the branch now carries review scratch material as product documentation surface.
+  - The final doc is now linked from `README.md`, so it should be kept aligned with the actual parser/help surface before merge.
+- OpenSpec shape:
+  - Decide whether branch-review drafts should be committed.
+  - If committed, classify them as design/review artifacts and gate them with doc freshness checks for CLI options.
+
 ## Things to verify before finalizing DS4_AGENT.md
 
 - Final user-visible footer/status strings for unread subagent output and thinking mode.
@@ -312,6 +368,8 @@ Commit subjects are useful hints only. The code is the source of truth.
 ## Verified caveats from current code
 
 - Strict sandbox exemption is narrower in code than one commit subject implies: `web_browse` and `web_fetch` are exempt; there is no current `web_search` tool name in dispatch.
+- Subagent manager command output now uses session-scoped buffers, not direct terminal writes; the current unit tests cover active output drain and `/subagent send` isolation, but not interactive latency/visibility in the full editor loop.
+- `--docker-build`, `--docker-image`, and `--docker-allow-one-shot` were removed from parser/config and user-facing startup docs; runtime sandbox creation remains available through `/docker create IMAGE NAME [COMMAND]`.
 
 ## Likely final document structure
 

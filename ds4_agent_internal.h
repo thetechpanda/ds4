@@ -41,7 +41,6 @@ typedef struct {
     const char *chdir_path;
     const char *docker_command;
     const char *docker_container;
-    const char *docker_image;
     bool docker_available;
     bool docker_debug;
     char launch_working_directory[PATH_MAX];

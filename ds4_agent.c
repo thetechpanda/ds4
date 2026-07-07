@@ -613,8 +613,6 @@ static agent_config parse_options(int argc, char **argv) {
             c.docker_command = need_arg(&i, argc, argv, arg);
         } else if (!strcmp(arg, "--docker-container")) {
             c.docker_container = need_arg(&i, argc, argv, arg);
-        } else if (!strcmp(arg, "--docker-image")) {
-            c.docker_image = need_arg(&i, argc, argv, arg);
         } else if (!strcmp(arg, "--workspace")) {
             agent_path_list_append(&c.working_directory_args,
                                    need_arg(&i, argc, argv, arg));
@@ -6406,8 +6404,6 @@ static bool agent_docker_capture(const agent_config *cfg,
 static void agent_config_prepare_startup_docker_sandbox_with_streams(agent_config *cfg,
                                                                      FILE *input,
                                                                      FILE *output);
-static void agent_config_prepare_startup_docker_sandbox_with_input(agent_config *cfg,
-                                                                   FILE *input);
 static void agent_config_prepare_startup_docker_sandbox(agent_config *cfg);
 static bool agent_docker_refresh_mounts(agent_worker *w,
                                         char *err, size_t err_len);
@@ -9043,7 +9039,6 @@ static void test_agent_startup_docker_prompt_skip_leaves_no_active_sandbox(void)
     char *captured = test_agent_startup_docker_capture_output(&cfg, "n\n");
 
     AGENT_TEST_ASSERT(cfg.docker_container == NULL);
-    AGENT_TEST_ASSERT(cfg.docker_image == NULL);
     AGENT_TEST_ASSERT(captured != NULL);
     AGENT_TEST_ASSERT(strstr(captured, "Select docker sandbox for this launch:") != NULL);
     AGENT_TEST_ASSERT(strstr(captured, "Choose 1-2 or n/skip:") != NULL);
@@ -9065,8 +9060,6 @@ static void test_agent_startup_docker_noninteractive_autoloads_first_sandbox(voi
 
     AGENT_TEST_ASSERT(cfg.docker_container != NULL);
     AGENT_TEST_ASSERT(!strcmp(cfg.docker_container, "alpha"));
-    AGENT_TEST_ASSERT(cfg.docker_image != NULL);
-    AGENT_TEST_ASSERT(!strcmp(cfg.docker_image, "image"));
     AGENT_TEST_ASSERT(captured == NULL || strstr(captured, "Select docker sandbox for this launch:") == NULL);
     free(captured);
     agent_test_fake_docker_cleanup(&env);
@@ -9085,8 +9078,6 @@ static void test_agent_startup_docker_prompt_selects_running_sandbox(void) {
 
     AGENT_TEST_ASSERT(cfg.docker_container != NULL);
     AGENT_TEST_ASSERT(!strcmp(cfg.docker_container, "alpha"));
-    AGENT_TEST_ASSERT(cfg.docker_image != NULL);
-    AGENT_TEST_ASSERT(!strcmp(cfg.docker_image, "image"));
     AGENT_TEST_ASSERT(captured != NULL);
     AGENT_TEST_ASSERT(strstr(captured, "Select docker sandbox for this launch:") != NULL);
     free(captured);
@@ -9132,7 +9123,6 @@ static void test_agent_startup_docker_activation_failure_leaves_no_sandbox(void)
     char *captured = test_agent_startup_docker_capture_output(&cfg, "1\n");
 
     AGENT_TEST_ASSERT(cfg.docker_container == NULL);
-    AGENT_TEST_ASSERT(cfg.docker_image == NULL);
     AGENT_TEST_ASSERT(captured != NULL);
     AGENT_TEST_ASSERT(strstr(captured, "startup docker sandbox activation failed:") != NULL);
     free(captured);
@@ -14988,7 +14978,6 @@ static bool agent_docker_activate_named_sandbox(agent_worker *w,
 
     if (w) agent_docker_shell_stop(w);
     cfg->docker_container = xstrdup(container_name);
-    cfg->docker_image = xstrdup(image);
     if (print_success) {
         printf("docker sandbox switched to %s (%s, ip=%s)\n",
                container_name, state[0] ? state : "unknown", ip[0] ? ip : "-");
@@ -15125,13 +15114,7 @@ static void agent_config_prepare_startup_docker_sandbox_with_streams(agent_confi
         FILE *out_stream = output ? output : stdout;
         fprintf(out_stream, "startup docker sandbox activation failed: %s\n", err);
         cfg->docker_container = NULL;
-        cfg->docker_image = NULL;
     }
-}
-
-static void agent_config_prepare_startup_docker_sandbox_with_input(agent_config *cfg,
-                                                                   FILE *input) {
-    agent_config_prepare_startup_docker_sandbox_with_streams(cfg, input, stdout);
 }
 
 static void agent_config_prepare_startup_docker_sandbox(agent_config *cfg) {
@@ -15711,7 +15694,6 @@ static void agent_command_docker_create(agent_worker *w, char *args) {
     free(argv);
 
     w->cfg->docker_container = xstrdup(name);
-    w->cfg->docker_image = xstrdup(image);
     printf("docker sandbox switched to %s\n", name);
     if (out.ptr && out.ptr[0]) {
         printf("%s", out.ptr);
@@ -15756,8 +15738,6 @@ static void agent_command_docker_use(agent_worker *w, char *args) {
             return;
         }
         printf("current docker sandbox: %s", w->cfg->docker_container);
-        if (w->cfg->docker_image && w->cfg->docker_image[0])
-            printf(" image=%s", w->cfg->docker_image);
         printf("\n");
         return;
     }
@@ -15809,27 +15789,15 @@ static void agent_command_docker_describe(agent_worker *w, char *args) {
     }
 
     char *line = out.ptr ? out.ptr : "";
-    char *newline = strchr(line, '\n');
-    if (newline) *newline = '\0';
-    char *container_name = line;
-    if (container_name[0] == '/') container_name++;
-    char *labels_json = strchr(line, '\t');
-    if (!labels_json) goto malformed;
-    *labels_json++ = '\0';
-    char *image = strchr(labels_json, '\t');
-    if (!image) goto malformed;
-    *image++ = '\0';
-    char *state = strchr(image, '\t');
-    if (!state) goto malformed;
-    *state++ = '\0';
-    char *ip = strchr(state, '\t');
-    if (!ip) goto malformed;
-    *ip++ = '\0';
-    size_t ip_len = strlen(ip);
-    while (ip_len > 0 && isspace((unsigned char)ip[ip_len - 1]))
-        ip[--ip_len] = '\0';
+    char *container_name = NULL, *labels = NULL, *image = NULL, *state = NULL, *ip = NULL;
+    if (!agent_docker_parse_sandbox_row(line, &container_name, &labels, &image,
+                                        &state, &ip)) {
+        printf("docker describe failed: malformed docker inspect output\n");
+        free(out.ptr);
+        return;
+    }
 
-    if (!strstr(labels_json, "\"ds4:sandbox\"")) {
+    if (!strstr(labels, "\"ds4:sandbox\"")) {
         printf("docker describe failed: container is not tagged ds4:sandbox: %s\n",
                name);
         free(out.ptr);
@@ -15840,16 +15808,12 @@ static void agent_command_docker_describe(agent_worker *w, char *args) {
     printf("state:  %s\n", state[0] ? state : "unknown");
     printf("image:  %s\n", image[0] ? image : "-");
     printf("ip:     %s\n", ip[0] ? ip : "-");
-    printf("tags:   %s\n", labels_json[0] ? labels_json : "{}");
+    printf("tags:   %s\n", labels[0] ? labels : "{}");
     printf("active: %s\n",
            (w->cfg->docker_container &&
             !strcmp(w->cfg->docker_container, container_name)) ? "yes" : "no");
     free(out.ptr);
     return;
-
-malformed:
-    printf("docker describe failed: malformed docker inspect output\n");
-    free(out.ptr);
 }
 
 /* What: stop one labeled sandbox or all labeled sandboxes, clearing the active
@@ -15953,8 +15917,6 @@ static void agent_command_docker_stop(agent_worker *w, char *args) {
     if (stopping_current) {
         free((char *)w->cfg->docker_container);
         w->cfg->docker_container = NULL;
-        free((char *)w->cfg->docker_image);
-        w->cfg->docker_image = NULL;
         printf("cleared current docker sandbox selection\n");
     }
     if (!args[0]) {
@@ -16021,24 +15983,14 @@ static void agent_command_docker_destroy(agent_worker *w, char *args) {
     }
 
     char *line = out.ptr ? out.ptr : "";
-    char *newline = strchr(line, '\n');
-    if (newline) *newline = '\0';
-    char *container_name = line;
-    if (container_name[0] == '/') container_name++;
-    char *labels_json = strchr(line, '\t');
-    if (!labels_json) goto malformed;
-    *labels_json++ = '\0';
-    char *image = strchr(labels_json, '\t');
-    if (!image) goto malformed;
-    *image++ = '\0';
-    char *state = strchr(image, '\t');
-    if (!state) goto malformed;
-    *state++ = '\0';
-    char *ip = strchr(state, '\t');
-    if (!ip) goto malformed;
-    *ip++ = '\0';
-
-    if (!strstr(labels_json, "\"ds4:sandbox\"")) {
+    char *container_name = NULL, *labels = NULL, *image = NULL, *state = NULL, *ip = NULL;
+    if (!agent_docker_parse_sandbox_row(line, &container_name, &labels, &image,
+                                        &state, &ip)) {
+        printf("docker destroy failed: malformed docker inspect output\n");
+        free(out.ptr);
+        return;
+    }
+    if (!strstr(labels, "\"ds4:sandbox\"")) {
         printf("docker destroy failed: container is not tagged ds4:sandbox: %s\n",
                name);
         free(out.ptr);
@@ -16090,10 +16042,6 @@ static void agent_command_docker_destroy(agent_worker *w, char *args) {
     free(rm_out.ptr);
     free(out.ptr);
     return;
-
-malformed:
-    printf("docker destroy failed: malformed docker inspect output\n");
-    free(out.ptr);
 }
 
 /* Initialize the worker, cache directory, sysprompt checkpoint path, trace file,

@@ -81,8 +81,6 @@ Docker startup options:
 
 - `--docker-command PATH`: use a specific Docker executable.
 - `--docker-container NAME`: use an existing container.
-- `--docker-image NAME`: create/use a container from an image.
-- `--docker-build FILE`: build an image from a Dockerfile for bash tools.
 - `--no-docker-auto`: disable automatic selection of the first tagged DS4
   sandbox when no container is specified.
 
@@ -178,12 +176,3 @@ thinking mode unless `--thinking` is provided.
 The web subsystem can use a remote Chrome DevTools Protocol endpoint through
 `--web-cdp-host` and `--web-cdp-port`. When those are set, `ds4-agent` targets
 that endpoint rather than launching a local browser.
-
-## Related Notes
-
-- [README.md](/Volumes/Repositories/ds4/README.md) covers the broader DS4
-  project and agent positioning.
-- [ds4_agent_docker.md](/Volumes/Repositories/ds4/ds4_agent_docker.md)
-  documents Docker helper internals.
-- [DRAFT_DS4_AGENT.md](/Volumes/Repositories/ds4/DRAFT_DS4_AGENT.md) remains a
-  branch-review draft for cleanup work, not the user-facing README.
