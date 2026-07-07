@@ -9270,6 +9270,71 @@ static void test_agent_startup_docker_activation_failure_leaves_no_sandbox(void)
     agent_test_fake_docker_cleanup(&env);
 }
 
+static void test_agent_startup_docker_prompt_selects_two_digit_choice(void) {
+    /* Create ten sandbox names so that entry 10 is valid */
+    agent_fake_docker_env env;
+    char names[256] = {0};
+    for (int i = 0; i < 10; i++) {
+        char tag[16];
+        snprintf(tag, sizeof(tag), "sb%d\n", i + 1);
+        if (i > 0) strlcat(names, tag, sizeof(names));
+        else strlcpy(names, tag, sizeof(names));
+    }
+    agent_test_fake_docker_setup(&env, names, "running\n", false);
+
+    agent_config cfg = {0};
+    cfg.docker_available = true;
+    cfg.docker_auto = true;
+    cfg.docker_command = env.docker_path;
+
+    char *captured = test_agent_startup_docker_capture_output(&cfg, "10\n");
+
+    AGENT_TEST_ASSERT(cfg.docker_container != NULL);
+    AGENT_TEST_ASSERT(!strcmp(cfg.docker_container, "sb10"));
+    AGENT_TEST_ASSERT(captured != NULL);
+    AGENT_TEST_ASSERT(strstr(captured, "Select docker sandbox for this launch:") != NULL);
+    free(captured);
+    agent_test_fake_docker_cleanup(&env);
+}
+
+static void test_agent_startup_docker_prompt_rejects_partial_numeric_token(void) {
+    agent_fake_docker_env env;
+    agent_test_fake_docker_setup(&env, "alpha\nbeta\n", "running\n", false);
+
+    agent_config cfg = {0};
+    cfg.docker_available = true;
+    cfg.docker_auto = true;
+    cfg.docker_command = env.docker_path;
+
+    /* "10abc" should be rejected and the prompt loops */
+    char *captured = test_agent_startup_docker_capture_output(&cfg, "10abc\nn\n");
+
+    AGENT_TEST_ASSERT(cfg.docker_container == NULL);
+    AGENT_TEST_ASSERT(captured != NULL);
+    AGENT_TEST_ASSERT(strstr(captured, "Choose 1-2 or n/skip:") != NULL);
+    free(captured);
+    agent_test_fake_docker_cleanup(&env);
+}
+
+static void test_agent_startup_docker_prompt_rejects_out_of_range_number(void) {
+    agent_fake_docker_env env;
+    agent_test_fake_docker_setup(&env, "alpha\nbeta\n", "running\n", false);
+
+    agent_config cfg = {0};
+    cfg.docker_available = true;
+    cfg.docker_auto = true;
+    cfg.docker_command = env.docker_path;
+
+    /* "0" (below range) and "3" (above count 2) both rejected, then skip */
+    char *captured = test_agent_startup_docker_capture_output(&cfg, "0\n3\nn\n");
+
+    AGENT_TEST_ASSERT(cfg.docker_container == NULL);
+    AGENT_TEST_ASSERT(captured != NULL);
+    AGENT_TEST_ASSERT(strstr(captured, "Choose 1-2 or n/skip:") != NULL);
+    free(captured);
+    agent_test_fake_docker_cleanup(&env);
+}
+
 /* What: verify persistent-shell exec rejects inactive shell state.
  * Why: callers should get false instead of blocking on invalid pipe fds.
  * Callers: ds4_agent_unit_tests_run(). */
@@ -10250,6 +10315,9 @@ static void ds4_agent_unit_tests_run(void) {
     test_agent_startup_docker_prompt_selects_running_sandbox();
     test_agent_startup_docker_prompt_starts_stopped_sandbox();
     test_agent_startup_docker_activation_failure_leaves_no_sandbox();
+    test_agent_startup_docker_prompt_selects_two_digit_choice();
+    test_agent_startup_docker_prompt_rejects_partial_numeric_token();
+    test_agent_startup_docker_prompt_rejects_out_of_range_number();
     test_agent_docker_shell_exec_rejects_inactive_shell();
     test_agent_docker_shell_parses_output_and_exit_code();
     test_agent_docker_shell_command_output_skips_blank_only();
@@ -15196,8 +15264,24 @@ static bool agent_prompt_startup_docker_sandbox(agent_config *cfg,
         if (*p == 'n' || *p == 'N') return false;
         if (!strncasecmp(p, "skip", 4) || !strncasecmp(p, "none", 4))
             return false;
+        /* Parse a full numeric token: require the first character to be a
+         * digit, consume contiguous digits, then reject if the next
+         * non-whitespace character is not end-of-string.  Accept only
+         * values in [1, count]. */
         if (*p >= '1' && *p <= '9') {
-            int idx = *p - '1';
+            char *end = p;
+            long val = 0;
+            while (*end >= '0' && *end <= '9') {
+                val = val * 10 + (*end - '0');
+                end++;
+            }
+            /* Skip trailing whitespace */
+            while (*end == ' ' || *end == '\t') end++;
+            /* Reject if any non-whitespace remains (e.g. "10abc") */
+            if (*end != '\0' && *end != '\n') {
+                continue;
+            }
+            int idx = (int)val - 1;
             if (idx >= 0 && idx < count) {
                 if (choice && choice_len > 0)
                     snprintf(choice, choice_len, "%s", options[idx]);

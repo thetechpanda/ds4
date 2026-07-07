@@ -19,3 +19,4 @@ __pycache__/
 /ds4_agent_test
 openspec/
 .codex/
+.npm/
