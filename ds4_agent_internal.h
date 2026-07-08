@@ -111,6 +111,7 @@ typedef struct {
     bool docker_auto;
     bool command_output;
     volatile bool preserve_agent_files;
+    char default_tools[256];
 } agent_config;
 
 typedef enum {

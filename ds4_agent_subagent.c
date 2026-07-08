@@ -372,7 +372,7 @@ int ds4_agent_subagents_create_for_agent(ds4_agent_subagents **out,
     slot->id.value = mgr->next_id++;
     slot->autonomy = req.autonomy;
     slot->budget_limit = mgr->default_round_budget;
-    slot->tool_policy.allow_none = true;
+    ds4_agent_tool_policy_parse(cfg->default_tools[0] ? cfg->default_tools : "read", &slot->tool_policy);
     snprintf(slot->name, sizeof(slot->name), "%s", req.name);
     ds4_agent_subagent_config_copy(&slot->cfg, cfg);
     if (agent_worker_init(&slot->worker, engine, &slot->cfg) != 0) {
@@ -475,7 +475,7 @@ int ds4_agent_subagent_create(ds4_agent_subagents *mgr,
     agent_session_slot *slot = &mgr->slots[mgr->len++];
     memset(slot, 0, sizeof(*slot));
     slot->id.value = mgr->next_id++;
-    /* Parse tool-access policy from request; default to none (no tools). */
+    /* Parse tool-access policy from request; default to parent policy. */
     if (req && req->allowed_tools && req->allowed_tools[0]) {
         if (ds4_agent_tool_policy_parse(req->allowed_tools, &slot->tool_policy) != 0) {
             ds4_agent_subagents_set_error(mgr,
@@ -486,7 +486,11 @@ int ds4_agent_subagent_create(ds4_agent_subagents *mgr,
             return -1;
         }
     } else {
-        slot->tool_policy.allow_none = true;
+        agent_session_slot *active = ds4_agent_subagents_active_slot(mgr);
+        if (active)
+            slot->tool_policy = active->tool_policy;
+        else
+            slot->tool_policy.allow_none = true;
     }
     slot->autonomy = req ? req->autonomy : DS4_AGENT_SUBAGENT_AUTONOMY_TAB;
     slot->budget_limit = req && req->round_budget > 0 ?

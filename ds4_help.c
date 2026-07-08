@@ -290,6 +290,7 @@ static void print_agent_specific(FILE *fp, const help_colors *c) {
     opt(fp, c, "--temp-directory DIR", "Temporary file directory (default: /tmp).");
     opt(fp, c, "--web-cdp-host HOST", "Use an existing Chrome DevTools Protocol host instead of starting Chrome.");
     opt(fp, c, "--web-cdp-port N", "Use an existing Chrome DevTools Protocol port instead of starting Chrome.");
+    opt(fp, c, "--tools POLICY", "Default tool-access policy at boot. Accepts: all, none, or comma-separated tool names (read, write, web, bash). Default: none.");
     fputc('\n', fp);
 }
 

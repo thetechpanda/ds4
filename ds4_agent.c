@@ -688,11 +688,15 @@ static agent_config parse_options(int argc, char **argv) {
             steering_scale_set = true;
         } else if (!strcmp(arg, "--recover")) {
             c.recover_session = need_arg(&i, argc, argv, arg);
+        } else if (!strcmp(arg, "--tools")) {
+            snprintf(c.default_tools, sizeof(c.default_tools), "%s",
+                     need_arg(&i, argc, argv, arg));
         } else {
             fprintf(stderr, "ds4-agent: unknown option: %s\n", arg);
             usage(stderr, NULL);
             exit(2);
         }
+
     }
 
     if (c.engine.directional_steering_file && !steering_scale_set)
@@ -708,6 +712,13 @@ static agent_config parse_options(int argc, char **argv) {
     if (c.engine.distributed.role == DS4_DISTRIBUTED_WORKER) {
         fprintf(stderr, "ds4-agent: --role worker is a serving mode; start workers with ./ds4\n");
         exit(2);
+    }
+    /* If no explicit --tools flag, default to "read" (and "web" if configured). */
+    if (!c.default_tools[0]) {
+        if (c.web_cdp_host[0] && c.web_cdp_port > 0)
+            snprintf(c.default_tools, sizeof(c.default_tools), "read, web");
+        else
+            snprintf(c.default_tools, sizeof(c.default_tools), "read");
     }
     return c;
 }
@@ -16820,7 +16831,11 @@ int agent_worker_init(agent_worker *w, ds4_engine *engine, agent_config *cfg) {
     pthread_mutex_init(&w->docker_shell.mu, NULL);
     w->status.state = AGENT_WORKER_IDLE;
     w->status.think_mode = cfg->gen.think_mode;
-    ds4_agent_tool_policy_set_none(&w->tool_policy);
+    bool tools_explicit = cfg->default_tools[0];
+    if (tools_explicit)
+        ds4_agent_tool_policy_parse(cfg->default_tools, &w->tool_policy);
+    else
+        ds4_agent_tool_policy_parse("read", &w->tool_policy);
     for (int i = 0; i < cfg->working_directories.len; i++)
         agent_path_list_append(&w->working_directories, cfg->working_directories.v[i]);
     if (pipe(w->wake_fd) != 0) return -1;
@@ -16850,6 +16865,9 @@ int agent_worker_init(agent_worker *w, ds4_engine *engine, agent_config *cfg) {
         .cancel_privdata = w,
     };
     w->web = ds4_web_create(&web_cfg);
+    /* If no explicit --tools and web is available, add web tools to the default. */
+    if (!tools_explicit && w->web)
+        ds4_agent_tool_policy_parse("web", &w->tool_policy);
     w->sysprompt_path = ds4_kvstore_path_join(w->cache_dir, "sysprompt.kv");
     if (cfg->gen.trace_path && cfg->gen.trace_path[0]) {
         w->trace = fopen(cfg->gen.trace_path, "ab");
@@ -17281,7 +17299,10 @@ static void test_agent_fake_worker_init(agent_worker *w, agent_config *cfg) {
     pthread_mutex_init(&w->docker_shell.mu, NULL);
     AGENT_TEST_ASSERT(pipe(w->wake_fd) == 0);
     w->status.state = AGENT_WORKER_IDLE;
-    ds4_agent_tool_policy_set_none(&w->tool_policy);
+    if (cfg->default_tools[0])
+        ds4_agent_tool_policy_parse(cfg->default_tools, &w->tool_policy);
+    else
+        ds4_agent_tool_policy_parse("read", &w->tool_policy);
 }
 
 typedef struct {
