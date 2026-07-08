@@ -236,6 +236,7 @@ static int agent_web_confirm(void *privdata, const char *message,
 static void agent_web_log(void *privdata, const char *message);
 static bool agent_preflight_edit_old(agent_worker *w, const agent_tool_call *call,
                                      char *err, size_t err_len);
+static char *agent_execute_tool_call(agent_worker *w, const agent_tool_call *call);
 static int agent_worker_sync_tokens(agent_worker *w, const ds4_tokens *tokens,
                                     bool publish_progress,
                                     char *err, size_t err_len);
@@ -443,6 +444,8 @@ static bool agent_slash_command_known(const char *cmd) {
            agent_slash_command_with_args(cmd, "/history") ||
            agent_slash_command_with_args(cmd, "/workspace") ||
            agent_slash_command_with_args(cmd, "/subagent") ||
+           agent_slash_command_with_args(cmd, "/allow") ||
+           agent_slash_command_with_args(cmd, "/disallow") ||
            !strcmp(cmd, "/purge_auto_files");
 }
 
@@ -871,41 +874,10 @@ static const char agent_tools_prompt_edit_line[] =
     "To insert text, use edit with old set to an exact unique anchor and new set to that anchor plus the added text.\n"
     "Use read raw=true only when you need plain file text without line numbers or read annotations.\n\n";
 
-static const char agent_tools_prompt_after_edit_web[] =
-    "Use web_browse to find web pages. Use web_fetch to read a known URL with a visible browser. "
-    "The first web call may ask the user for permission to start Chrome.\n\n"
-    "### Available Tool Schemas\n\n"
-    "{\n"
-    "  \"type\": \"function\",\n"
-    "  \"function\": {\n"
-    "    \"name\": \"web_browse\",\n"
-    "    \"description\": \"Search Google in a visible browser and return compact Markdown links.\",\n"
-    "    \"parameters\": {\n"
-    "      \"type\": \"object\",\n"
-    "      \"properties\": {\n"
-    "        \"query\": {\"type\": \"string\"}\n"
-    "      },\n"
-    "      \"required\": [\"query\"]\n"
-    "    }\n"
-    "  }\n"
-    "}\n\n"
-    "{\n"
-    "  \"type\": \"function\",\n"
-    "  \"function\": {\n"
-    "    \"name\": \"web_fetch\",\n"
-    "    \"description\": \"Open a URL in a visible browser and return rendered page Markdown.\",\n"
-    "    \"parameters\": {\n"
-    "      \"type\": \"object\",\n"
-    "      \"properties\": {\n"
-    "        \"url\": {\"type\": \"string\"}\n"
-    "      },\n"
-    "      \"required\": [\"url\"]\n"
-    "    }\n"
-    "  }\n"
-    "}\n\n"
-;
+/* Individual tool JSON schemas for per-tool filtering.
+ * Each entry includes guidance text so the model knows when to use it. */
 
-static const char agent_tools_prompt_after_edit_core[] =
+static const char agent_tool_schema_bash[] =
     "For long-running bash commands, pass refresh_sec. If a bash job is still running, use "
     "bash_status to check it early or bash_stop to terminate it.\n\n"
     "{\n"
@@ -923,7 +895,9 @@ static const char agent_tools_prompt_after_edit_core[] =
     "      \"required\": [\"command\"]\n"
     "    }\n"
     "  }\n"
-    "}\n\n"
+    "}\n\n";
+
+static const char agent_tool_schema_bash_status[] =
     "{\n"
     "  \"type\": \"function\",\n"
     "  \"function\": {\n"
@@ -939,7 +913,9 @@ static const char agent_tools_prompt_after_edit_core[] =
     "      \"required\": [\"job\"]\n"
     "    }\n"
     "  }\n"
-    "}\n\n"
+    "}\n\n";
+
+static const char agent_tool_schema_bash_stop[] =
     "{\n"
     "  \"type\": \"function\",\n"
     "  \"function\": {\n"
@@ -955,7 +931,9 @@ static const char agent_tools_prompt_after_edit_core[] =
     "      \"required\": [\"job\"]\n"
     "    }\n"
     "  }\n"
-    "}\n\n"
+    "}\n\n";
+
+static const char agent_tool_schema_read[] =
     "{\n"
     "  \"type\": \"function\",\n"
     "  \"function\": {\n"
@@ -973,7 +951,9 @@ static const char agent_tools_prompt_after_edit_core[] =
     "      \"required\": [\"path\"]\n"
     "    }\n"
     "  }\n"
-    "}\n\n"
+    "}\n\n";
+
+static const char agent_tool_schema_more[] =
     "{\n"
     "  \"type\": \"function\",\n"
     "  \"function\": {\n"
@@ -986,7 +966,9 @@ static const char agent_tools_prompt_after_edit_core[] =
     "      }\n"
     "    }\n"
     "  }\n"
-    "}\n\n"
+    "}\n\n";
+
+static const char agent_tool_schema_write[] =
     "{\n"
     "  \"type\": \"function\",\n"
     "  \"function\": {\n"
@@ -1001,7 +983,9 @@ static const char agent_tools_prompt_after_edit_core[] =
     "      \"required\": [\"path\", \"content\"]\n"
     "    }\n"
     "  }\n"
-    "}\n\n"
+    "}\n\n";
+
+static const char agent_tool_schema_edit[] =
     "{\n"
     "  \"type\": \"function\",\n"
     "  \"function\": {\n"
@@ -1017,7 +1001,9 @@ static const char agent_tools_prompt_after_edit_core[] =
     "      \"required\": [\"path\", \"old\", \"new\"]\n"
     "    }\n"
     "  }\n"
-    "}\n\n"
+    "}\n\n";
+
+static const char agent_tool_schema_search[] =
     "{\n"
     "  \"type\": \"function\",\n"
     "  \"function\": {\n"
@@ -1037,7 +1023,9 @@ static const char agent_tools_prompt_after_edit_core[] =
     "      \"required\": [\"query\"]\n"
     "    }\n"
     "  }\n"
-    "}\n\n"
+    "}\n\n";
+
+static const char agent_tool_schema_list[] =
     "{\n"
     "  \"type\": \"function\",\n"
     "  \"function\": {\n"
@@ -1051,8 +1039,45 @@ static const char agent_tools_prompt_after_edit_core[] =
     "      \"required\": [\"path\"]\n"
     "    }\n"
     "  }\n"
-    "}\n"
-    "\n"
+    "}\n\n";
+
+static const char agent_tool_schema_web_browse[] =
+    "Use web_browse to find web pages. Use web_fetch to read a known URL with a visible browser. "
+    "The first web call may ask the user for permission to start Chrome.\n\n"
+    "### Available Tool Schemas\n\n"
+    "{\n"
+    "  \"type\": \"function\",\n"
+    "  \"function\": {\n"
+    "    \"name\": \"web_browse\",\n"
+    "    \"description\": \"Search Google in a visible browser and return compact Markdown links.\",\n"
+    "    \"parameters\": {\n"
+    "      \"type\": \"object\",\n"
+    "      \"properties\": {\n"
+    "        \"query\": {\"type\": \"string\"}\n"
+    "      },\n"
+    "      \"required\": [\"query\"]\n"
+    "    }\n"
+    "  }\n"
+    "}\n\n";
+
+static const char agent_tool_schema_web_fetch[] =
+    "{\n"
+    "  \"type\": \"function\",\n"
+    "  \"function\": {\n"
+    "    \"name\": \"web_fetch\",\n"
+    "    \"description\": \"Open a URL in a visible browser and return rendered page Markdown.\",\n"
+    "    \"parameters\": {\n"
+    "      \"type\": \"object\",\n"
+    "      \"properties\": {\n"
+    "        \"url\": {\"type\": \"string\"}\n"
+    "      },\n"
+    "      \"required\": [\"url\"]\n"
+    "    }\n"
+    "  }\n"
+    "}\n\n";
+
+/* Rules section — always included after tool schemas. */
+static const char agent_tools_prompt_rules[] =
     "# Rules\n\n"
     "- Always use strict syntax for DSML tool stanzas.\n"
     "- This system runs on local inference of a few hundred tokens/s of prefill, "
@@ -1064,24 +1089,71 @@ static const char agent_tools_prompt_after_edit_core[] =
     "- Work in a way that preserves the current system configuration integrity, "
     "unless explicitly asked otherwise by the user.\n";
 
-static char *agent_build_tools_prompt(bool include_web_tools) {
-    const char *edit = agent_tools_prompt_edit_line;
-    size_t a = strlen(agent_tools_prompt_intro);
-    size_t b = strlen(edit);
-    const char *after = agent_tools_prompt_after_edit_core;
-    size_t c = strlen(after);
-    const char *tail = "";
-    size_t d = 0;
-    if (include_web_tools) {
-        tail = agent_tools_prompt_after_edit_web;
-        d = strlen(tail);
+/* Map from concrete tool index to its schema string.  Indices match the
+ * DS4_AGENT_CONCRETE_TOOL_COUNT ordering: read(0), more(1), write(2),
+ * list(3), edit(4), search(5), web_browse(6), web_fetch(7), bash(8),
+ * bash_status(9), bash_stop(10). */
+static const char *agent_tool_schemas[DS4_AGENT_CONCRETE_TOOL_COUNT] = {
+    [0]  = agent_tool_schema_read,
+    [1]  = agent_tool_schema_more,
+    [2]  = agent_tool_schema_write,
+    [3]  = agent_tool_schema_list,
+    [4]  = agent_tool_schema_edit,
+    [5]  = agent_tool_schema_search,
+    [6]  = agent_tool_schema_web_browse,
+    [7]  = agent_tool_schema_web_fetch,
+    [8]  = agent_tool_schema_bash,
+    [9]  = agent_tool_schema_bash_status,
+    [10] = agent_tool_schema_bash_stop,
+};
+
+/* Build a filtered tools prompt that only includes schemas and guidance for
+ * concrete tools allowed by the given policy.  If pol is NULL, all tools are
+ * included (fallback for legacy callers).  Uses per-tool schema strings so
+ * that only allowed tools are advertised — the model never sees schemas for
+ * disallowed tools. */
+static char *agent_build_filtered_tools_prompt(const ds4_agent_tool_policy *pol) {
+    agent_buf b = {0};
+    /* Always include the intro. */
+    agent_buf_puts(&b, agent_tools_prompt_intro);
+
+    /* Include editing instructions if any WRITE-class tool is allowed
+     * (includes READ-class tools since they're a subset of WRITE). */
+    if (!pol || pol->allow_all) {
+        agent_buf_puts(&b, agent_tools_prompt_edit_line);
+    } else if (!pol->allow_none) {
+        bool include_edit = false;
+        int count = agent_tools_class_indices[AGENT_TOOLS_CLASS_WRITE][0];
+        for (int j = 1; j <= count; j++) {
+            int idx = agent_tools_class_indices[AGENT_TOOLS_CLASS_WRITE][j];
+            if (pol->allowed[idx]) { include_edit = true; break; }
+        }
+        if (include_edit)
+            agent_buf_puts(&b, agent_tools_prompt_edit_line);
     }
-    char *out = xmalloc(a + b + c + d + 1);
-    memcpy(out, agent_tools_prompt_intro, a);
-    memcpy(out + a, edit, b);
-    memcpy(out + a + b, after, c);
-    memcpy(out + a + b + c, tail, d + 1);
-    return out;
+
+    /* Include individual tool schemas for each allowed concrete tool.
+     * When pol is NULL, include all tools. */
+    for (int i = 0; i < DS4_AGENT_CONCRETE_TOOL_COUNT; i++) {
+        bool include = !pol || pol->allow_all ||
+            (pol->allow_none ? false : pol->allowed[i]);
+        if (include && agent_tool_schemas[i])
+            agent_buf_puts(&b, agent_tool_schemas[i]);
+    }
+
+    /* Always include the Rules section (meta-guidance, not tool-specific). */
+    agent_buf_puts(&b, agent_tools_prompt_rules);
+
+    /* Append a policy summary line so the model knows its current contract. */
+    if (pol) {
+        char summary[256];
+        ds4_agent_tool_policy_format(pol, summary, sizeof(summary));
+        agent_buf_puts(&b, "\n**Current tool-access policy:** ");
+        agent_buf_puts(&b, summary);
+        agent_buf_puts(&b, "\n");
+    }
+
+    return agent_buf_take(&b);
 }
 
 static const char agent_dsml_syntax_reminder[] =
@@ -1094,8 +1166,8 @@ static const char agent_dsml_syntax_reminder[] =
 
 #define AGENT_SYSTEM_PROMPT_REMINDER_TOKENS 50000
 
-static char *agent_build_system_prompt_reminder(bool include_web_tools) {
-    char *tools = agent_build_tools_prompt(include_web_tools);
+static char *agent_build_system_prompt_reminder(const ds4_agent_tool_policy *pol) {
+    char *tools = agent_build_filtered_tools_prompt(pol);
     const char *start = "\n\n[System prompt reminder follows.]\n";
     const char *end = "[End system prompt reminder.]\n\n";
     size_t len = strlen(start) + strlen(tools) + strlen(end) + 1;
@@ -1110,13 +1182,8 @@ static char *agent_build_system_prompt_reminder(bool include_web_tools) {
 
 static void agent_append_system_prompt(ds4_engine *engine, ds4_tokens *tokens,
                                        const char *extra,
-                                       bool include_web_tools) {
-    /* The built-in tool prompt is trusted DS4 control text.  Tokenize it like a
-     * rendered chat prompt so the literal ｜DSML｜ markers in the examples become
-     * the model's dedicated DSML token.  Do not apply that tokenizer to user
-     * supplied -sys text: arbitrary user text containing <｜User｜>, <think>, or
-     * ｜DSML｜ must remain plain content, not control tokens. */
-    char *tools_prompt = agent_build_tools_prompt(include_web_tools);
+                                       const ds4_agent_tool_policy *pol) {
+    char *tools_prompt = agent_build_filtered_tools_prompt(pol);
     // fprintf(stdout, "--- agent prompt ---\n%s\n--- agent prompt ---\n", tools_prompt);
     ds4_tokenize_rendered_chat(engine, tools_prompt, tokens);
     free(tools_prompt);
@@ -1245,7 +1312,7 @@ static void agent_worker_maybe_append_system_prompt_reminder(agent_worker *w) {
         return;
     }
 
-    char *reminder = agent_build_system_prompt_reminder(true);
+    char *reminder = agent_build_system_prompt_reminder(&w->tool_policy);
     agent_publish_system_status(w, "Re-injecting system prompt reminder...");
     agent_trace(w, "system prompt reminder injected at transcript=%d",
                 w->transcript.len);
@@ -4255,7 +4322,7 @@ static void agent_worker_build_system_tokens(agent_worker *w, ds4_tokens *out) {
     if (w->cfg->gen.think_mode == DS4_THINK_MAX &&
         effective_think_mode(w->cfg) == DS4_THINK_MAX)
         ds4_chat_append_max_effort_prefix(w->engine, out);
-    agent_append_system_prompt(w->engine, out, w->cfg->gen.system, true);
+    agent_append_system_prompt(w->engine, out, w->cfg->gen.system, &w->tool_policy);
     const agent_path_list *roots = agent_working_directories(w);
     agent_append_project_instruction_prompt(w->engine, out,
                                             roots && roots->len ? roots->v[0] : NULL);
@@ -10273,8 +10340,451 @@ static void test_agent_subagent_slash_command_recognition(void) {
     AGENT_TEST_ASSERT(agent_slash_command_known("/subagent new tests run"));
     AGENT_TEST_ASSERT(agent_slash_command_known("/subagent new --thinking off tests run"));
     AGENT_TEST_ASSERT(agent_slash_command_known("/subagent report tests"));
+    AGENT_TEST_ASSERT(agent_slash_command_known("/allow read,bash"));
+    AGENT_TEST_ASSERT(agent_slash_command_known("/disallow web"));
     AGENT_TEST_ASSERT(!agent_slash_command_known("/subagentry"));
     AGENT_TEST_ASSERT(agent_slash_command_known("/save"));
+}
+
+#endif
+
+/* --- Tool-access policy implementation ------------------------------------ */
+
+/* Parse a comma-separated list of tool names / meta-tools into a normalized
+ * policy.  Returns 0 on success, -1 on unknown tool name. */
+static const char *agent_tool_name_for_index(int idx) {
+    static const char *names[DS4_AGENT_CONCRETE_TOOL_COUNT] = {
+        "read", "more", "write", "list", "edit", "search",
+        "web_browse", "web_fetch", "bash", "bash_status", "bash_stop",
+    };
+    return idx >= 0 && idx < DS4_AGENT_CONCRETE_TOOL_COUNT ? names[idx] : NULL;
+}
+
+static int agent_tool_index_for_name(const char *name) {
+    if (!name) return -1;
+    for (int i = 0; i < DS4_AGENT_CONCRETE_TOOL_COUNT; i++) {
+        const char *tool = agent_tool_name_for_index(i);
+        if (tool && !strcmp(name, tool)) return i;
+    }
+    return -1;
+}
+
+static void ds4_agent_tool_policy_set_none(ds4_agent_tool_policy *pol) {
+    if (!pol) return;
+    memset(pol, 0, sizeof(*pol));
+    pol->allow_none = true;
+}
+
+static void ds4_agent_tool_policy_set_all(ds4_agent_tool_policy *pol) {
+    if (!pol) return;
+    memset(pol, 0, sizeof(*pol));
+    pol->allow_all = true;
+}
+
+static bool ds4_agent_tool_policy_any_allowed(const ds4_agent_tool_policy *pol) {
+    if (!pol || pol->allow_none) return false;
+    if (pol->allow_all) return true;
+    for (int i = 0; i < DS4_AGENT_CONCRETE_TOOL_COUNT; i++)
+        if (pol->allowed[i]) return true;
+    return false;
+}
+
+static void ds4_agent_tool_policy_allow_class(ds4_agent_tool_policy *pol,
+                                              agent_tools_class cls) {
+    if (!pol || cls < 0 || cls >= AGENT_TOOLS_CLASS_COUNT) return;
+    int count = agent_tools_class_indices[cls][0];
+    for (int j = 1; j <= count; j++) {
+        int idx = agent_tools_class_indices[cls][j];
+        if (idx >= 0 && idx < DS4_AGENT_CONCRETE_TOOL_COUNT)
+            pol->allowed[idx] = true;
+    }
+}
+
+static bool ds4_agent_tool_policy_class_allowed(const ds4_agent_tool_policy *pol,
+                                                agent_tools_class cls) {
+    if (!pol || pol->allow_none || cls < 0 || cls >= AGENT_TOOLS_CLASS_COUNT)
+        return false;
+    if (pol->allow_all) return true;
+    int count = agent_tools_class_indices[cls][0];
+    for (int j = 1; j <= count; j++) {
+        int idx = agent_tools_class_indices[cls][j];
+        if (idx < 0 || idx >= DS4_AGENT_CONCRETE_TOOL_COUNT ||
+            !pol->allowed[idx])
+            return false;
+    }
+    return true;
+}
+
+int ds4_agent_tool_policy_parse(const char *input, ds4_agent_tool_policy *out) {
+    if (!out) return -1;
+    memset(out, 0, sizeof(*out));
+    if (!input || !input[0]) { out->allow_none = true; return 0; }
+
+    /* Handle single-word aliases. */
+    if (!strcmp(input, "all"))  { out->allow_all = true; return 0; }
+    if (!strcmp(input, "none") || !strcmp(input, "off")) { out->allow_none = true; return 0; }
+
+    /* Tokenize comma-separated list. */
+    char buf[1024];
+    snprintf(buf, sizeof(buf), "%s", input);
+    char *save = NULL;
+    for (char *tok = strtok_r(buf, ",", &save); tok; tok = strtok_r(NULL, ",", &save)) {
+        /* Strip leading/trailing whitespace. */
+        while (*tok == ' ' || *tok == '\t') tok++;
+        char *end = tok + strlen(tok) - 1;
+        while (end > tok && (*end == ' ' || *end == '\t')) end--;
+        end[1] = '\0';
+        if (!*tok) continue;
+
+        if (!strcmp(tok, "read")) {
+            ds4_agent_tool_policy_allow_class(out, AGENT_TOOLS_CLASS_READ);
+        } else if (!strcmp(tok, "write")) {
+            ds4_agent_tool_policy_allow_class(out, AGENT_TOOLS_CLASS_WRITE);
+        } else if (!strcmp(tok, "web")) {
+            ds4_agent_tool_policy_allow_class(out, AGENT_TOOLS_CLASS_WEB);
+        } else if (!strcmp(tok, "bash")) {
+            ds4_agent_tool_policy_allow_class(out, AGENT_TOOLS_CLASS_BASH);
+        } else {
+            int idx = agent_tool_index_for_name(tok);
+            if (idx < 0) return -1;
+            out->allowed[idx] = true;
+        }
+    }
+    if (!ds4_agent_tool_policy_any_allowed(out))
+        out->allow_none = true;
+    return 0;
+}
+
+bool ds4_agent_tool_policy_allows(const ds4_agent_tool_policy *pol, const char *tool_name) {
+    if (!tool_name) return false;
+    if (!pol) return false;
+    if (pol->allow_all)  return true;
+    if (pol->allow_none) return false;
+    int idx = agent_tool_index_for_name(tool_name);
+    if (idx < 0 || idx >= DS4_AGENT_CONCRETE_TOOL_COUNT) return false;
+    return pol->allowed[idx];
+}
+
+void ds4_agent_tool_policy_format(const ds4_agent_tool_policy *pol, char *buf, size_t len) {
+    if (!buf || len == 0) return;
+    if (!pol) { buf[0] = '\0'; return; }
+    if (pol->allow_all)  { snprintf(buf, len, "all");  return; }
+    if (pol->allow_none) { snprintf(buf, len, "none"); return; }
+    bool covered[DS4_AGENT_CONCRETE_TOOL_COUNT] = {0};
+    char tmp[256] = "";
+    int first = 1;
+
+    const struct {
+        agent_tools_class cls;
+        const char *name;
+    } classes[] = {
+        {AGENT_TOOLS_CLASS_WRITE, "write"},
+        {AGENT_TOOLS_CLASS_READ,  "read"},
+        {AGENT_TOOLS_CLASS_WEB,   "web"},
+        {AGENT_TOOLS_CLASS_BASH,  "bash"},
+    };
+    for (size_t k = 0; k < sizeof(classes) / sizeof(classes[0]); k++) {
+        agent_tools_class cls = classes[k].cls;
+        if (!ds4_agent_tool_policy_class_allowed(pol, cls)) continue;
+        bool all_covered = true;
+        int count = agent_tools_class_indices[cls][0];
+        for (int j = 1; j <= count; j++) {
+            int idx = agent_tools_class_indices[cls][j];
+            if (idx < 0 || idx >= DS4_AGENT_CONCRETE_TOOL_COUNT ||
+                !covered[idx]) {
+                all_covered = false;
+                break;
+            }
+        }
+        if (all_covered) continue;
+        if (!first) strcat(tmp, ", ");
+        first = 0;
+        strcat(tmp, classes[k].name);
+        for (int j = 1; j <= count; j++) {
+            int idx = agent_tools_class_indices[cls][j];
+            if (idx >= 0 && idx < DS4_AGENT_CONCRETE_TOOL_COUNT)
+                covered[idx] = true;
+        }
+    }
+
+    for (int i = 0; i < DS4_AGENT_CONCRETE_TOOL_COUNT; i++) {
+        if (covered[i] || !pol->allowed[i]) continue;
+        const char *tool = agent_tool_name_for_index(i);
+        if (tool) {
+            if (!first) strcat(tmp, ", ");
+            first = 0;
+            strcat(tmp, tool);
+        }
+    }
+    if (tmp[0] == '\0') strcpy(tmp, "none");
+    snprintf(buf, len, "%s", tmp);
+}
+
+static void ds4_agent_tool_policy_grant(ds4_agent_tool_policy *dst,
+                                        const ds4_agent_tool_policy *grant) {
+    if (!dst || !grant) return;
+    if (grant->allow_all) {
+        ds4_agent_tool_policy_set_all(dst);
+        return;
+    }
+    if (grant->allow_none) {
+        ds4_agent_tool_policy_set_none(dst);
+        return;
+    }
+    if (dst->allow_all) return;
+    dst->allow_none = false;
+    for (int i = 0; i < DS4_AGENT_CONCRETE_TOOL_COUNT; i++)
+        if (grant->allowed[i]) dst->allowed[i] = true;
+    if (!ds4_agent_tool_policy_any_allowed(dst))
+        ds4_agent_tool_policy_set_none(dst);
+}
+
+static void ds4_agent_tool_policy_revoke(ds4_agent_tool_policy *dst,
+                                         const ds4_agent_tool_policy *remove) {
+    if (!dst || !remove) return;
+    if (remove->allow_all || remove->allow_none) {
+        ds4_agent_tool_policy_set_none(dst);
+        return;
+    }
+    if (dst->allow_all) {
+        dst->allow_all = false;
+        dst->allow_none = false;
+        for (int i = 0; i < DS4_AGENT_CONCRETE_TOOL_COUNT; i++)
+            dst->allowed[i] = !remove->allowed[i];
+    } else if (!dst->allow_none) {
+        for (int i = 0; i < DS4_AGENT_CONCRETE_TOOL_COUNT; i++)
+            if (remove->allowed[i]) dst->allowed[i] = false;
+    }
+    if (!ds4_agent_tool_policy_any_allowed(dst))
+        ds4_agent_tool_policy_set_none(dst);
+}
+
+static bool agent_worker_apply_tool_policy_command(agent_worker *w,
+                                                   bool grant,
+                                                   const char *arg,
+                                                   char *err,
+                                                   size_t err_len) {
+    if (err && err_len) err[0] = '\0';
+    if (!w || !arg || !arg[0]) {
+        if (err && err_len) snprintf(err, err_len, "missing tool policy");
+        return false;
+    }
+    ds4_agent_tool_policy parsed;
+    if (ds4_agent_tool_policy_parse(arg, &parsed) != 0) {
+        if (err && err_len) snprintf(err, err_len, "invalid tool policy '%s'", arg);
+        return false;
+    }
+    if (grant)
+        ds4_agent_tool_policy_grant(&w->tool_policy, &parsed);
+    else
+        ds4_agent_tool_policy_revoke(&w->tool_policy, &parsed);
+    return true;
+}
+
+#ifdef DS4_AGENT_TEST
+static void test_agent_tool_policy_parse(void) {
+    ds4_agent_tool_policy pol;
+    char buf[256];
+    AGENT_TEST_ASSERT(ds4_agent_tool_policy_parse("all", &pol) == 0);
+    AGENT_TEST_ASSERT(pol.allow_all);
+    AGENT_TEST_ASSERT(!pol.allow_none);
+    AGENT_TEST_ASSERT(ds4_agent_tool_policy_parse("none", &pol) == 0);
+    AGENT_TEST_ASSERT(pol.allow_none);
+    AGENT_TEST_ASSERT(!pol.allow_all);
+    AGENT_TEST_ASSERT(ds4_agent_tool_policy_parse("off", &pol) == 0);
+    AGENT_TEST_ASSERT(pol.allow_none);
+    AGENT_TEST_ASSERT(ds4_agent_tool_policy_parse("", &pol) == 0);
+    AGENT_TEST_ASSERT(pol.allow_none);
+    AGENT_TEST_ASSERT(ds4_agent_tool_policy_parse(NULL, &pol) == 0);
+    AGENT_TEST_ASSERT(pol.allow_none);
+    AGENT_TEST_ASSERT(ds4_agent_tool_policy_parse("read", &pol) == 0);
+    AGENT_TEST_ASSERT(!pol.allow_all && !pol.allow_none);
+    AGENT_TEST_ASSERT(ds4_agent_tool_policy_allows(&pol, "read"));
+    AGENT_TEST_ASSERT(!ds4_agent_tool_policy_allows(&pol, "bash"));
+    AGENT_TEST_ASSERT(ds4_agent_tool_policy_parse("read,bash", &pol) == 0);
+    AGENT_TEST_ASSERT(ds4_agent_tool_policy_allows(&pol, "read"));
+    AGENT_TEST_ASSERT(ds4_agent_tool_policy_allows(&pol, "bash"));
+    AGENT_TEST_ASSERT(!ds4_agent_tool_policy_allows(&pol, "write"));
+    AGENT_TEST_ASSERT(ds4_agent_tool_policy_parse("read", &pol) == 0);
+    AGENT_TEST_ASSERT(ds4_agent_tool_policy_allows(&pol, "read"));
+    AGENT_TEST_ASSERT(ds4_agent_tool_policy_allows(&pol, "more"));
+    AGENT_TEST_ASSERT(ds4_agent_tool_policy_allows(&pol, "list"));
+    AGENT_TEST_ASSERT(ds4_agent_tool_policy_allows(&pol, "search"));
+    AGENT_TEST_ASSERT(!ds4_agent_tool_policy_allows(&pol, "write"));
+    AGENT_TEST_ASSERT(ds4_agent_tool_policy_parse("write", &pol) == 0);
+    AGENT_TEST_ASSERT(ds4_agent_tool_policy_allows(&pol, "read"));
+    AGENT_TEST_ASSERT(ds4_agent_tool_policy_allows(&pol, "write"));
+    AGENT_TEST_ASSERT(ds4_agent_tool_policy_allows(&pol, "edit"));
+    AGENT_TEST_ASSERT(!ds4_agent_tool_policy_allows(&pol, "bash"));
+    AGENT_TEST_ASSERT(ds4_agent_tool_policy_parse("bash", &pol) == 0);
+    AGENT_TEST_ASSERT(ds4_agent_tool_policy_allows(&pol, "bash"));
+    AGENT_TEST_ASSERT(ds4_agent_tool_policy_allows(&pol, "bash_status"));
+    AGENT_TEST_ASSERT(ds4_agent_tool_policy_allows(&pol, "bash_stop"));
+    AGENT_TEST_ASSERT(!ds4_agent_tool_policy_allows(&pol, "read"));
+    /* meta-tool: web */
+    AGENT_TEST_ASSERT(ds4_agent_tool_policy_parse("web", &pol) == 0);
+    AGENT_TEST_ASSERT(ds4_agent_tool_policy_allows(&pol, "web_browse"));
+    AGENT_TEST_ASSERT(ds4_agent_tool_policy_allows(&pol, "web_fetch"));
+    AGENT_TEST_ASSERT(!ds4_agent_tool_policy_allows(&pol, "read"));
+    AGENT_TEST_ASSERT(!ds4_agent_tool_policy_allows(&pol, "bash"));
+    AGENT_TEST_ASSERT(ds4_agent_tool_policy_parse("nonexistent_tool", &pol) == -1);
+    ds4_agent_tool_policy_parse("all", &pol);
+    ds4_agent_tool_policy_format(&pol, buf, sizeof(buf));
+    AGENT_TEST_ASSERT(!strcmp(buf, "all"));
+    ds4_agent_tool_policy_parse("none", &pol);
+    ds4_agent_tool_policy_format(&pol, buf, sizeof(buf));
+    AGENT_TEST_ASSERT(!strcmp(buf, "none"));
+    ds4_agent_tool_policy_parse("read,bash", &pol);
+    ds4_agent_tool_policy_format(&pol, buf, sizeof(buf));
+    AGENT_TEST_ASSERT(strstr(buf, "read") != NULL);
+    AGENT_TEST_ASSERT(strstr(buf, "bash") != NULL);
+    ds4_agent_tool_policy_parse("write", &pol);
+    ds4_agent_tool_policy_format(&pol, buf, sizeof(buf));
+    AGENT_TEST_ASSERT(!strcmp(buf, "write"));
+}
+
+static void test_agent_tool_policy_prompt_building(void) {
+    ds4_agent_tool_policy pol;
+    char *prompt;
+    ds4_agent_tool_policy_parse("none", &pol);
+    prompt = agent_build_filtered_tools_prompt(&pol);
+    AGENT_TEST_ASSERT(prompt != NULL);
+    AGENT_TEST_ASSERT(strstr(prompt, "## Tools") != NULL);
+    AGENT_TEST_ASSERT(strstr(prompt, "## Editing files") == NULL);
+    free(prompt);
+    ds4_agent_tool_policy_parse("web", &pol);
+    prompt = agent_build_filtered_tools_prompt(&pol);
+    AGENT_TEST_ASSERT(prompt != NULL);
+    AGENT_TEST_ASSERT(strstr(prompt, "Use web_browse") != NULL);
+    AGENT_TEST_ASSERT(strstr(prompt, "## Editing files") == NULL);
+    free(prompt);
+    ds4_agent_tool_policy_parse("bash", &pol);
+    prompt = agent_build_filtered_tools_prompt(&pol);
+    AGENT_TEST_ASSERT(prompt != NULL);
+    AGENT_TEST_ASSERT(strstr(prompt, "Run a shell command") != NULL);
+    AGENT_TEST_ASSERT(strstr(prompt, "## Editing files") == NULL);
+    free(prompt);
+    ds4_agent_tool_policy_parse("write", &pol);
+    prompt = agent_build_filtered_tools_prompt(&pol);
+    AGENT_TEST_ASSERT(prompt != NULL);
+    AGENT_TEST_ASSERT(strstr(prompt, "## Editing files") != NULL);
+    AGENT_TEST_ASSERT(strstr(prompt, "web_browse") == NULL);
+    free(prompt);
+}
+
+static void test_agent_tool_policy_session_mutation(void) {
+    agent_config cfg = {0};
+    agent_worker a = {0};
+    agent_worker b = {0};
+    char err[256];
+    ds4_agent_tool_policy_set_none(&a.tool_policy);
+    ds4_agent_tool_policy_set_none(&b.tool_policy);
+
+    a.cfg = &cfg;
+    b.cfg = &cfg;
+    AGENT_TEST_ASSERT(agent_worker_apply_tool_policy_command(
+        &a, true, "read", err, sizeof(err)));
+    AGENT_TEST_ASSERT(ds4_agent_tool_policy_allows(&a.tool_policy, "read"));
+    AGENT_TEST_ASSERT(!ds4_agent_tool_policy_allows(&b.tool_policy, "read"));
+
+    AGENT_TEST_ASSERT(agent_worker_apply_tool_policy_command(
+        &a, true, "web", err, sizeof(err)));
+    AGENT_TEST_ASSERT(ds4_agent_tool_policy_allows(&a.tool_policy, "read"));
+    AGENT_TEST_ASSERT(ds4_agent_tool_policy_allows(&a.tool_policy, "web_browse"));
+    AGENT_TEST_ASSERT(!ds4_agent_tool_policy_allows(&b.tool_policy, "web_browse"));
+
+    AGENT_TEST_ASSERT(agent_worker_apply_tool_policy_command(
+        &a, false, "read", err, sizeof(err)));
+    AGENT_TEST_ASSERT(!ds4_agent_tool_policy_allows(&a.tool_policy, "read"));
+    AGENT_TEST_ASSERT(ds4_agent_tool_policy_allows(&a.tool_policy, "web_browse"));
+
+    AGENT_TEST_ASSERT(agent_worker_apply_tool_policy_command(
+        &a, true, "all", err, sizeof(err)));
+    AGENT_TEST_ASSERT(ds4_agent_tool_policy_allows(&a.tool_policy, "bash"));
+    AGENT_TEST_ASSERT(agent_worker_apply_tool_policy_command(
+        &a, false, "all", err, sizeof(err)));
+    AGENT_TEST_ASSERT(a.tool_policy.allow_none);
+    AGENT_TEST_ASSERT(!ds4_agent_tool_policy_allows(&a.tool_policy, "bash"));
+
+    AGENT_TEST_ASSERT(agent_worker_apply_tool_policy_command(
+        &a, true, "off", err, sizeof(err)));
+    AGENT_TEST_ASSERT(a.tool_policy.allow_none);
+    AGENT_TEST_ASSERT(!agent_worker_apply_tool_policy_command(
+        &a, true, "not_a_tool", err, sizeof(err)));
+    AGENT_TEST_ASSERT(strstr(err, "invalid tool policy") != NULL);
+}
+
+static void test_agent_tool_policy_subagent_persistence(void) {
+    ds4_agent_tool_policy main_pol, sub_pol, saved;
+    ds4_agent_tool_policy_parse("read,bash", &main_pol);
+    AGENT_TEST_ASSERT(ds4_agent_tool_policy_allows(&main_pol, "read"));
+    AGENT_TEST_ASSERT(ds4_agent_tool_policy_allows(&main_pol, "bash"));
+    AGENT_TEST_ASSERT(!ds4_agent_tool_policy_allows(&main_pol, "web_browse"));
+    ds4_agent_tool_policy_parse("web", &sub_pol);
+    AGENT_TEST_ASSERT(ds4_agent_tool_policy_allows(&sub_pol, "web_browse"));
+    AGENT_TEST_ASSERT(!ds4_agent_tool_policy_allows(&sub_pol, "read"));
+    saved = sub_pol;
+    AGENT_TEST_ASSERT(ds4_agent_tool_policy_allows(&saved, "web_browse"));
+    AGENT_TEST_ASSERT(!ds4_agent_tool_policy_allows(&saved, "read"));
+    AGENT_TEST_ASSERT(ds4_agent_tool_policy_allows(&main_pol, "read"));
+    AGENT_TEST_ASSERT(!ds4_agent_tool_policy_allows(&main_pol, "web_browse"));
+}
+
+static void test_agent_tool_policy_dispatch_enforcement(void) {
+    char root_tmpl[] = "/tmp/ds4_agent_policy_dispatch_XXXXXX";
+    char *root_tmp = mkdtemp(root_tmpl);
+    AGENT_TEST_ASSERT(root_tmp != NULL);
+    if (!root_tmp) return;
+
+    agent_config cfg = {.non_interactive = true};
+    agent_worker w = {0};
+    w.cfg = &cfg;
+    w.wake_fd[0] = -1;
+    w.wake_fd[1] = -1;
+    pthread_mutex_init(&w.mu, NULL);
+    pthread_cond_init(&w.cond, NULL);
+    pthread_mutex_init(&w.docker_shell.mu, NULL);
+    AGENT_TEST_ASSERT(pipe(w.wake_fd) == 0);
+    ds4_agent_tool_policy_set_none(&w.tool_policy);
+
+    char root[PATH_MAX];
+    AGENT_TEST_ASSERT(realpath(root_tmp, root) != NULL);
+    agent_path_list_append(&w.working_directories, root);
+
+    char file_path[PATH_MAX];
+    snprintf(file_path, sizeof(file_path), "%s/policy.txt", root);
+    char err[256];
+    AGENT_TEST_ASSERT(agent_write_file_bytes(file_path, "policy ok\n", 10,
+                                             err, sizeof(err)) == 0);
+
+    agent_tool_arg read_args[] = {
+        {.name = "path", .value = "policy.txt", .is_string = true},
+    };
+    agent_tool_call read_call = {
+        .name = "read",
+        .args = read_args,
+        .argc = 1,
+    };
+
+    char *blocked = agent_execute_tool_call(&w, &read_call);
+    AGENT_TEST_ASSERT(strstr(blocked, "is not allowed") != NULL);
+    AGENT_TEST_ASSERT(w.out && strstr(w.out, "blocked by tool-access policy") != NULL);
+    free(blocked);
+
+    ds4_agent_tool_policy_parse("read", &w.tool_policy);
+    char *allowed = agent_execute_tool_call(&w, &read_call);
+    AGENT_TEST_ASSERT(strstr(allowed, "policy ok") != NULL);
+    free(allowed);
+
+    unlink(file_path);
+    rmdir(root);
+    agent_path_list_free(&w.working_directories);
+    free(w.out);
+    close(w.wake_fd[0]);
+    close(w.wake_fd[1]);
+    pthread_cond_destroy(&w.cond);
+    pthread_mutex_destroy(&w.mu);
+    pthread_mutex_destroy(&w.docker_shell.mu);
 }
 
 static void test_agent_worker_model_gate_serializes(void);
@@ -10341,6 +10851,11 @@ static void ds4_agent_unit_tests_run(void) {
     test_agent_tool_list_shell_argv_quoting();
     test_agent_subagent_api_lifecycle();
     test_agent_subagent_slash_command_recognition();
+    test_agent_tool_policy_parse();
+    test_agent_tool_policy_prompt_building();
+    test_agent_tool_policy_session_mutation();
+    test_agent_tool_policy_subagent_persistence();
+    test_agent_tool_policy_dispatch_enforcement();
     ds4_agent_subagent_unit_tests_run();
     test_agent_worker_model_gate_serializes();
 }
@@ -12190,6 +12705,22 @@ static pid_t agent_tool_pid(const agent_tool_call *call) {
 static char *agent_execute_tool_call(agent_worker *w, const agent_tool_call *call) {
     agent_buf result = {0};
     if (!call->name) return xstrdup("Tool error: missing tool name\n");
+    if (!ds4_agent_tool_policy_allows(&w->tool_policy, call->name)) {
+        char summary[256];
+        ds4_agent_tool_policy_format(&w->tool_policy, summary, sizeof(summary));
+        char header[512];
+        snprintf(header, sizeof(header),
+                 "\n[tool:%s] blocked by tool-access policy (%s)\n",
+                 call->name, summary);
+        agent_publish(w, header, strlen(header));
+        agent_buf_puts(&result, "Tool error: ");
+        agent_buf_puts(&result, call->name);
+        agent_buf_puts(&result, " is not allowed by current tool-access policy (");
+        agent_buf_puts(&result, summary);
+        agent_buf_puts(&result, ")\n");
+        return agent_buf_take(&result);
+    }
+
     if (agent_tool_requires_docker_sandbox(w, call->name) &&
         !agent_bash_use_docker_sandbox(w))
         return agent_tool_sandbox_required_error();
@@ -14931,6 +15462,10 @@ static void runtime_help(void) {
     puts("               Set thinking effort level.");
     puts("  /workspace   List workspace roots; +PATH adds, -PATH removes. The first root is the active workspace.");
     puts("  /subagent    Manage resident subagents: new, list, switch, send, stop, close, report, import.");
+    puts("  /allow <tools>");
+    puts("               Grant tool access to the active session (e.g. /allow read,bash).");
+    puts("  /disallow <tools>");
+    puts("               Revoke tool access from the active session (e.g. /disallow web or /disallow all).");
     puts("  /purge_auto_files");
     puts("               Delete auto-created files. Lists files, gives 5s to abort.");
     puts("  /new         Start a fresh session from the system prompt.");
@@ -16285,6 +16820,7 @@ int agent_worker_init(agent_worker *w, ds4_engine *engine, agent_config *cfg) {
     pthread_mutex_init(&w->docker_shell.mu, NULL);
     w->status.state = AGENT_WORKER_IDLE;
     w->status.think_mode = cfg->gen.think_mode;
+    ds4_agent_tool_policy_set_none(&w->tool_policy);
     for (int i = 0; i < cfg->working_directories.len; i++)
         agent_path_list_append(&w->working_directories, cfg->working_directories.v[i]);
     if (pipe(w->wake_fd) != 0) return -1;
@@ -16745,6 +17281,7 @@ static void test_agent_fake_worker_init(agent_worker *w, agent_config *cfg) {
     pthread_mutex_init(&w->docker_shell.mu, NULL);
     AGENT_TEST_ASSERT(pipe(w->wake_fd) == 0);
     w->status.state = AGENT_WORKER_IDLE;
+    ds4_agent_tool_policy_set_none(&w->tool_policy);
 }
 
 typedef struct {
@@ -17365,8 +17902,70 @@ static int run_agent(ds4_engine *engine, agent_config *cfg) {
                             printf("\n%d file%s deleted, %d stale, %d failed.\n",
                                    deleted, deleted == 1 ? "" : "s", stale, failed);
                         }
-                        for (int i = 0; i < n; i++) free(paths[i]);
-                        free(paths);
+	                        for (int i = 0; i < n; i++) free(paths[i]);
+	                        free(paths);
+	                    }
+                } else if (!strncmp(cmd, "/allow", 6) &&
+                           (cmd[6] == '\0' || cmd[6] == ' ' || cmd[6] == '\t')) {
+                    if (busy) {
+                        printf("command requires the model to be idle: %s\n", cmd);
+                    } else {
+                        char *arg = cmd + 6;
+                        while (*arg == ' ' || *arg == '\t') arg++;
+                        if (!arg[0]) {
+                            printf("usage: /allow <tools> (e.g. /allow read,bash)\n");
+                        } else {
+                            char err[256];
+                            if (!agent_worker_apply_tool_policy_command(
+                                    &worker, true, arg, err, sizeof(err))) {
+                                printf("error: %s\n", err);
+                            } else {
+                                char summary[256];
+                                ds4_agent_tool_policy_format(&worker.tool_policy,
+                                                             summary, sizeof(summary));
+                                printf("tool-access policy updated: %s\n", summary);
+                                char *reminder =
+                                    agent_build_system_prompt_reminder(&worker.tool_policy);
+                                agent_publish_system_status(
+                                    &worker,
+                                    "Tool policy changed; re-injecting system prompt...");
+                                ds4_tokenize_rendered_chat(worker.engine, reminder,
+                                                           &worker.transcript);
+                                free(reminder);
+                                agent_worker_note_system_prompt_seen(&worker);
+                            }
+                        }
+                    }
+                } else if (!strncmp(cmd, "/disallow", 9) &&
+                           (cmd[9] == '\0' || cmd[9] == ' ' || cmd[9] == '\t')) {
+                    if (busy) {
+                        printf("command requires the model to be idle: %s\n", cmd);
+                    } else {
+                        char *arg = cmd + 9;
+                        while (*arg == ' ' || *arg == '\t') arg++;
+                        if (!arg[0]) {
+                            printf("usage: /disallow <tools> (e.g. /disallow web or /disallow all)\n");
+                        } else {
+                            char err[256];
+                            if (!agent_worker_apply_tool_policy_command(
+                                    &worker, false, arg, err, sizeof(err))) {
+                                printf("error: %s\n", err);
+                            } else {
+                                char summary[256];
+                                ds4_agent_tool_policy_format(&worker.tool_policy,
+                                                             summary, sizeof(summary));
+                                printf("tool-access policy updated: %s\n", summary);
+                                char *reminder =
+                                    agent_build_system_prompt_reminder(&worker.tool_policy);
+                                agent_publish_system_status(
+                                    &worker,
+                                    "Tool policy changed; re-injecting system prompt...");
+                                ds4_tokenize_rendered_chat(worker.engine, reminder,
+                                                           &worker.transcript);
+                                free(reminder);
+                                agent_worker_note_system_prompt_seen(&worker);
+                            }
+                        }
                     }
                 } else if (ds4_agent_subagents_handle_command(subagents, cmd, busy)) {
                     worker_ptr = ds4_agent_subagents_active_worker(subagents);

@@ -16,6 +16,62 @@
 
 typedef struct agent_worker agent_worker;
 
+/* Tool-access policy model
+ *
+ * A session's tool-access policy is a normalized allow-set plus special
+ * flags for "all" and "none".  "off" is aliased to "none" at parse time.
+ * Meta-tools (read, write, web, bash) expand to concrete DSML tool names.
+ *
+ * The concrete DSML tool surface is:
+ *   read, more, write, list, edit, search
+ *   web_browse, web_fetch
+ *   bash, bash_status, bash_stop
+ */
+#define DS4_AGENT_CONCRETE_TOOL_COUNT 11
+
+/* Agent tool classes for prompt building and meta-tool expansion. */
+typedef enum {
+    AGENT_TOOLS_CLASS_READ,   /* read, more, list, search */
+    AGENT_TOOLS_CLASS_WRITE,  /* read, more, list, search, write, edit */
+    AGENT_TOOLS_CLASS_WEB,    /* web_browse, web_fetch */
+    AGENT_TOOLS_CLASS_BASH,   /* bash, bash_status, bash_stop */
+    AGENT_TOOLS_CLASS_COUNT
+} agent_tools_class;
+
+/* Map from agent_tools_class to the set of concrete tool indices included
+ * in that class.  The first element is the count of tools in the class,
+ * followed by the indices. */
+static const int agent_tools_class_indices[AGENT_TOOLS_CLASS_COUNT][7] = {
+    [AGENT_TOOLS_CLASS_READ]  = {4, 0, 1, 3, 5},
+    [AGENT_TOOLS_CLASS_WRITE] = {6, 0, 1, 3, 5, 2, 4},
+    [AGENT_TOOLS_CLASS_WEB]   = {2, 6, 7},
+    [AGENT_TOOLS_CLASS_BASH]  = {3, 8, 9, 10},
+};
+
+typedef struct {
+    bool allow_all;                          /* policy is "all" */
+    bool allow_none;                         /* policy is "none" (or "off") */
+    bool allowed[DS4_AGENT_CONCRETE_TOOL_COUNT]; /* per-tool allow bits */
+} ds4_agent_tool_policy;
+
+/* Parse a tool-access string into a normalized policy.
+ * Accepts: "all", "none", "off", comma-separated tool names.
+ * Meta-tool expansions:
+ *   "read"  -> read, more, list, search
+ *   "write" -> read, more, list, search, write, edit
+ *   "web"   -> web_browse, web_fetch
+ *   "bash"  -> bash, bash_status, bash_stop
+ * Returns 0 on success, -1 on parse error (unknown tool name).
+ */
+int ds4_agent_tool_policy_parse(const char *input, ds4_agent_tool_policy *out);
+
+/* Return a human-readable summary of the policy (e.g. "all", "none",
+ * "read, write, bash") into buf (len >= 256). */
+void ds4_agent_tool_policy_format(const ds4_agent_tool_policy *pol, char *buf, size_t len);
+
+/* Check whether a concrete tool name is allowed by the policy. */
+bool ds4_agent_tool_policy_allows(const ds4_agent_tool_policy *pol, const char *tool_name);
+
 typedef struct {
     const char *prompt;
     const char *system;
@@ -177,6 +233,7 @@ struct agent_worker {
     char session_slot_name[DS4_AGENT_SUBAGENT_NAME_MAX];
     int background_sessions;
     int unread_sessions;
+    ds4_agent_tool_policy tool_policy;
 };
 
 typedef struct {

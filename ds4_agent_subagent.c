@@ -26,6 +26,7 @@ typedef struct agent_session_slot {
     char stop_reason[DS4_AGENT_SUBAGENT_TEXT_MAX];
     int budget_limit;
     int budget_used;
+    ds4_agent_tool_policy tool_policy;
 } agent_session_slot;
 
 struct ds4_agent_subagents {
@@ -371,6 +372,7 @@ int ds4_agent_subagents_create_for_agent(ds4_agent_subagents **out,
     slot->id.value = mgr->next_id++;
     slot->autonomy = req.autonomy;
     slot->budget_limit = mgr->default_round_budget;
+    slot->tool_policy.allow_none = true;
     snprintf(slot->name, sizeof(slot->name), "%s", req.name);
     ds4_agent_subagent_config_copy(&slot->cfg, cfg);
     if (agent_worker_init(&slot->worker, engine, &slot->cfg) != 0) {
@@ -380,6 +382,7 @@ int ds4_agent_subagents_create_for_agent(ds4_agent_subagents **out,
         return -1;
     }
     slot->has_worker = true;
+    slot->worker.tool_policy = slot->tool_policy;
     slot->worker.model_gate = &mgr->model_gate;
     slot->worker.model_tool_round_budget = 0;
     mgr->active_id = slot->id.value;
@@ -413,7 +416,7 @@ static char *ds4_agent_subagent_mission_envelope(
     const char *name,
     const char *goal,
     ds4_agent_subagent_autonomy autonomy,
-    const char *allowed_tools,
+    const ds4_agent_tool_policy *tool_policy,
     const char *write_policy,
     int budget,
     const char *stop_conditions,
@@ -427,8 +430,14 @@ static char *ds4_agent_subagent_mission_envelope(
     agent_buf_puts(&b, "\nAutonomy mode: ");
     agent_buf_puts(&b, ds4_agent_subagent_autonomy_name(autonomy));
     agent_buf_puts(&b, "\nAllowed tools: ");
-    agent_buf_puts(&b, allowed_tools && allowed_tools[0] ?
-                   allowed_tools : "read, search, bash, web_fetch, web_browse");
+    /* Render the effective tool list from the parsed policy. */
+    if (tool_policy) {
+        char buf[256];
+        ds4_agent_tool_policy_format(tool_policy, buf, sizeof(buf));
+        agent_buf_puts(&b, buf);
+    } else {
+        agent_buf_puts(&b, "none");
+    }
     agent_buf_puts(&b, "\nWrite policy: ");
     agent_buf_puts(&b, write_policy && write_policy[0] ?
                    write_policy : "no file edits unless explicitly allowed");
@@ -466,6 +475,19 @@ int ds4_agent_subagent_create(ds4_agent_subagents *mgr,
     agent_session_slot *slot = &mgr->slots[mgr->len++];
     memset(slot, 0, sizeof(*slot));
     slot->id.value = mgr->next_id++;
+    /* Parse tool-access policy from request; default to none (no tools). */
+    if (req && req->allowed_tools && req->allowed_tools[0]) {
+        if (ds4_agent_tool_policy_parse(req->allowed_tools, &slot->tool_policy) != 0) {
+            ds4_agent_subagents_set_error(mgr,
+                "invalid tool-access policy '%s' for subagent %s",
+                req->allowed_tools, requested);
+            ds4_agent_subagent_slot_free(slot);
+            mgr->len--;
+            return -1;
+        }
+    } else {
+        slot->tool_policy.allow_none = true;
+    }
     slot->autonomy = req ? req->autonomy : DS4_AGENT_SUBAGENT_AUTONOMY_TAB;
     slot->budget_limit = req && req->round_budget > 0 ?
         req->round_budget : mgr->default_round_budget;
@@ -494,6 +516,8 @@ int ds4_agent_subagent_create(ds4_agent_subagents *mgr,
             slot->autonomy == DS4_AGENT_SUBAGENT_AUTONOMY_AUTONOMOUS ?
             slot->budget_limit : 0;
         slot->worker.subagents_disabled = true;
+        /* Sync tool-access policy to worker for dispatch enforcement. */
+        slot->worker.tool_policy = slot->tool_policy;
     }
 
     if (!mgr->active_id) mgr->active_id = slot->id.value;
@@ -502,7 +526,7 @@ int ds4_agent_subagent_create(ds4_agent_subagents *mgr,
                                   slot, "created subagent");
     if (req && req->prompt && req->prompt[0]) {
         char *mission = ds4_agent_subagent_mission_envelope(
-            slot->name, req->prompt, slot->autonomy, req->allowed_tools,
+            slot->name, req->prompt, slot->autonomy, &slot->tool_policy,
             req->write_policy, slot->budget_limit, req->stop_conditions,
             req->report_format);
         agent_prompt_queue_push(&slot->queue, mission);
@@ -957,7 +981,7 @@ static void ds4_agent_subagent_emit_usage(ds4_agent_subagents *mgr) {
     ds4_agent_subagents_active_printf(mgr, "usage:\n");
     ds4_agent_subagents_active_printf(
         mgr,
-        "  /subagent new [--tab|--background|--auto] [--thinking off|default|max] [name] [prompt]\n");
+        "  /subagent new [--tab|--background|--auto] [--thinking off|default|max] [--tools POLICY] [name] [prompt]\n");
     ds4_agent_subagents_active_printf(mgr, "  /subagent list\n");
     ds4_agent_subagents_active_printf(mgr, "  /subagent switch <id|name>\n");
     ds4_agent_subagents_active_printf(mgr, "  /subagent send <id|name> <prompt>\n");
@@ -1006,6 +1030,7 @@ bool ds4_agent_subagents_handle_command(ds4_agent_subagents *mgr,
         ds4_agent_subagent_autonomy mode = DS4_AGENT_SUBAGENT_AUTONOMY_BACKGROUND;
         ds4_think_mode think_mode = DS4_THINK_HIGH;
         bool think_mode_set = false;
+        char *allowed_tools = NULL;
         char *name = NULL;
         for (;;) {
             char *arg = ds4_agent_subagent_next_arg(&args);
@@ -1040,12 +1065,31 @@ bool ds4_agent_subagents_handle_command(ds4_agent_subagents *mgr,
                         "usage: /subagent new [--tab|--background|--auto] [--thinking off|default|max] [name] [prompt]\n");
                     return true;
                 }
-                think_mode_set = true;
+	                think_mode_set = true;
+	                continue;
+	            }
+            if (!strcmp(arg, "--tools") || !strcmp(arg, "--allowed-tools")) {
+                char *value = ds4_agent_subagent_next_arg(&args);
+                if (!value) {
+                    ds4_agent_subagents_active_printf(
+                        mgr,
+                        "usage: /subagent new [--tab|--background|--auto] [--thinking off|default|max] [--tools POLICY] [name] [prompt]\n");
+                    return true;
+                }
+                allowed_tools = value;
                 continue;
             }
-            name = arg;
-            break;
-        }
+            if (!strncmp(arg, "--tools=", 8)) {
+                allowed_tools = arg + 8;
+                continue;
+            }
+            if (!strncmp(arg, "--allowed-tools=", 16)) {
+                allowed_tools = arg + 16;
+                continue;
+            }
+	            name = arg;
+	            break;
+	        }
         while (args && (*args == ' ' || *args == '\t')) args++;
         const char *prompt = args && args[0] ? args : NULL;
         if (!prompt && mode == DS4_AGENT_SUBAGENT_AUTONOMY_BACKGROUND)
@@ -1053,10 +1097,11 @@ bool ds4_agent_subagents_handle_command(ds4_agent_subagents *mgr,
         ds4_agent_subagent_create_request req = {
             .name = name,
             .prompt = prompt,
-            .autonomy = mode,
-            .think_mode = think_mode,
-            .think_mode_set = think_mode_set,
-        };
+	            .autonomy = mode,
+	            .think_mode = think_mode,
+	            .think_mode_set = think_mode_set,
+	            .allowed_tools = allowed_tools,
+	        };
         ds4_agent_subagent_id id = {0};
         if (ds4_agent_subagent_create(mgr, &req, &id) != 0)
             ds4_agent_subagents_active_printf(
@@ -1212,10 +1257,12 @@ static agent_session_slot *test_agent_subagent_add_fake_slot(
     slot->id.value = id;
     slot->autonomy = DS4_AGENT_SUBAGENT_AUTONOMY_TAB;
     slot->budget_limit = 9;
+    slot->tool_policy.allow_none = true;
     snprintf(slot->name, sizeof(slot->name), "%s", name);
     slot->cfg.gen.ctx_size = 1234;
     slot->cfg.gen.think_mode = DS4_THINK_HIGH;
     test_agent_fake_worker_init(&slot->worker, &slot->cfg);
+    slot->worker.tool_policy = slot->tool_policy;
     slot->has_worker = true;
     return slot;
 }
@@ -1281,6 +1328,34 @@ static void test_agent_subagent_new_command_accepts_thinking_flag(void) {
     AGENT_TEST_ASSERT(ds4_agent_subagents_handle_command(mgr, cmd2, false));
     AGENT_TEST_ASSERT(mgr->len == 3);
     AGENT_TEST_ASSERT(mgr->slots[2].cfg.gen.think_mode == DS4_THINK_MAX);
+
+    ds4_agent_subagents_destroy(mgr);
+}
+
+static void test_agent_subagent_new_command_accepts_tools_flag(void) {
+    ds4_agent_subagents *mgr = NULL;
+    AGENT_TEST_ASSERT(ds4_agent_subagents_create(&mgr, NULL, NULL) == 0);
+
+    ds4_agent_subagent_id main_id = {0};
+    ds4_agent_subagent_create_request main_req = {
+        .name = "main",
+        .autonomy = DS4_AGENT_SUBAGENT_AUTONOMY_TAB,
+    };
+    AGENT_TEST_ASSERT(ds4_agent_subagent_create(mgr, &main_req, &main_id) == 0);
+
+    char cmd1[] = "/subagent new --tools read,web scout inspect docs";
+    AGENT_TEST_ASSERT(ds4_agent_subagents_handle_command(mgr, cmd1, false));
+    AGENT_TEST_ASSERT(mgr->len == 2);
+    AGENT_TEST_ASSERT(ds4_agent_tool_policy_allows(
+        &mgr->slots[1].tool_policy, "read"));
+    AGENT_TEST_ASSERT(ds4_agent_tool_policy_allows(
+        &mgr->slots[1].tool_policy, "web_browse"));
+    AGENT_TEST_ASSERT(!ds4_agent_tool_policy_allows(
+        &mgr->slots[1].tool_policy, "bash"));
+
+    char cmd2[] = "/subagent new --tools=not_a_tool bad";
+    AGENT_TEST_ASSERT(ds4_agent_subagents_handle_command(mgr, cmd2, false));
+    AGENT_TEST_ASSERT(mgr->len == 2);
 
     ds4_agent_subagents_destroy(mgr);
 }
@@ -1469,6 +1544,7 @@ void ds4_agent_subagent_unit_tests_run(void) {
     test_agent_subagent_error_notifications_remain_visible();
     test_agent_subagent_create_think_mode_inherits_or_overrides();
     test_agent_subagent_new_command_accepts_thinking_flag();
+    test_agent_subagent_new_command_accepts_tools_flag();
     test_agent_subagent_switch_preserves_thinking_modes();
 }
 #endif
