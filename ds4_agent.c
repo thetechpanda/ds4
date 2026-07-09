@@ -858,6 +858,7 @@ static const char agent_tools_prompt_edit_line[] =
     "Use write for new files or deliberate whole-file replacement. Use edit with path, old, and new for changes. "
     "For edit, always put the edited file path as the first parameter. "
     "The old text must match exactly once in the current file; otherwise edit fails for safety.\n"
+    "When file content needs the literal text \\n (backslash followed by n), emit it in write.content, edit.old, or edit.new as \\\\n; actual line breaks should remain real newlines.\n"
     "For large replacements, prefer anchored old text: write the first lines, then [upto], then the final lines. "
     "The tool replaces everything from the head through the tail. If the head or tail is ambiguous, the edit fails.\n"
     "When old uses [upto], new may use one [upto] to keep the original omitted middle at that point.\n"
@@ -1629,6 +1630,49 @@ static const char *agent_tool_arg_value(const agent_tool_call *call, const char 
     return NULL;
 }
 
+static bool agent_file_tool_param_uses_literal_escape_markup(const char *tool,
+                                                            const char *param) {
+    if (!tool || !param) return false;
+    if (!strcmp(tool, "write") && !strcmp(param, "content")) return true;
+    if (!strcmp(tool, "edit") &&
+        (!strcmp(param, "old") || !strcmp(param, "new")))
+        return true;
+    return false;
+}
+
+static char *agent_file_tool_decode_literal_escape_markup(const char *value,
+                                                          size_t value_len,
+                                                          size_t *out_len) {
+    char *out = xmalloc(value_len + 1);
+    size_t out_pos = 0;
+    size_t i = 0;
+    while (i < value_len) {
+        if (value[i] != '\\') {
+            out[out_pos++] = value[i];
+            i++;
+            continue;
+        }
+
+        size_t slash_start = i;
+        while (i < value_len && value[i] == '\\') i++;
+        size_t slash_count = i - slash_start;
+        if (i < value_len && value[i] == 'n') {
+            size_t keep = slash_count == 1 ? 1 : (slash_count + 1) / 2;
+            for (size_t j = 0; j < keep; j++)
+                out[out_pos++] = '\\';
+            out[out_pos++] = 'n';
+            i++;
+            continue;
+        }
+
+        memcpy(out + out_pos, value + slash_start, slash_count);
+        out_pos += slash_count;
+    }
+    out[out_pos] = '\0';
+    if (out_len) *out_len = out_pos;
+    return out;
+}
+
 static void agent_dsml_parser_free(agent_dsml_parser *p) {
     if (!p) return;
     free(p->raw);
@@ -1776,10 +1820,19 @@ static void agent_dsml_parse(agent_dsml_parser *p) {
             char *end = agent_dsml_find_close_tag(p->raw + p->param_value_start,
                                                   "parameter", &end_tag_len);
             if (!end) return;
+            const char *value = p->raw + p->param_value_start;
+            size_t value_len = (size_t)(end - value);
+            char *decoded = NULL;
+            if (agent_file_tool_param_uses_literal_escape_markup(
+                    p->current.name, p->param_name))
+            {
+                decoded = agent_file_tool_decode_literal_escape_markup(
+                    value, value_len, &value_len);
+                value = decoded;
+            }
             agent_tool_call_add_arg(&p->current, p->param_name ? p->param_name : "",
-                                    p->raw + p->param_value_start,
-                                    (size_t)(end - (p->raw + p->param_value_start)),
-                                    p->param_is_string);
+                                    value, value_len, p->param_is_string);
+            free(decoded);
             p->param_close_prefix = false;
             free(p->param_name);
             p->param_name = NULL;
@@ -8525,6 +8578,163 @@ static void test_agent_tool_edit_new_upto_merges_omitted_middle(void) {
     rmdir(root);
 }
 
+static void test_agent_dsml_file_literal_escape_markup(void) {
+    const char *dsml =
+        "<｜DSML｜tool_calls>"
+        "<｜DSML｜invoke name=\"write\">"
+        "<｜DSML｜parameter name=\"path\" string=\"true\">sample.txt</｜DSML｜parameter>"
+        "<｜DSML｜parameter name=\"content\" string=\"true\">line one\nliteral \\\\n tail</｜DSML｜parameter>"
+        "</｜DSML｜invoke>"
+        "</｜DSML｜tool_calls>";
+    agent_dsml_parser p = {.state = AGENT_DSML_SEARCH};
+    agent_dsml_feed(&p, dsml, strlen(dsml));
+
+    AGENT_TEST_ASSERT(p.state == AGENT_DSML_DONE);
+    AGENT_TEST_ASSERT(p.calls.len == 1);
+    if (p.calls.len == 1) {
+        const agent_tool_call *call = &p.calls.v[0];
+        const char *content = agent_tool_arg_value(call, "content");
+        AGENT_TEST_ASSERT(content != NULL);
+        AGENT_TEST_ASSERT(content && strcmp(content, "line one\nliteral \\n tail") == 0);
+        AGENT_TEST_ASSERT(content && strstr(content, "\\\\n") == NULL);
+    }
+    agent_dsml_parser_free(&p);
+}
+
+static void test_agent_file_literal_escape_decode_function_only(void) {
+    const char *encoded = "before \\\\n after\nreal newline";
+    size_t decoded_len = 0;
+    char *decoded = agent_file_tool_decode_literal_escape_markup(
+        encoded, strlen(encoded), &decoded_len);
+    AGENT_TEST_ASSERT(decoded != NULL);
+    if (decoded) {
+        AGENT_TEST_ASSERT(decoded_len == strlen("before \\n after\nreal newline"));
+        AGENT_TEST_ASSERT(strcmp(decoded, "before \\n after\nreal newline") == 0);
+        free(decoded);
+    }
+
+    decoded = agent_file_tool_decode_literal_escape_markup(
+        "already \\n literal", strlen("already \\n literal"), &decoded_len);
+    AGENT_TEST_ASSERT(decoded != NULL);
+    if (decoded) {
+        AGENT_TEST_ASSERT(decoded_len == strlen("already \\n literal"));
+        AGENT_TEST_ASSERT(strcmp(decoded, "already \\n literal") == 0);
+        free(decoded);
+    }
+}
+
+static void test_agent_tool_write_preserves_literal_backslash_n(void) {
+    char root_tmpl[] = "/tmp/ds4_agent_literal_write_XXXXXX";
+    char *root_tmp = mkdtemp(root_tmpl);
+    AGENT_TEST_ASSERT(root_tmp != NULL);
+    if (!root_tmp) return;
+
+    agent_config cfg = {.non_interactive = true};
+    agent_worker w = {.cfg = &cfg};
+    char root[PATH_MAX];
+    AGENT_TEST_ASSERT(realpath(root_tmp, root) != NULL);
+    agent_path_list_append(&w.working_directories, root);
+
+    const char *expected = "line one\nliteral \\n tail\n";
+    agent_tool_arg write_args[] = {
+        {.name = "path", .value = "literal.txt", .is_string = true},
+        {.name = "content", .value = (char *)expected, .is_string = true},
+    };
+    agent_tool_call write_call = {
+        .name = "write",
+        .args = write_args,
+        .argc = 2,
+    };
+    char *write_result = agent_tool_write(&w, &write_call);
+    AGENT_TEST_ASSERT(write_result != NULL);
+    AGENT_TEST_ASSERT(write_result && strstr(write_result, "Wrote ") != NULL);
+    free(write_result);
+
+    char file_path[PATH_MAX];
+    snprintf(file_path, sizeof(file_path), "%s/literal.txt", root);
+    char err[128] = {0};
+    char *data = NULL;
+    size_t len = 0;
+    AGENT_TEST_ASSERT(agent_read_file_bytes(file_path, &data, &len,
+                                            err, sizeof(err)) == 0);
+    if (data) {
+        AGENT_TEST_ASSERT(len == strlen(expected));
+        AGENT_TEST_ASSERT(strcmp(data, expected) == 0);
+        AGENT_TEST_ASSERT(strstr(data, "\\n") != NULL);
+        free(data);
+    }
+
+    unlink(file_path);
+    agent_path_list_free(&w.working_directories);
+    rmdir(root);
+}
+
+static void test_agent_tool_edit_preserves_literal_backslash_n(void) {
+    char root_tmpl[] = "/tmp/ds4_agent_literal_edit_XXXXXX";
+    char *root_tmp = mkdtemp(root_tmpl);
+    AGENT_TEST_ASSERT(root_tmp != NULL);
+    if (!root_tmp) return;
+
+    agent_config cfg = {.non_interactive = true};
+    agent_worker w = {.cfg = &cfg};
+    char root[PATH_MAX];
+    AGENT_TEST_ASSERT(realpath(root_tmp, root) != NULL);
+    agent_path_list_append(&w.working_directories, root);
+
+    char file_path[PATH_MAX];
+    snprintf(file_path, sizeof(file_path), "%s/literal.txt", root);
+    const char *initial = "alpha \\n beta\nsecond line\n";
+    const char *expected = "gamma \\n delta\nsecond line\n";
+    char err[128] = {0};
+    AGENT_TEST_ASSERT(agent_write_file_bytes(file_path, initial, strlen(initial),
+                                             err, sizeof(err)) == 0);
+
+    agent_tool_arg mismatch_args[] = {
+        {.name = "path", .value = "literal.txt", .is_string = true},
+        {.name = "old", .value = "alpha \n beta", .is_string = true},
+        {.name = "new", .value = "should not apply", .is_string = true},
+    };
+    agent_tool_call mismatch_call = {
+        .name = "edit",
+        .args = mismatch_args,
+        .argc = 3,
+    };
+    char *mismatch = agent_tool_edit(&w, &mismatch_call);
+    AGENT_TEST_ASSERT(mismatch != NULL);
+    AGENT_TEST_ASSERT(mismatch && strstr(mismatch, "old text") != NULL);
+    free(mismatch);
+
+    agent_tool_arg edit_args[] = {
+        {.name = "path", .value = "literal.txt", .is_string = true},
+        {.name = "old", .value = "alpha \\n beta", .is_string = true},
+        {.name = "new", .value = "gamma \\n delta", .is_string = true},
+    };
+    agent_tool_call edit_call = {
+        .name = "edit",
+        .args = edit_args,
+        .argc = 3,
+    };
+    char *result = agent_tool_edit(&w, &edit_call);
+    AGENT_TEST_ASSERT(result != NULL);
+    AGENT_TEST_ASSERT(result && strstr(result, "old/new replacement") != NULL);
+    free(result);
+
+    char *data = NULL;
+    size_t len = 0;
+    AGENT_TEST_ASSERT(agent_read_file_bytes(file_path, &data, &len,
+                                            err, sizeof(err)) == 0);
+    if (data) {
+        AGENT_TEST_ASSERT(len == strlen(expected));
+        AGENT_TEST_ASSERT(strcmp(data, expected) == 0);
+        AGENT_TEST_ASSERT(strstr(data, "\\n") != NULL);
+        free(data);
+    }
+
+    unlink(file_path);
+    agent_path_list_free(&w.working_directories);
+    rmdir(root);
+}
+
 static void test_agent_working_directory_path_resolution(void) {
     char root_tmpl[] = "/tmp/ds4_agent_jail_root_XXXXXX";
     char outside_tmpl[] = "/tmp/ds4_agent_jail_out_XXXXXX";
@@ -10807,6 +11017,10 @@ static void ds4_agent_unit_tests_run(void) {
     test_agent_edit_upto_accepts_indented_marker_line();
     test_agent_edit_new_literal_upto_is_not_merge_marker();
     test_agent_tool_edit_new_upto_merges_omitted_middle();
+    test_agent_dsml_file_literal_escape_markup();
+    test_agent_file_literal_escape_decode_function_only();
+    test_agent_tool_write_preserves_literal_backslash_n();
+    test_agent_tool_edit_preserves_literal_backslash_n();
     test_agent_working_directory_path_resolution();
     test_agent_working_directory_file_tools();
     test_agent_default_working_directory_from_launch_cwd();
