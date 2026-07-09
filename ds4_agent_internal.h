@@ -26,8 +26,9 @@ typedef struct agent_worker agent_worker;
  *   read, more, write, list, edit, search
  *   web_browse, web_fetch
  *   bash, bash_status, bash_stop
+ *   mkdir
  */
-#define DS4_AGENT_CONCRETE_TOOL_COUNT 11
+#define DS4_AGENT_CONCRETE_TOOL_COUNT 12
 
 /* Agent tool classes for prompt building and meta-tool expansion. */
 typedef enum {
@@ -41,9 +42,9 @@ typedef enum {
 /* Map from agent_tools_class to the set of concrete tool indices included
  * in that class.  The first element is the count of tools in the class,
  * followed by the indices. */
-static const int agent_tools_class_indices[AGENT_TOOLS_CLASS_COUNT][7] = {
+static const int agent_tools_class_indices[AGENT_TOOLS_CLASS_COUNT][8] = {
     [AGENT_TOOLS_CLASS_READ]  = {4, 0, 1, 3, 5},
-    [AGENT_TOOLS_CLASS_WRITE] = {6, 0, 1, 3, 5, 2, 4},
+    [AGENT_TOOLS_CLASS_WRITE] = {7, 0, 1, 3, 5, 2, 4, 11},
     [AGENT_TOOLS_CLASS_WEB]   = {2, 6, 7},
     [AGENT_TOOLS_CLASS_BASH]  = {3, 8, 9, 10},
 };

@@ -1088,6 +1088,22 @@ static const char agent_tool_schema_web_fetch[] =
     "  }\n"
     "}\n\n";
 
+static const char agent_tool_schema_mkdir[] =
+    "{\n"
+    "  \"type\": \"function\",\n"
+    "  \"function\": {\n"
+    "    \"name\": \"mkdir\",\n"
+    "    \"description\": \"Recursively create directories for the given path. Respects workspace folder rules.\",\n"
+    "    \"parameters\": {\n"
+    "      \"type\": \"object\",\n"
+    "      \"properties\": {\n"
+    "        \"path\": {\"type\": \"string\"}\n"
+    "      },\n"
+    "      \"required\": [\"path\"]\n"
+    "    }\n"
+    "  }\n"
+    "}\n\n";
+
 /* Rules section — always included after tool schemas. */
 static const char agent_tools_prompt_rules[] =
     "# Rules\n\n"
@@ -1104,7 +1120,7 @@ static const char agent_tools_prompt_rules[] =
 /* Map from concrete tool index to its schema string.  Indices match the
  * DS4_AGENT_CONCRETE_TOOL_COUNT ordering: read(0), more(1), write(2),
  * list(3), edit(4), search(5), web_browse(6), web_fetch(7), bash(8),
- * bash_status(9), bash_stop(10). */
+ * bash_status(9), bash_stop(10), mkdir(11). */
 static const char *agent_tool_schemas[DS4_AGENT_CONCRETE_TOOL_COUNT] = {
     [0]  = agent_tool_schema_read,
     [1]  = agent_tool_schema_more,
@@ -1117,6 +1133,7 @@ static const char *agent_tool_schemas[DS4_AGENT_CONCRETE_TOOL_COUNT] = {
     [8]  = agent_tool_schema_bash,
     [9]  = agent_tool_schema_bash_status,
     [10] = agent_tool_schema_bash_stop,
+    [11] = agent_tool_schema_mkdir,
 };
 
 /* Build a filtered tools prompt that only includes schemas and guidance for
@@ -6711,6 +6728,8 @@ static bool agent_docker_write_file_bytes(agent_worker *w, const char *path,
                                           const char *data, size_t len,
                                           char *err, size_t err_len,
                                           agent_buf *stderr_out);
+static bool agent_docker_mkdir_p(agent_worker *w, const char *path,
+                                  char *err, size_t err_len);
 #ifdef DS4_AGENT_TEST
 static bool agent_docker_shell_exec_argv(agent_worker *w,
                                           char *const cmd_argv[],
@@ -6729,6 +6748,7 @@ static bool agent_docker_shell_exec_argv_stderr(agent_worker *w,
 static char *agent_tool_edit(agent_worker *w, const agent_tool_call *call);
 static char *agent_tool_list(agent_worker *w, const agent_tool_call *call);
 static char *agent_tool_search(agent_worker *w, const agent_tool_call *call);
+static char *agent_tool_mkdir(agent_worker *w, const agent_tool_call *call);
 
 static bool agent_tool_result_fits_context(agent_worker *w, const char *result,
                                            int reserve_tokens,
@@ -7128,6 +7148,45 @@ static char *agent_tool_write(agent_worker *w, const agent_tool_call *call) {
     free(stderr_out.ptr);
     free(file_path);
     return agent_buf_take(&result);
+}
+
+static char *agent_tool_mkdir(agent_worker *w, const agent_tool_call *call) {
+    const char *path = agent_tool_arg_value(call, "path");
+    if (!path || !path[0]) return xstrdup("Tool error: mkdir requires path\n");
+    char err[256];
+    char *resolved = agent_resolve_tool_path(w, path, AGENT_PATH_PARENT,
+                                             err, sizeof(err));
+    if (!resolved) {
+        agent_buf b = {0};
+        agent_buf_puts(&b, "Tool error: ");
+        agent_buf_puts(&b, err);
+        agent_buf_puts(&b, "\n");
+        return agent_buf_take(&b);
+    }
+    const char *display_path = resolved;
+    bool ok = false;
+    if (agent_tool_use_docker_filesystem(w)) {
+        ok = agent_docker_mkdir_p(w, resolved, err, sizeof(err));
+    } else {
+        ok = agent_mkdir_p(resolved);
+    }
+    if (!ok) {
+        agent_buf b = {0};
+        agent_buf_puts(&b, "Tool error: mkdir failed");
+        if (!agent_tool_use_docker_filesystem(w)) {
+            agent_buf_puts(&b, ": ");
+            agent_buf_puts(&b, strerror(errno));
+        }
+        agent_buf_puts(&b, "\n");
+        free(resolved);
+        return agent_buf_take(&b);
+    }
+    if (!agent_path_list_contains(&w->auto_allowed_paths, resolved))
+        agent_path_list_append(&w->auto_allowed_paths, resolved);
+    char msg[PATH_MAX + 64];
+    snprintf(msg, sizeof(msg), "Created directory %s\n", display_path);
+    free(resolved);
+    return xstrdup(msg);
 }
 
 static char *agent_tool_list(agent_worker *w, const agent_tool_call *call) {
@@ -7753,20 +7812,17 @@ static bool agent_docker_shell_start(agent_worker *w) {
     return true;
 }
 
-/* What: append a chunk of persistent-shell command output to the caller buffer
- * and optionally mirror visible command output to the terminal.
- * Why: all Docker shell reads need one output policy, including unbounded reads
- * for file contents and bounded output for status-like commands.
+/* What: append a chunk of persistent-shell command output to the caller buffer.
+ * Why: the persistent Docker shell is an internal transport for file tools; its
+ * stdout often contains parser protocol such as resolved paths or line markers
+ * and should not be mirrored by /command_output.
  * Callers: agent_docker_shell_exec() while draining command output before the
  * sentinel line or after EOF without a sentinel. */
 static void agent_docker_shell_emit_output(agent_worker *w, agent_buf *out,
                                            const char *s, size_t n,
-                                           bool unbounded_output,
-                                           bool command_output,
-                                           bool *command_output_seen) {
+                                           bool unbounded_output) {
+    (void)w;
     if (!s || !n) return;
-    if (command_output)
-        agent_publish_command_output_chunk(w, s, n, command_output_seen);
     if (!out) return;
     if (unbounded_output)
         agent_buf_append_full(out, s, n);
@@ -7967,8 +8023,6 @@ static bool agent_docker_shell_exec(agent_worker *w,
      * position 0 of a chunk after a line boundary). */
     bool saw_sentinel = false;
     int rc = -1;
-    bool command_output = w && w->cfg && w->cfg->command_output;
-    bool command_output_seen = false;
     agent_buf pending = {0};
 
     for (;;) {
@@ -7985,8 +8039,7 @@ static bool agent_docker_shell_exec(agent_worker *w,
         if (s) {
             size_t before = (size_t)(s - pending.ptr);
             agent_docker_shell_emit_output(w, out, pending.ptr, before,
-                                           unbounded_output, command_output,
-                                           &command_output_seen);
+                                           unbounded_output);
             saw_sentinel = true;
             break;
         }
@@ -7998,16 +8051,14 @@ static bool agent_docker_shell_exec(agent_worker *w,
         if (pending.len > keep) {
             size_t emit = pending.len - keep;
             agent_docker_shell_emit_output(w, out, pending.ptr, emit,
-                                           unbounded_output, command_output,
-                                           &command_output_seen);
+                                           unbounded_output);
             agent_buf_discard_prefix(&pending, emit);
         }
     }
 
     if (!saw_sentinel && pending.len > 0)
         agent_docker_shell_emit_output(w, out, pending.ptr, pending.len,
-                                       unbounded_output, command_output,
-                                       &command_output_seen);
+                                       unbounded_output);
     free(pending.ptr);
 
     /* Strip trailing newline from output if present. */
@@ -9696,9 +9747,9 @@ static void test_agent_docker_shell_parses_output_and_exit_code(void) {
     pthread_mutex_destroy(&w.docker_shell.mu);
 }
 
-/* What: verify command-output mirroring skips leading blank-only chunks.
- * Why: blank Docker command output should not repaint noisy empty terminal
- * lines.
+/* What: verify persistent Docker shell output is captured but not mirrored.
+ * Why: file-tool helpers use the persistent shell for path resolution and
+ * parsing protocols; /command_output should not display those internals.
  * Callers: ds4_agent_unit_tests_run(). */
 static void test_agent_docker_shell_command_output_skips_blank_only(void) {
     int stdin_pipe[2];
@@ -9741,7 +9792,19 @@ static void test_agent_docker_shell_command_output_skips_blank_only(void) {
     AGENT_TEST_ASSERT(status == 0);
     AGENT_TEST_ASSERT(w.out == NULL);
 
+    agent_buf path_out = {0};
+    int path_status = 0;
+    AGENT_TEST_ASSERT(agent_docker_shell_exec(&w,
+                                              "printf '/tmp/file\\n/tmp\\n'",
+                                              false, "test", &path_out,
+                                              &path_status));
+    AGENT_TEST_ASSERT(path_status == 0);
+    AGENT_TEST_ASSERT(path_out.ptr != NULL);
+    AGENT_TEST_ASSERT(strstr(path_out.ptr, "/tmp/file") != NULL);
+    AGENT_TEST_ASSERT(w.out == NULL);
+
     free(out.ptr);
+    free(path_out.ptr);
     close(w.wake_fd[0]);
     close(w.wake_fd[1]);
     close(stdin_pipe[1]);
@@ -10141,6 +10204,27 @@ static void test_agent_bash_publish_observation_command_output_off(void) {
         "<output>\n"
         "hidden\n"
         "</output>\n";
+    agent_bash_publish_observation(&w, obs);
+    AGENT_TEST_ASSERT(w.out == NULL);
+
+    close(w.wake_fd[0]);
+    close(w.wake_fd[1]);
+    pthread_mutex_destroy(&w.mu);
+}
+
+static void test_agent_bash_publish_observation_skips_nonempty_body(void) {
+    agent_config cfg = {.command_output = true};
+    agent_worker w = {0};
+    w.cfg = &cfg;
+    AGENT_TEST_ASSERT(pipe(w.wake_fd) == 0);
+    pthread_mutex_init(&w.mu, NULL);
+
+    const char *obs =
+        "bash job=1 pid=42 status=running elapsed_sec=0.1 timeout_sec=5\n"
+        "output_path=/tmp/ds4_agent_output_test (12 bytes, 1 lines)\n"
+        "<tail -4 /tmp/ds4_agent_output_test>\n"
+        "old-output\n"
+        "</tail>\n";
     agent_bash_publish_observation(&w, obs);
     AGENT_TEST_ASSERT(w.out == NULL);
 
@@ -10577,6 +10661,7 @@ static const char *agent_tool_name_for_index(int idx) {
     static const char *names[DS4_AGENT_CONCRETE_TOOL_COUNT] = {
         "read", "more", "write", "list", "edit", "search",
         "web_browse", "web_fetch", "bash", "bash_status", "bash_stop",
+        "mkdir",
     };
     return idx >= 0 && idx < DS4_AGENT_CONCRETE_TOOL_COUNT ? names[idx] : NULL;
 }
@@ -11066,6 +11151,7 @@ static void ds4_agent_unit_tests_run(void) {
     test_agent_docker_effective_working_directory_prefers_primary_root();
     test_agent_bash_publish_observation_command_output_on();
     test_agent_bash_publish_observation_command_output_off();
+    test_agent_bash_publish_observation_skips_nonempty_body();
     test_agent_docker_bash_publishes_command_output();
     test_agent_docker_shell_debug_argv_includes_docker_exec();
     test_agent_docker_shell_stop_is_idempotent();
@@ -12482,6 +12568,35 @@ static bool agent_docker_write_file_bytes(agent_worker *w, const char *path,
     return true;
 }
 
+/* What: create a directory tree inside the Docker sandbox using `mkdir -p`.
+ * Why: the mkdir tool needs Docker filesystem support; this follows the
+ * same pattern as agent_docker_write_file_bytes but simpler (no stdin pipe).
+ * Callers: agent_tool_mkdir(). */
+static bool agent_docker_mkdir_p(agent_worker *w, const char *path,
+                                  char *err, size_t err_len) {
+    if (!path || !path[0]) {
+        snprintf(err, err_len, "missing path");
+        return false;
+    }
+    char *argv[] = {"mkdir", "-p", (char *)path, NULL};
+    agent_buf out = {0};
+    agent_buf err_buf = {0};
+    int status = 0;
+    bool ok = agent_docker_shell_exec_argv_stderr(w, argv, false,
+                                                  "docker mkdir", &out,
+                                                  &err_buf, &status);
+    free(out.ptr);
+    if (!ok || status != 0) {
+        snprintf(err, err_len, "%s",
+                 err_buf.ptr && err_buf.ptr[0] ? err_buf.ptr :
+                 "mkdir failed in container");
+        free(err_buf.ptr);
+        return false;
+    }
+    free(err_buf.ptr);
+    return true;
+}
+
 static void agent_bash_exec_local(const char *cmd, const char *working_dir,
                                   const char *temp_dir) {
     if (working_dir && chdir(working_dir) != 0) _exit(126);
@@ -12865,10 +12980,6 @@ static void agent_bash_publish_observation(agent_worker *w, const char *obs) {
         }
         return;
     }
-    /* Publish the output body with grey highlighting when command_output is on. */
-    agent_publish(w, "\x1b[90m", 5);
-    agent_publish(w, body, n);
-    agent_publish(w, "\x1b[0m", 4);
 }
 
 static void agent_bash_refresh_for(agent_worker *w, agent_bash_job *job,
@@ -12958,6 +13069,7 @@ static char *agent_execute_tool_call(agent_worker *w, const agent_tool_call *cal
     if (!strcmp(call->name, "search")) return agent_tool_search(w, call);
     if (!strcmp(call->name, "web_browse")) return agent_tool_web_browse(w, call);
     if (!strcmp(call->name, "web_fetch")) return agent_tool_web_fetch(w, call);
+    if (!strcmp(call->name, "mkdir")) return agent_tool_mkdir(w, call);
 
     if (!strcmp(call->name, "bash")) {
         const char *cmd = agent_tool_arg_value(call, "command");
