@@ -1118,22 +1118,37 @@ static const char agent_tools_prompt_rules[] =
     "unless explicitly asked otherwise by the user.\n";
 
 /* Map from concrete tool index to its schema string.  Indices match the
- * DS4_AGENT_CONCRETE_TOOL_COUNT ordering: read(0), more(1), write(2),
+ * AGENT_TOOLS_CLASS_COUNT ordering: read(0), more(1), write(2),
  * list(3), edit(4), search(5), web_browse(6), web_fetch(7), bash(8),
  * bash_status(9), bash_stop(10), mkdir(11). */
-static const char *agent_tool_schemas[DS4_AGENT_CONCRETE_TOOL_COUNT] = {
-    [0]  = agent_tool_schema_read,
-    [1]  = agent_tool_schema_more,
-    [2]  = agent_tool_schema_write,
-    [3]  = agent_tool_schema_list,
-    [4]  = agent_tool_schema_edit,
-    [5]  = agent_tool_schema_search,
-    [6]  = agent_tool_schema_web_browse,
-    [7]  = agent_tool_schema_web_fetch,
-    [8]  = agent_tool_schema_bash,
-    [9]  = agent_tool_schema_bash_status,
-    [10] = agent_tool_schema_bash_stop,
-    [11] = agent_tool_schema_mkdir,
+static const char *agent_tool_schemas[AGENT_TOOL_COUNT] = {
+    [AGENT_TOOL_READ]        = agent_tool_schema_read,
+    [AGENT_TOOL_MORE]        = agent_tool_schema_more,
+    [AGENT_TOOL_WRITE]       = agent_tool_schema_write,
+    [AGENT_TOOL_LIST]        = agent_tool_schema_list,
+    [AGENT_TOOL_EDIT]        = agent_tool_schema_edit,
+    [AGENT_TOOL_SEARCH]      = agent_tool_schema_search,
+    [AGENT_TOOL_WEB_BROWSE]  = agent_tool_schema_web_browse,
+    [AGENT_TOOL_WEB_FETCH]   = agent_tool_schema_web_fetch,
+    [AGENT_TOOL_BASH]        = agent_tool_schema_bash,
+    [AGENT_TOOL_BASH_STATUS] = agent_tool_schema_bash_status,
+    [AGENT_TOOL_BASH_STOP]   = agent_tool_schema_bash_stop,
+    [AGENT_TOOL_MKDIR]       = agent_tool_schema_mkdir,
+};
+
+static const char *agent_tool_names[AGENT_TOOL_COUNT] = {
+    [AGENT_TOOL_READ]        = "read",
+    [AGENT_TOOL_MORE]        = "more",
+    [AGENT_TOOL_WRITE]       = "write",
+    [AGENT_TOOL_LIST]        = "list",
+    [AGENT_TOOL_EDIT]        = "edit",
+    [AGENT_TOOL_SEARCH]      = "search",
+    [AGENT_TOOL_WEB_BROWSE]  = "web_browse",
+    [AGENT_TOOL_WEB_FETCH]   = "web_fetch",
+    [AGENT_TOOL_BASH]        = "bash",
+    [AGENT_TOOL_BASH_STATUS] = "bash_status",
+    [AGENT_TOOL_BASH_STOP]   = "bash_stop",
+    [AGENT_TOOL_MKDIR]       = "mkdir",
 };
 
 /* Build a filtered tools prompt that only includes schemas and guidance for
@@ -1163,7 +1178,7 @@ static char *agent_build_filtered_tools_prompt(const ds4_agent_tool_policy *pol)
 
     /* Include individual tool schemas for each allowed concrete tool.
      * When pol is NULL, include all tools. */
-    for (int i = 0; i < DS4_AGENT_CONCRETE_TOOL_COUNT; i++) {
+    for (int i = 0; i < AGENT_TOOL_COUNT; i++) {
         bool include = !pol || pol->allow_all ||
             (pol->allow_none ? false : pol->allowed[i]);
         if (include && agent_tool_schemas[i])
@@ -10658,17 +10673,12 @@ static void test_agent_subagent_slash_command_recognition(void) {
 /* Parse a comma-separated list of tool names / meta-tools into a normalized
  * policy.  Returns 0 on success, -1 on unknown tool name. */
 static const char *agent_tool_name_for_index(int idx) {
-    static const char *names[DS4_AGENT_CONCRETE_TOOL_COUNT] = {
-        "read", "more", "write", "list", "edit", "search",
-        "web_browse", "web_fetch", "bash", "bash_status", "bash_stop",
-        "mkdir",
-    };
-    return idx >= 0 && idx < DS4_AGENT_CONCRETE_TOOL_COUNT ? names[idx] : NULL;
+    return idx >= 0 && idx < AGENT_TOOL_COUNT ? agent_tool_names[idx] : NULL;
 }
 
 static int agent_tool_index_for_name(const char *name) {
     if (!name) return -1;
-    for (int i = 0; i < DS4_AGENT_CONCRETE_TOOL_COUNT; i++) {
+    for (int i = 0; i < AGENT_TOOL_COUNT; i++) {
         const char *tool = agent_tool_name_for_index(i);
         if (tool && !strcmp(name, tool)) return i;
     }
@@ -10690,7 +10700,7 @@ static void ds4_agent_tool_policy_set_all(ds4_agent_tool_policy *pol) {
 static bool ds4_agent_tool_policy_any_allowed(const ds4_agent_tool_policy *pol) {
     if (!pol || pol->allow_none) return false;
     if (pol->allow_all) return true;
-    for (int i = 0; i < DS4_AGENT_CONCRETE_TOOL_COUNT; i++)
+    for (int i = 0; i < AGENT_TOOL_COUNT; i++)
         if (pol->allowed[i]) return true;
     return false;
 }
@@ -10701,7 +10711,7 @@ static void ds4_agent_tool_policy_allow_class(ds4_agent_tool_policy *pol,
     int count = agent_tools_class_indices[cls][0];
     for (int j = 1; j <= count; j++) {
         int idx = agent_tools_class_indices[cls][j];
-        if (idx >= 0 && idx < DS4_AGENT_CONCRETE_TOOL_COUNT)
+        if (idx >= 0 && idx < AGENT_TOOL_COUNT)
             pol->allowed[idx] = true;
     }
 }
@@ -10714,7 +10724,7 @@ static bool ds4_agent_tool_policy_class_allowed(const ds4_agent_tool_policy *pol
     int count = agent_tools_class_indices[cls][0];
     for (int j = 1; j <= count; j++) {
         int idx = agent_tools_class_indices[cls][j];
-        if (idx < 0 || idx >= DS4_AGENT_CONCRETE_TOOL_COUNT ||
+        if (idx < 0 || idx >= AGENT_TOOL_COUNT ||
             !pol->allowed[idx])
             return false;
     }
@@ -10767,7 +10777,7 @@ bool ds4_agent_tool_policy_allows(const ds4_agent_tool_policy *pol, const char *
     if (pol->allow_all)  return true;
     if (pol->allow_none) return false;
     int idx = agent_tool_index_for_name(tool_name);
-    if (idx < 0 || idx >= DS4_AGENT_CONCRETE_TOOL_COUNT) return false;
+    if (idx < 0 || idx >= AGENT_TOOL_COUNT) return false;
     return pol->allowed[idx];
 }
 
@@ -10776,7 +10786,7 @@ void ds4_agent_tool_policy_format(const ds4_agent_tool_policy *pol, char *buf, s
     if (!pol) { buf[0] = '\0'; return; }
     if (pol->allow_all)  { snprintf(buf, len, "all");  return; }
     if (pol->allow_none) { snprintf(buf, len, "none"); return; }
-    bool covered[DS4_AGENT_CONCRETE_TOOL_COUNT] = {0};
+    bool covered[AGENT_TOOL_COUNT] = {0};
     char tmp[256] = "";
     int first = 1;
 
@@ -10796,7 +10806,7 @@ void ds4_agent_tool_policy_format(const ds4_agent_tool_policy *pol, char *buf, s
         int count = agent_tools_class_indices[cls][0];
         for (int j = 1; j <= count; j++) {
             int idx = agent_tools_class_indices[cls][j];
-            if (idx < 0 || idx >= DS4_AGENT_CONCRETE_TOOL_COUNT ||
+            if (idx < 0 || idx >= AGENT_TOOL_COUNT ||
                 !covered[idx]) {
                 all_covered = false;
                 break;
@@ -10808,12 +10818,12 @@ void ds4_agent_tool_policy_format(const ds4_agent_tool_policy *pol, char *buf, s
         strcat(tmp, classes[k].name);
         for (int j = 1; j <= count; j++) {
             int idx = agent_tools_class_indices[cls][j];
-            if (idx >= 0 && idx < DS4_AGENT_CONCRETE_TOOL_COUNT)
+            if (idx >= 0 && idx < AGENT_TOOL_COUNT)
                 covered[idx] = true;
         }
     }
 
-    for (int i = 0; i < DS4_AGENT_CONCRETE_TOOL_COUNT; i++) {
+    for (int i = 0; i < AGENT_TOOL_COUNT; i++) {
         if (covered[i] || !pol->allowed[i]) continue;
         const char *tool = agent_tool_name_for_index(i);
         if (tool) {
@@ -10839,7 +10849,7 @@ static void ds4_agent_tool_policy_grant(ds4_agent_tool_policy *dst,
     }
     if (dst->allow_all) return;
     dst->allow_none = false;
-    for (int i = 0; i < DS4_AGENT_CONCRETE_TOOL_COUNT; i++)
+    for (int i = 0; i < AGENT_TOOL_COUNT; i++)
         if (grant->allowed[i]) dst->allowed[i] = true;
     if (!ds4_agent_tool_policy_any_allowed(dst))
         ds4_agent_tool_policy_set_none(dst);
@@ -10855,10 +10865,10 @@ static void ds4_agent_tool_policy_revoke(ds4_agent_tool_policy *dst,
     if (dst->allow_all) {
         dst->allow_all = false;
         dst->allow_none = false;
-        for (int i = 0; i < DS4_AGENT_CONCRETE_TOOL_COUNT; i++)
+        for (int i = 0; i < AGENT_TOOL_COUNT; i++)
             dst->allowed[i] = !remove->allowed[i];
     } else if (!dst->allow_none) {
-        for (int i = 0; i < DS4_AGENT_CONCRETE_TOOL_COUNT; i++)
+        for (int i = 0; i < AGENT_TOOL_COUNT; i++)
             if (remove->allowed[i]) dst->allowed[i] = false;
     }
     if (!ds4_agent_tool_policy_any_allowed(dst))
@@ -14220,6 +14230,24 @@ static void worker_update_status_writable_locked(agent_worker *w) {
     free(auto_allowed.ptr);
 }
 
+/* What: compute the four-character tool-permissions string (R=read, W=write,
+ * B=browse/web, X=bash) from the worker's tool policy.
+ * Why: the UI footer shows which tool classes are enabled next to the sandbox
+ * name so the user can see the effective access level at a glance.
+ * Callers: worker_update_status_*_locked functions. */
+static void worker_update_status_tool_policy_locked(agent_worker *w) {
+    const ds4_agent_tool_policy *pol = &w->tool_policy;
+    w->status.tool_permissions[0] =
+        ds4_agent_tool_policy_class_allowed(pol, AGENT_TOOLS_CLASS_READ)  ? 'R' : '-';
+    w->status.tool_permissions[1] =
+        ds4_agent_tool_policy_class_allowed(pol, AGENT_TOOLS_CLASS_WRITE) ? 'W' : '-';
+    w->status.tool_permissions[2] =
+        ds4_agent_tool_policy_class_allowed(pol, AGENT_TOOLS_CLASS_WEB)   ? 'B' : '-';
+    w->status.tool_permissions[3] =
+        ds4_agent_tool_policy_class_allowed(pol, AGENT_TOOLS_CLASS_BASH)  ? 'X' : '-';
+    w->status.tool_permissions[4] = '\0';
+}
+
 /* Request interruption at the next model/tool polling point. */
 void worker_interrupt(agent_worker *w) {
     pthread_mutex_lock(&w->mu);
@@ -14261,6 +14289,7 @@ void worker_consume(agent_worker *w, char **out, size_t *out_len, agent_status *
     worker_update_status_workspace_locked(w);
     worker_update_status_docker_locked(w);
     worker_update_status_writable_locked(w);
+    worker_update_status_tool_policy_locked(w);
     if (status) *status = w->status;
     w->wake_pending = false;
     pthread_mutex_unlock(&w->mu);
@@ -14272,6 +14301,7 @@ void worker_get_status(agent_worker *w, agent_status *status) {
     worker_update_status_workspace_locked(w);
     worker_update_status_docker_locked(w);
     worker_update_status_writable_locked(w);
+    worker_update_status_tool_policy_locked(w);
     *status = w->status;
     pthread_mutex_unlock(&w->mu);
 }
@@ -14291,6 +14321,7 @@ static bool worker_is_initialized(agent_worker *w, agent_status *status) {
     worker_update_status_workspace_locked(w);
     worker_update_status_docker_locked(w);
     worker_update_status_writable_locked(w);
+    worker_update_status_tool_policy_locked(w);
     if (status) *status = w->status;
     bool initialized = w->initialized;
     pthread_mutex_unlock(&w->mu);
@@ -14519,10 +14550,11 @@ static void build_status_text(const agent_status *st, char *buf, size_t len) {
     } else {
         session_suffix[0] = '\0';
     }
+    const char *perms = st->tool_permissions[0] ? st->tool_permissions : "----";
     if (st->docker_container[0])
-        snprintf(sandbox, sizeof(sandbox), "✅ %s | ", st->docker_container);
+        snprintf(sandbox, sizeof(sandbox), "✅ %s | %s | ", st->docker_container, perms);
     else
-        snprintf(sandbox, sizeof(sandbox), "🚨 no-sandbox | ");
+        snprintf(sandbox, sizeof(sandbox), "🚨 no-sandbox | %s | ", perms);
 
     switch (st->state) {
     case AGENT_WORKER_WAITING_MODEL:
