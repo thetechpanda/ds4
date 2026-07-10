@@ -14,6 +14,11 @@
 #include <stdio.h>
 #include <sys/types.h>
 
+#define AGENT_ASK_QUESTION_TEXT_MAX 2048
+#define AGENT_ASK_QUESTION_CHOICE_MAX 256
+#define AGENT_ASK_QUESTION_MAX_CHOICES 16
+#define AGENT_ASK_QUESTION_ANSWER_MAX 4096
+
 typedef struct agent_worker agent_worker;
 
 /* Agent tool list */
@@ -215,6 +220,14 @@ struct agent_worker {
     int path_approval_option_count;
     char path_approval_choice[PATH_MAX];
     char path_approval_error[160];
+    bool question_pending;
+    bool question_answered;
+    bool question_interrupted;
+    char question_message[AGENT_ASK_QUESTION_TEXT_MAX];
+    char question_choices[AGENT_ASK_QUESTION_MAX_CHOICES][AGENT_ASK_QUESTION_CHOICE_MAX];
+    int question_choice_count;
+    char *question_answer;
+    char question_error[160];
     bool queued_user_drain_pending;
     bool queued_user_drain_answered;
     char *queued_user_drain_text;
@@ -299,6 +312,15 @@ bool worker_take_path_approval_request(agent_worker *w, char *message,
                                        int *option_count);
 void worker_answer_path_approval(agent_worker *w, bool allow,
                                  const char *choice, const char *err);
+bool worker_take_question_request(agent_worker *w,
+                                  char *message,
+                                  size_t message_len,
+                                  char choices[AGENT_ASK_QUESTION_MAX_CHOICES][AGENT_ASK_QUESTION_CHOICE_MAX],
+                                  int *choice_count);
+void worker_answer_question(agent_worker *w,
+                            bool interrupted,
+                            const char *answer,
+                            const char *err);
 bool worker_take_queued_user_drain_request(agent_worker *w);
 void worker_answer_queued_user_drain(agent_worker *w, char *text);
 void drain_wake_fd(int fd);
@@ -340,6 +362,17 @@ void ds4_agent_subagents_answer_path_approval(ds4_agent_subagents *mgr,
                                              bool allow,
                                              const char *choice,
                                              const char *err);
+bool ds4_agent_subagents_take_question(ds4_agent_subagents *mgr,
+                                       ds4_agent_subagent_id *id,
+                                       char *msg,
+                                       size_t msg_len,
+                                       char choices[AGENT_ASK_QUESTION_MAX_CHOICES][AGENT_ASK_QUESTION_CHOICE_MAX],
+                                       int *choice_count);
+void ds4_agent_subagents_answer_question(ds4_agent_subagents *mgr,
+                                         ds4_agent_subagent_id id,
+                                         bool interrupted,
+                                         const char *answer,
+                                         const char *err);
 bool ds4_agent_subagents_take_queued_user_drain(ds4_agent_subagents *mgr);
 void ds4_agent_subagents_submit_ready(ds4_agent_subagents *mgr);
 bool ds4_agent_subagents_handle_command(ds4_agent_subagents *mgr,

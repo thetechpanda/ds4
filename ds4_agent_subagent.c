@@ -931,6 +931,39 @@ void ds4_agent_subagents_answer_path_approval(ds4_agent_subagents *mgr,
         worker_answer_path_approval(&slot->worker, allow, choice, err);
 }
 
+bool ds4_agent_subagents_take_question(ds4_agent_subagents *mgr,
+                                       ds4_agent_subagent_id *id,
+                                       char *msg,
+                                       size_t msg_len,
+                                       char choices[AGENT_ASK_QUESTION_MAX_CHOICES][AGENT_ASK_QUESTION_CHOICE_MAX],
+                                       int *choice_count) {
+    if (!mgr || !msg || msg_len == 0) return false;
+    for (size_t i = 0; i < mgr->len; i++) {
+        agent_session_slot *slot = &mgr->slots[i];
+        if (!slot->has_worker) continue;
+        char inner[AGENT_ASK_QUESTION_TEXT_MAX] = {0};
+        if (worker_take_question_request(&slot->worker, inner, sizeof(inner),
+                                         choices, choice_count)) {
+            if (id) *id = slot->id;
+            snprintf(msg, msg_len, "[subagent %s] %s", slot->name, inner);
+            ds4_agent_subagents_push_event(mgr,
+                DS4_AGENT_SUBAGENT_EVENT_APPROVAL, slot, "question requested");
+            return true;
+        }
+    }
+    return false;
+}
+
+void ds4_agent_subagents_answer_question(ds4_agent_subagents *mgr,
+                                         ds4_agent_subagent_id id,
+                                         bool interrupted,
+                                         const char *answer,
+                                         const char *err) {
+    agent_session_slot *slot = ds4_agent_subagents_slot_by_id(mgr, id);
+    if (slot && slot->has_worker)
+        worker_answer_question(&slot->worker, interrupted, answer, err);
+}
+
 bool ds4_agent_subagents_take_queued_user_drain(ds4_agent_subagents *mgr) {
     if (!mgr) return false;
     for (size_t i = 0; i < mgr->len; i++) {

@@ -41,6 +41,11 @@ static bool agent_parse_bool_default(const char *s, bool def);
 static bool agent_executable_exists(const char *path);
 static bool agent_command_in_path(const char *command);
 static bool agent_bash_use_docker_sandbox(const agent_worker *w);
+static bool agent_prompt_ask_question(const char *prompt,
+                                      char choices[AGENT_ASK_QUESTION_MAX_CHOICES][AGENT_ASK_QUESTION_CHOICE_MAX],
+                                      int choice_count,
+                                      char answer[AGENT_ASK_QUESTION_ANSWER_MAX],
+                                      bool *interrupted);
 
 /* ============================================================================
  * Configuration, Worker State, And Streaming Types
@@ -183,6 +188,11 @@ typedef struct {
     char read_whole[8];
     char tool_path[512];
     bool code_param_active;
+    bool ask_question_style;
+    bool ask_question_question_active;
+    bool ask_question_preview_started;
+    bool ask_question_preview_done;
+    char ask_question_preview[256];
 } agent_tool_visualizer;
 
 typedef struct {
@@ -237,6 +247,10 @@ static void agent_web_log(void *privdata, const char *message);
 static bool agent_preflight_edit_old(agent_worker *w, const agent_tool_call *call,
                                      char *err, size_t err_len);
 static char *agent_execute_tool_call(agent_worker *w, const agent_tool_call *call);
+static void agent_string_array_free(char **v, int count);
+static bool agent_json_parse_string_array(const char *json,
+                                          char ***out_v,
+                                          int *out_count);
 static int agent_worker_sync_tokens(agent_worker *w, const ds4_tokens *tokens,
                                     bool publish_progress,
                                     char *err, size_t err_len);
@@ -886,6 +900,26 @@ static const char agent_tools_prompt_edit_line[] =
 /* Individual tool JSON schemas for per-tool filtering.
  * Each entry includes guidance text so the model knows when to use it. */
 
+static const char agent_tool_schema_ask_question[] =
+    "Use ask_question when a decision requires user clarification, especially during exploratory work, planning, "
+    "or before performing an action. If you provide choices, the UI will always also offer Interrupt and "
+    "Something else; do not include those fallback choices yourself.\n\n"
+    "{\n"
+    "  \"type\": \"function\",\n"
+    "  \"function\": {\n"
+    "    \"name\": \"ask_question\",\n"
+    "    \"description\": \"When a decision is required you can ask a question to clarify, especially when planning changes or before performing an action.\",\n"
+    "    \"parameters\": {\n"
+    "      \"type\": \"object\",\n"
+    "      \"properties\": {\n"
+    "        \"question\": {\"type\": \"string\"},\n"
+    "        \"choices\": {\"type\": \"array\", \"items\": {\"type\": \"string\"}}\n"
+    "      },\n"
+    "      \"required\": [\"question\"]\n"
+    "    }\n"
+    "  }\n"
+    "}\n\n";
+
 static const char agent_tool_schema_bash[] =
     "For long-running bash commands, pass refresh_sec. If a bash job is still running, use "
     "bash_status to check it early or bash_stop to terminate it.\n\n"
@@ -1105,6 +1139,8 @@ static const char agent_tool_schema_mkdir[] =
 static const char agent_tools_prompt_rules[] =
     "# Rules\n\n"
     "- Always use strict syntax for DSML tool stanzas.\n"
+    "- Use ask_question when exploratory work, planning, or a decision point requires clarification from the user; "
+    "when enough context exists, proceed without asking unnecessary questions.\n"
     "- This system runs on local inference of a few hundred tokens/s of prefill, "
     "and a few tens of tokens/s decoding speed. Use read/search to get the "
     "anchors you need, then use anchored edit to avoid having to "
@@ -1156,10 +1192,16 @@ static bool agent_tool_policy_includes_index(const ds4_agent_tool_policy *pol,
     return pol->allowed[idx];
 }
 
+static bool agent_tool_is_policy_exempt(const char *tool_name) {
+    return tool_name && !strcmp(tool_name, "ask_question");
+}
+
 static void agent_append_available_tools(agent_buf *b,
                                          const ds4_agent_tool_policy *pol) {
     agent_buf_puts(b, "Available tools: ");
     int first = 1;
+    agent_buf_puts(b, "ask_question");
+    first = 0;
     for (int i = 0; i < AGENT_TOOL_COUNT; i++) {
         const char *tool = agent_tool_names[i];
         if (!tool) continue;
@@ -1168,7 +1210,6 @@ static void agent_append_available_tools(agent_buf *b,
         first = 0;
         agent_buf_puts(b, tool);
     }
-    if (first) agent_buf_puts(b, "none");
     agent_buf_puts(b, "\n");
 }
 
@@ -1183,6 +1224,7 @@ static char *agent_build_filtered_tools_prompt(const ds4_agent_tool_policy *pol)
     agent_buf_puts(&b, "\n");
     agent_append_available_tools(&b, pol);
     agent_buf_puts(&b, "\n");
+    agent_buf_puts(&b, agent_tool_schema_ask_question);
 
     /* Include editing instructions if any WRITE-class tool is allowed
      * (includes READ-class tools since they're a subset of WRITE). */
@@ -3225,6 +3267,7 @@ static void agent_tool_viz_tool(agent_stream_renderer *sr, const char *name) {
     snprintf(v->tool_name, sizeof(v->tool_name), "%s", name ? name : "tool");
     v->tool_announced = true;
     v->read_style = !strcmp(v->tool_name, "read");
+    v->ask_question_style = !strcmp(v->tool_name, "ask_question");
     agent_tool_viz_line_prefix(sr);
     if (v->read_style) {
         renderer_color(sr->renderer, "\x1b[1;37m");
@@ -3250,6 +3293,25 @@ static void agent_tool_viz_append(char *dst, size_t cap, char c) {
     if (len + 1 >= cap) return;
     dst[len] = c;
     dst[len + 1] = '\0';
+}
+
+static void agent_tool_viz_question_preview_byte(agent_tool_visualizer *v,
+                                                 char c) {
+    if (v->ask_question_preview_done) return;
+    unsigned char uc = (unsigned char)c;
+    if (c == '\r' || c == '\n') {
+        if (v->ask_question_preview_started)
+            v->ask_question_preview_done = true;
+        return;
+    }
+    if (!v->ask_question_preview_started) {
+        if (uc <= ' ' || uc >= 0x80) return;
+        v->ask_question_preview_started = true;
+    }
+    if (uc < ' ' && c != '\t') return;
+    if (c == '\t') c = ' ';
+    agent_tool_viz_append(v->ask_question_preview,
+                          sizeof(v->ask_question_preview), c);
 }
 
 static void agent_tool_viz_read_value_byte(agent_stream_renderer *sr, char c) {
@@ -3388,8 +3450,23 @@ static void agent_tool_viz_param_begin(agent_stream_renderer *sr, const char *na
     v->param_kind = agent_tool_param_kind_for(v->tool_name, v->param_name);
     v->param_active = true;
     v->param_end_len = 0;
+    v->ask_question_question_active = false;
 
     if (v->read_style) return;
+
+    if (v->ask_question_style) {
+        if (!strcmp(v->param_name, "question")) {
+            if (!v->at_line_start) agent_tool_viz_puts(sr, " ");
+            renderer_color(sr->renderer, "\x1b[1;37m");
+            agent_tool_viz_puts(sr, "question=");
+            renderer_color(sr->renderer, agent_tool_param_color(v->param_kind));
+            v->ask_question_question_active = true;
+            v->ask_question_preview_started = false;
+            v->ask_question_preview_done = false;
+            v->ask_question_preview[0] = '\0';
+        }
+        return;
+    }
 
     if (v->param_kind == AGENT_TOOL_PARAM_DIFF_OLD ||
         v->param_kind == AGENT_TOOL_PARAM_DIFF_NEW)
@@ -3432,7 +3509,13 @@ static void agent_tool_viz_param_end(agent_stream_renderer *sr) {
     agent_tool_visualizer *v = &sr->viz;
     v->param_end_len = 0;
     if (v->code_param_active) agent_tool_viz_code_end(sr);
+    if (v->ask_question_question_active) {
+        agent_tool_viz_puts(sr, v->ask_question_preview[0] ?
+                            v->ask_question_preview : "<question>");
+        v->at_line_start = false;
+    }
     if (!v->read_style) renderer_color(sr->renderer, "\x1b[0m");
+    v->ask_question_question_active = false;
     v->param_active = false;
     v->param_name[0] = '\0';
 }
@@ -3441,6 +3524,11 @@ static void agent_tool_viz_param_raw_byte(agent_stream_renderer *sr, char c) {
     agent_tool_visualizer *v = &sr->viz;
     if (v->read_style) {
         agent_tool_viz_read_value_byte(sr, c);
+        return;
+    }
+    if (v->ask_question_style) {
+        if (v->ask_question_question_active)
+            agent_tool_viz_question_preview_byte(v, c);
         return;
     }
     if (v->param_kind == AGENT_TOOL_PARAM_PATH) {
@@ -4592,6 +4680,103 @@ void worker_answer_path_approval(agent_worker *w, bool allow,
         snprintf(w->path_approval_error, sizeof(w->path_approval_error),
                  "%s", deny_error && deny_error[0] ? deny_error :
                  "user denied working directory add");
+    pthread_cond_signal(&w->cond);
+    agent_wake_locked(w);
+    pthread_mutex_unlock(&w->mu);
+}
+
+static char *worker_request_question(agent_worker *w,
+                                     const char *question,
+                                     char **choices,
+                                     int choice_count) {
+    if (!w || !w->cfg || w->cfg->non_interactive)
+        return xstrdup("Tool error: ask_question requires an interactive user\n");
+    if (!question || !question[0])
+        return xstrdup("Tool error: ask_question requires question\n");
+
+    pthread_mutex_lock(&w->mu);
+    w->question_pending = true;
+    w->question_answered = false;
+    w->question_interrupted = false;
+    free(w->question_answer);
+    w->question_answer = NULL;
+    w->question_error[0] = '\0';
+    snprintf(w->question_message, sizeof(w->question_message), "%s", question);
+    w->question_choice_count = 0;
+    for (int i = 0; i < choice_count && i < AGENT_ASK_QUESTION_MAX_CHOICES; i++) {
+        if (!choices[i] || !choices[i][0]) continue;
+        snprintf(w->question_choices[w->question_choice_count],
+                 AGENT_ASK_QUESTION_CHOICE_MAX, "%s", choices[i]);
+        w->question_choice_count++;
+    }
+    agent_wake_locked(w);
+    pthread_cond_signal(&w->cond);
+    while (!w->stop && !w->interrupt && !w->question_answered)
+        pthread_cond_wait(&w->cond, &w->mu);
+
+    bool interrupted = w->question_interrupted;
+    char *answer = w->question_answer ? xstrdup(w->question_answer) : NULL;
+    char err[160];
+    snprintf(err, sizeof(err), "%s", w->question_error);
+    if (!w->question_answered && (w->stop || w->interrupt)) {
+        interrupted = true;
+        w->question_pending = false;
+        snprintf(err, sizeof(err), "interrupted");
+    }
+    w->question_answered = false;
+    free(w->question_answer);
+    w->question_answer = NULL;
+    pthread_mutex_unlock(&w->mu);
+
+    agent_buf result = {0};
+    if (interrupted) {
+        agent_buf_puts(&result, "Question interrupted by user.\n");
+    } else if (answer && answer[0]) {
+        agent_buf_puts(&result, "Answer: ");
+        agent_buf_puts(&result, answer);
+        agent_buf_puts(&result, "\n");
+    } else {
+        agent_buf_puts(&result, "Tool error: ");
+        agent_buf_puts(&result, err[0] ? err : "ask_question received no answer");
+        agent_buf_puts(&result, "\n");
+    }
+    free(answer);
+    return agent_buf_take(&result);
+}
+
+bool worker_take_question_request(agent_worker *w,
+                                  char *message,
+                                  size_t message_len,
+                                  char choices[AGENT_ASK_QUESTION_MAX_CHOICES][AGENT_ASK_QUESTION_CHOICE_MAX],
+                                  int *choice_count) {
+    pthread_mutex_lock(&w->mu);
+    bool pending = w->question_pending;
+    if (pending) {
+        snprintf(message, message_len, "%s", w->question_message);
+        if (choice_count) *choice_count = w->question_choice_count;
+        for (int i = 0; i < w->question_choice_count &&
+                        i < AGENT_ASK_QUESTION_MAX_CHOICES; i++)
+            snprintf(choices[i], AGENT_ASK_QUESTION_CHOICE_MAX, "%s",
+                     w->question_choices[i]);
+        w->question_pending = false;
+    } else if (choice_count) {
+        *choice_count = 0;
+    }
+    pthread_mutex_unlock(&w->mu);
+    return pending;
+}
+
+void worker_answer_question(agent_worker *w,
+                            bool interrupted,
+                            const char *answer,
+                            const char *err) {
+    pthread_mutex_lock(&w->mu);
+    w->question_interrupted = interrupted;
+    w->question_answered = true;
+    free(w->question_answer);
+    w->question_answer = answer ? xstrdup(answer) : NULL;
+    snprintf(w->question_error, sizeof(w->question_error), "%s",
+             err && err[0] ? err : "");
     pthread_cond_signal(&w->cond);
     agent_wake_locked(w);
     pthread_mutex_unlock(&w->mu);
@@ -10966,6 +11151,8 @@ static void test_agent_tool_policy_parse(void) {
     AGENT_TEST_ASSERT(ds4_agent_tool_policy_allows(&pol, "web_fetch"));
     AGENT_TEST_ASSERT(!ds4_agent_tool_policy_allows(&pol, "read"));
     AGENT_TEST_ASSERT(!ds4_agent_tool_policy_allows(&pol, "bash"));
+    AGENT_TEST_ASSERT(!ds4_agent_tool_policy_allows(&pol, "ask_question"));
+    AGENT_TEST_ASSERT(ds4_agent_tool_policy_parse("ask_question", &pol) == -1);
     AGENT_TEST_ASSERT(ds4_agent_tool_policy_parse("nonexistent_tool", &pol) == -1);
     ds4_agent_tool_policy_parse("all", &pol);
     ds4_agent_tool_policy_format(&pol, buf, sizeof(buf));
@@ -10989,27 +11176,29 @@ static void test_agent_tool_policy_prompt_building(void) {
     prompt = agent_build_filtered_tools_prompt(&pol);
     AGENT_TEST_ASSERT(prompt != NULL);
     AGENT_TEST_ASSERT(strstr(prompt, "## Tools") != NULL);
-    AGENT_TEST_ASSERT(strstr(prompt, "Available tools: none") != NULL);
+    AGENT_TEST_ASSERT(strstr(prompt, "Available tools: ask_question") != NULL);
+    AGENT_TEST_ASSERT(strstr(prompt, "\"name\": \"ask_question\"") != NULL);
+    AGENT_TEST_ASSERT(strstr(prompt, "\"choices\": {\"type\": \"array\"") != NULL);
     AGENT_TEST_ASSERT(strstr(prompt, "## Editing files") == NULL);
     free(prompt);
     ds4_agent_tool_policy_parse("web", &pol);
     prompt = agent_build_filtered_tools_prompt(&pol);
     AGENT_TEST_ASSERT(prompt != NULL);
-    AGENT_TEST_ASSERT(strstr(prompt, "Available tools: web_browse, web_fetch") != NULL);
+    AGENT_TEST_ASSERT(strstr(prompt, "Available tools: ask_question, web_browse, web_fetch") != NULL);
     AGENT_TEST_ASSERT(strstr(prompt, "Use web_browse") != NULL);
     AGENT_TEST_ASSERT(strstr(prompt, "## Editing files") == NULL);
     free(prompt);
     ds4_agent_tool_policy_parse("bash", &pol);
     prompt = agent_build_filtered_tools_prompt(&pol);
     AGENT_TEST_ASSERT(prompt != NULL);
-    AGENT_TEST_ASSERT(strstr(prompt, "Available tools: bash, bash_status, bash_stop") != NULL);
+    AGENT_TEST_ASSERT(strstr(prompt, "Available tools: ask_question, bash, bash_status, bash_stop") != NULL);
     AGENT_TEST_ASSERT(strstr(prompt, "Run a shell command") != NULL);
     AGENT_TEST_ASSERT(strstr(prompt, "## Editing files") == NULL);
     free(prompt);
     ds4_agent_tool_policy_parse("write", &pol);
     prompt = agent_build_filtered_tools_prompt(&pol);
     AGENT_TEST_ASSERT(prompt != NULL);
-    AGENT_TEST_ASSERT(strstr(prompt, "Available tools: read, more, write, list, edit, search") != NULL);
+    AGENT_TEST_ASSERT(strstr(prompt, "Available tools: ask_question, read, more, write, list, edit, search") != NULL);
     AGENT_TEST_ASSERT(strstr(prompt, "## Editing files") != NULL);
     AGENT_TEST_ASSERT(strstr(prompt, "Use web_browse") == NULL);
     free(prompt);
@@ -11017,7 +11206,7 @@ static void test_agent_tool_policy_prompt_building(void) {
     ds4_agent_tool_policy_parse("all", &pol);
     prompt = agent_build_filtered_tools_prompt(&pol);
     AGENT_TEST_ASSERT(prompt != NULL);
-    AGENT_TEST_ASSERT(strstr(prompt, "Available tools: read, more, write, list, edit, search, web_browse, web_fetch, bash, bash_status, bash_stop, mkdir") != NULL);
+    AGENT_TEST_ASSERT(strstr(prompt, "Available tools: ask_question, read, more, write, list, edit, search, web_browse, web_fetch, bash, bash_status, bash_stop, mkdir") != NULL);
     AGENT_TEST_ASSERT(strstr(prompt, "Use web_browse") != NULL);
     AGENT_TEST_ASSERT(strstr(prompt, "Run a shell command") != NULL);
     free(prompt);
@@ -11098,6 +11287,33 @@ static void test_agent_tool_policy_dispatch_enforcement(void) {
     AGENT_TEST_ASSERT(pipe(w.wake_fd) == 0);
     ds4_agent_tool_policy_set_none(&w.tool_policy);
 
+    agent_tool_arg empty_question_args[] = {
+        {.name = "choices", .value = "[\"A\",\"B\"]", .is_string = true},
+    };
+    agent_tool_call empty_question_call = {
+        .name = "ask_question",
+        .args = empty_question_args,
+        .argc = 1,
+    };
+    char *empty_question = agent_execute_tool_call(&w, &empty_question_call);
+    AGENT_TEST_ASSERT(strstr(empty_question, "ask_question requires question") != NULL);
+    free(empty_question);
+
+    agent_tool_arg question_args[] = {
+        {.name = "question", .value = "Choose?", .is_string = true},
+        {.name = "choices", .value = "[\"A\",\"B\"]", .is_string = true},
+    };
+    agent_tool_call question_call = {
+        .name = "ask_question",
+        .args = question_args,
+        .argc = 2,
+    };
+    char *noninteractive_question = agent_execute_tool_call(&w, &question_call);
+    AGENT_TEST_ASSERT(strstr(noninteractive_question,
+                             "requires an interactive user") != NULL);
+    AGENT_TEST_ASSERT(strstr(noninteractive_question, "not allowed") == NULL);
+    free(noninteractive_question);
+
     char root[PATH_MAX];
     AGENT_TEST_ASSERT(realpath(root_tmp, root) != NULL);
     agent_path_list_append(&w.working_directories, root);
@@ -11153,6 +11369,150 @@ static void test_agent_tool_policy_dispatch_enforcement(void) {
     pthread_cond_destroy(&w.cond);
     pthread_mutex_destroy(&w.mu);
     pthread_mutex_destroy(&w.docker_shell.mu);
+}
+
+static void test_agent_fake_worker_init(agent_worker *w, agent_config *cfg);
+
+typedef struct {
+    agent_worker *worker;
+    agent_tool_call call;
+    char *result;
+} agent_question_test_ctx;
+
+static void *test_agent_question_thread(void *arg) {
+    agent_question_test_ctx *ctx = arg;
+    ctx->result = agent_execute_tool_call(ctx->worker, &ctx->call);
+    return NULL;
+}
+
+static void test_agent_ask_question_stream_preview(void) {
+    const char dsml[] =
+        "<｜DSML｜tool_calls>\n"
+        "<｜DSML｜invoke name=\"ask_question\">\n"
+        "<｜DSML｜parameter name=\"question\" string=\"true\">\xef\xbf\xbd\xef\xbf\xbd Should Fix #4: Path validation against allowed directories\n"
+        "\n"
+        "The body should be reserved for the interactive prompt.</｜DSML｜parameter>\n"
+        "<｜DSML｜parameter name=\"choices\" string=\"true\">[\"Yes - validate paths\", \"No - skip validation\"]</｜DSML｜parameter>\n"
+        "</｜DSML｜invoke>\n"
+        "</｜DSML｜tool_calls>\n";
+    agent_tail_capture capture = {.cap = 4096};
+    agent_token_renderer renderer = {
+        .last_output_newline = true,
+        .capture = &capture,
+    };
+    agent_dsml_parser dsml_parser = {.state = AGENT_DSML_SEARCH};
+    agent_stream_renderer stream = {
+        .renderer = &renderer,
+        .parser = &dsml_parser,
+    };
+
+    agent_stream_text(&stream, dsml, strlen(dsml), true);
+    size_t out_len = 0;
+    char *out = agent_tail_capture_take(&capture, &out_len);
+    (void)out_len;
+
+    AGENT_TEST_ASSERT(strstr(out, "ask_question  question=Should Fix #4: Path validation against allowed directories\n") != NULL);
+    AGENT_TEST_ASSERT(strstr(out, "\xef\xbf\xbd") == NULL);
+    AGENT_TEST_ASSERT(strstr(out, "The body should be reserved") == NULL);
+    AGENT_TEST_ASSERT(strstr(out, "validate paths") == NULL);
+    free(out);
+    agent_dsml_parser_free(&dsml_parser);
+}
+
+static void test_agent_ask_question_interactive_flow(void) {
+    agent_config cfg = {0};
+    agent_worker w;
+    test_agent_fake_worker_init(&w, &cfg);
+    ds4_agent_tool_policy_set_none(&w.tool_policy);
+
+    agent_tool_arg args[] = {
+        {.name = "question", .value = "Which path?", .is_string = true},
+        {.name = "choices",
+         .value = "[\"Yes - \\\\@name escapes replacement, backslash is removed, @name passes through literally\",\"No - no escape needed, user can avoid conflicts\"]",
+         .is_string = true},
+    };
+    agent_question_test_ctx ctx = {
+        .worker = &w,
+        .call = {
+            .name = "ask_question",
+            .args = args,
+            .argc = 2,
+        },
+    };
+    pthread_t thread;
+    AGENT_TEST_ASSERT(pthread_create(&thread, NULL,
+                                     test_agent_question_thread, &ctx) == 0);
+
+    char message[AGENT_ASK_QUESTION_TEXT_MAX];
+    char choices[AGENT_ASK_QUESTION_MAX_CHOICES][AGENT_ASK_QUESTION_CHOICE_MAX];
+    int choice_count = 0;
+    bool pending = false;
+    for (int i = 0; i < 100; i++) {
+        if (worker_take_question_request(&w, message, sizeof(message),
+                                         choices, &choice_count)) {
+            pending = true;
+            break;
+        }
+        usleep(1000);
+    }
+    AGENT_TEST_ASSERT(pending);
+    AGENT_TEST_ASSERT(!strcmp(message, "Which path?"));
+    AGENT_TEST_ASSERT(choice_count == 2);
+    AGENT_TEST_ASSERT(!strcmp(choices[0], "Yes - \\@name escapes replacement, backslash is removed, @name passes through literally"));
+    AGENT_TEST_ASSERT(!strcmp(choices[1], "No - no escape needed, user can avoid conflicts"));
+    worker_answer_question(&w, false, choices[0], NULL);
+    pthread_join(thread, NULL);
+    AGENT_TEST_ASSERT(ctx.result && strstr(ctx.result, "Answer: Yes - \\@name escapes replacement, backslash is removed") != NULL);
+    free(ctx.result);
+    agent_worker_free(&w);
+}
+
+static void test_agent_ask_question_prompt_options(void) {
+    char choices[AGENT_ASK_QUESTION_MAX_CHOICES][AGENT_ASK_QUESTION_CHOICE_MAX] = {0};
+    snprintf(choices[0], sizeof(choices[0]), "A");
+
+    int saved_stdin = dup(STDIN_FILENO);
+    AGENT_TEST_ASSERT(saved_stdin >= 0);
+    int saved_stdout = dup(STDOUT_FILENO);
+    AGENT_TEST_ASSERT(saved_stdout >= 0);
+    int devnull = open("/dev/null", O_WRONLY);
+    AGENT_TEST_ASSERT(devnull >= 0);
+    AGENT_TEST_ASSERT(dup2(devnull, STDOUT_FILENO) >= 0);
+    close(devnull);
+
+    int input_pipe[2];
+    AGENT_TEST_ASSERT(pipe(input_pipe) == 0);
+    const char custom_input[] = "3\nCustom answer\n";
+    AGENT_TEST_ASSERT(write(input_pipe[1], custom_input,
+                            sizeof(custom_input) - 1) ==
+                      (ssize_t)(sizeof(custom_input) - 1));
+    close(input_pipe[1]);
+    AGENT_TEST_ASSERT(dup2(input_pipe[0], STDIN_FILENO) >= 0);
+    close(input_pipe[0]);
+    char answer[AGENT_ASK_QUESTION_ANSWER_MAX];
+    bool interrupted = false;
+    AGENT_TEST_ASSERT(agent_prompt_ask_question("Question?", choices, 1,
+                                                answer, &interrupted));
+    AGENT_TEST_ASSERT(!interrupted);
+    AGENT_TEST_ASSERT(!strcmp(answer, "Custom answer"));
+
+    AGENT_TEST_ASSERT(pipe(input_pipe) == 0);
+    const char interrupt_input[] = "2\n";
+    AGENT_TEST_ASSERT(write(input_pipe[1], interrupt_input,
+                            sizeof(interrupt_input) - 1) ==
+                      (ssize_t)(sizeof(interrupt_input) - 1));
+    close(input_pipe[1]);
+    AGENT_TEST_ASSERT(dup2(input_pipe[0], STDIN_FILENO) >= 0);
+    close(input_pipe[0]);
+    interrupted = false;
+    AGENT_TEST_ASSERT(!agent_prompt_ask_question("Question?", choices, 1,
+                                                 answer, &interrupted));
+    AGENT_TEST_ASSERT(interrupted);
+
+    AGENT_TEST_ASSERT(dup2(saved_stdin, STDIN_FILENO) >= 0);
+    close(saved_stdin);
+    AGENT_TEST_ASSERT(dup2(saved_stdout, STDOUT_FILENO) >= 0);
+    close(saved_stdout);
 }
 
 static void test_agent_worker_model_gate_serializes(void);
@@ -11229,6 +11589,9 @@ static void ds4_agent_unit_tests_run(void) {
     test_agent_tool_policy_session_mutation();
     test_agent_tool_policy_subagent_persistence();
     test_agent_tool_policy_dispatch_enforcement();
+    test_agent_ask_question_stream_preview();
+    test_agent_ask_question_interactive_flow();
+    test_agent_ask_question_prompt_options();
     ds4_agent_subagent_unit_tests_run();
     test_agent_worker_model_gate_serializes();
 }
@@ -13092,6 +13455,190 @@ static pid_t agent_tool_pid(const agent_tool_call *call) {
     return (pid_t)agent_parse_int_default(agent_tool_arg_value(call, "pid"), 0, 0, INT_MAX);
 }
 
+static char *agent_trimmed_dup(const char *s, size_t len) {
+    while (len > 0 && isspace((unsigned char)*s)) {
+        s++;
+        len--;
+    }
+    while (len > 0 && isspace((unsigned char)s[len - 1])) len--;
+    return xstrndup(s, len);
+}
+
+static void agent_question_choices_push(char ***items,
+                                        int *len,
+                                        int *cap,
+                                        const char *start,
+                                        size_t n) {
+    if (!items || !len || !cap || !start) return;
+    char *choice = agent_trimmed_dup(start, n);
+    if (!choice[0]) {
+        free(choice);
+        return;
+    }
+    if (*len == AGENT_ASK_QUESTION_MAX_CHOICES) {
+        free(choice);
+        return;
+    }
+    if (*len == *cap) {
+        *cap = *cap ? *cap * 2 : 4;
+        *items = xrealloc(*items, (size_t)*cap * sizeof((*items)[0]));
+    }
+    (*items)[(*len)++] = choice;
+}
+
+static bool agent_parse_question_choices_text(const char *text,
+                                              char ***out_v,
+                                              int *out_count) {
+    if (out_v) *out_v = NULL;
+    if (out_count) *out_count = 0;
+    if (!text || !text[0]) return true;
+
+    char **items = NULL;
+    int len = 0;
+    int cap = 0;
+    const char *sep = strchr(text, '\n') ? "\n" : ",";
+    char *buf = xstrdup(text);
+    char *save = NULL;
+    for (char *tok = strtok_r(buf, sep, &save); tok;
+         tok = strtok_r(NULL, sep, &save))
+    {
+        agent_question_choices_push(&items, &len, &cap, tok, strlen(tok));
+    }
+    free(buf);
+    if (out_v) *out_v = items;
+    else agent_string_array_free(items, len);
+    if (out_count) *out_count = len;
+    return true;
+}
+
+static bool agent_parse_question_choices_array(const char *text,
+                                               char ***out_v,
+                                               int *out_count) {
+    if (out_v) *out_v = NULL;
+    if (out_count) *out_count = 0;
+    if (!text) return false;
+
+    const unsigned char *p = (const unsigned char *)text;
+    while (isspace(*p)) p++;
+    if (*p != '[') return false;
+    p++;
+
+    char **items = NULL;
+    int len = 0;
+    int cap = 0;
+    for (;;) {
+        while (isspace(*p)) p++;
+        if (*p == ']') {
+            p++;
+            break;
+        }
+        if (*p != '"') {
+            agent_string_array_free(items, len);
+            return false;
+        }
+        p++;
+        agent_buf item = {0};
+        while (*p && *p != '"') {
+            if (*p == '\\') {
+                p++;
+                if (!*p) {
+                    agent_string_array_free(items, len);
+                    free(item.ptr);
+                    return false;
+                }
+                char c = (char)*p;
+                switch (c) {
+                    case '"': case '\\': case '/':
+                        agent_buf_append(&item, &c, 1);
+                        break;
+                    case 'b': c = '\b'; agent_buf_append(&item, &c, 1); break;
+                    case 'f': c = '\f'; agent_buf_append(&item, &c, 1); break;
+                    case 'n': c = '\n'; agent_buf_append(&item, &c, 1); break;
+                    case 'r': c = '\r'; agent_buf_append(&item, &c, 1); break;
+                    case 't': c = '\t'; agent_buf_append(&item, &c, 1); break;
+                    default:
+                        /* Model-emitted choices are DSML text, not strict JSON.
+                         * Preserve unknown backslash escapes like \@ literally. */
+                        agent_buf_append(&item, "\\", 1);
+                        agent_buf_append(&item, &c, 1);
+                        break;
+                }
+                p++;
+                continue;
+            }
+            char c = (char)*p++;
+            agent_buf_append(&item, &c, 1);
+        }
+        if (*p != '"') {
+            agent_string_array_free(items, len);
+            free(item.ptr);
+            return false;
+        }
+        p++;
+        char *choice = agent_buf_take(&item);
+        agent_question_choices_push(&items, &len, &cap, choice, strlen(choice));
+        free(choice);
+        while (isspace(*p)) p++;
+        if (*p == ',') {
+            p++;
+            continue;
+        }
+        if (*p == ']') {
+            p++;
+            break;
+        }
+        agent_string_array_free(items, len);
+        return false;
+    }
+
+    while (isspace(*p)) p++;
+    if (*p) {
+        agent_string_array_free(items, len);
+        return false;
+    }
+    if (out_v) *out_v = items;
+    else agent_string_array_free(items, len);
+    if (out_count) *out_count = len;
+    return true;
+}
+
+static bool agent_parse_question_choices(const char *text,
+                                         char ***out_v,
+                                         int *out_count) {
+    if (out_v) *out_v = NULL;
+    if (out_count) *out_count = 0;
+    if (!text || !text[0]) return true;
+
+    char **items = NULL;
+    int count = 0;
+    if (agent_parse_question_choices_array(text, &items, &count)) {
+        if (out_v) *out_v = items;
+        else agent_string_array_free(items, count);
+        if (out_count) *out_count = count;
+        return true;
+    }
+
+    return agent_parse_question_choices_text(text, out_v, out_count);
+}
+
+static char *agent_tool_ask_question(agent_worker *w,
+                                     const agent_tool_call *call) {
+    const char *question = agent_tool_arg_value(call, "question");
+    if (!question || !question[0])
+        return xstrdup("Tool error: ask_question requires question\n");
+
+    char **choices = NULL;
+    int choice_count = 0;
+    if (!agent_parse_question_choices(agent_tool_arg_value(call, "choices"),
+                                      &choices, &choice_count))
+    {
+        return xstrdup("Tool error: ask_question choices must be strings\n");
+    }
+    char *result = worker_request_question(w, question, choices, choice_count);
+    agent_string_array_free(choices, choice_count);
+    return result;
+}
+
 /* ============================================================================
  * Tool Dispatch
  * ============================================================================
@@ -13103,6 +13650,8 @@ static pid_t agent_tool_pid(const agent_tool_call *call) {
 static char *agent_execute_tool_call(agent_worker *w, const agent_tool_call *call) {
     agent_buf result = {0};
     if (!call->name) return xstrdup("Tool error: missing tool name\n");
+    if (agent_tool_is_policy_exempt(call->name))
+        return agent_tool_ask_question(w, call);
     if (agent_tool_index_for_name(call->name) < 0) {
         char header[256];
         snprintf(header, sizeof(header), "\n[tool:%s] unknown tool\n", call->name);
@@ -17311,6 +17860,7 @@ void agent_worker_free(agent_worker *w) {
     free(w->session_title);
     free(w->legacy_session_path_to_delete);
     free(w->queued_user_drain_text);
+    free(w->question_answer);
     agent_path_list_free(&w->working_directories);
     /* Clean up auto-allowed temp files (web_fetch output, bash output, etc.). */
     for (int i = 0; i < w->auto_allowed_paths.len; i++)
@@ -17472,6 +18022,109 @@ static bool agent_prompt_working_directory_choice(const char *prompt,
                 return true;
             }
         }
+    }
+}
+
+static bool agent_prompt_read_line(char *buf, size_t len) {
+    if (!buf || len == 0) return false;
+    int saved_flags = fcntl(STDIN_FILENO, F_GETFL, 0);
+    if (saved_flags >= 0 && (saved_flags & O_NONBLOCK))
+        fcntl(STDIN_FILENO, F_SETFL, saved_flags & ~O_NONBLOCK);
+    bool got_line = fgets(buf, len, stdin) != NULL;
+    if (saved_flags >= 0 && (saved_flags & O_NONBLOCK))
+        fcntl(STDIN_FILENO, F_SETFL, saved_flags);
+    if (!got_line) return false;
+    size_t n = strlen(buf);
+    while (n > 0 && (buf[n - 1] == '\n' || buf[n - 1] == '\r'))
+        buf[--n] = '\0';
+    return true;
+}
+
+static bool agent_prompt_ask_question(const char *prompt,
+                                      char choices[AGENT_ASK_QUESTION_MAX_CHOICES][AGENT_ASK_QUESTION_CHOICE_MAX],
+                                      int choice_count,
+                                      char answer[AGENT_ASK_QUESTION_ANSWER_MAX],
+                                      bool *interrupted) {
+    char buf[AGENT_ASK_QUESTION_ANSWER_MAX];
+    if (answer) answer[0] = '\0';
+    if (interrupted) *interrupted = false;
+
+    printf("%s\n", prompt ? prompt : "Question:");
+    if (choice_count <= 0) {
+        printf("Answer: ");
+        fflush(stdout);
+        if (!agent_prompt_read_line(buf, sizeof(buf))) {
+            if (interrupted) *interrupted = true;
+            return false;
+        }
+        if (answer) snprintf(answer, AGENT_ASK_QUESTION_ANSWER_MAX, "%s", buf);
+        return true;
+    }
+
+    int shown_count = choice_count;
+    if (shown_count > AGENT_ASK_QUESTION_MAX_CHOICES)
+        shown_count = AGENT_ASK_QUESTION_MAX_CHOICES;
+    for (int i = 0; i < shown_count; i++)
+        printf("  %d) %s\n", i + 1, choices[i]);
+    int interrupt_choice = shown_count + 1;
+    int something_else_choice = shown_count + 2;
+    printf("  %d) Interrupt\n", interrupt_choice);
+    printf("  %d) Something else\n", something_else_choice);
+
+    for (;;) {
+        printf("Select 1-%d: ", something_else_choice);
+        fflush(stdout);
+        if (!agent_prompt_read_line(buf, sizeof(buf))) {
+            if (interrupted) *interrupted = true;
+            return false;
+        }
+        char *p = buf;
+        while (*p == ' ' || *p == '\t') p++;
+        if (!*p) continue;
+        if (!strcasecmp(p, "interrupt") || !strcasecmp(p, "i")) {
+            if (interrupted) *interrupted = true;
+            return false;
+        }
+        if (!strcasecmp(p, "something else") || !strcasecmp(p, "else") ||
+            !strcasecmp(p, "other"))
+        {
+            printf("Answer: ");
+            fflush(stdout);
+            if (!agent_prompt_read_line(buf, sizeof(buf))) {
+                if (interrupted) *interrupted = true;
+                return false;
+            }
+            if (answer) snprintf(answer, AGENT_ASK_QUESTION_ANSWER_MAX, "%s", buf);
+            return true;
+        }
+        char *end = NULL;
+        long n = strtol(p, &end, 10);
+        while (end && (*end == ' ' || *end == '\t')) end++;
+        if (end && *end == '\0') {
+            if (n >= 1 && n <= shown_count) {
+                if (answer)
+                    snprintf(answer, AGENT_ASK_QUESTION_ANSWER_MAX, "%s",
+                             choices[n - 1]);
+                return true;
+            }
+            if (n == interrupt_choice) {
+                if (interrupted) *interrupted = true;
+                return false;
+            }
+            if (n == something_else_choice) {
+                printf("Answer: ");
+                fflush(stdout);
+                if (!agent_prompt_read_line(buf, sizeof(buf))) {
+                    if (interrupted) *interrupted = true;
+                    return false;
+                }
+                if (answer) snprintf(answer, AGENT_ASK_QUESTION_ANSWER_MAX, "%s", buf);
+                return true;
+            }
+        }
+
+        if (answer) snprintf(answer, AGENT_ASK_QUESTION_ANSWER_MAX, "%s", p);
+        return true;
     }
 }
 
@@ -17969,6 +18622,40 @@ static int run_agent(ds4_engine *engine, agent_config *cfg) {
             ds4_agent_subagents_answer_path_approval(subagents, path_approval_id,
                 allow, approved_dir,
                 approval_timed_out ? "working directory approval timed out" : NULL);
+            worker_ptr = ds4_agent_subagents_active_worker(subagents);
+            queue_ptr = ds4_agent_subagents_active_queue(subagents);
+            worker_get_status(&worker, &st);
+            build_prompt_text(&st, prompt, sizeof(prompt));
+            int restart_cols = editor.edit.cols > 0 ? (int)editor.edit.cols : 80;
+            build_footer_text(&st, subagents, &queue, restart_cols, statusline, sizeof(statusline));
+            editor_start(&editor, prompt, statusline, saved_input);
+            free(saved_input);
+            continue;
+        }
+
+        char question_msg[AGENT_ASK_QUESTION_TEXT_MAX];
+        char question_choices[AGENT_ASK_QUESTION_MAX_CHOICES][AGENT_ASK_QUESTION_CHOICE_MAX];
+        int question_choice_count = 0;
+        ds4_agent_subagent_id question_id = {0};
+        if (ds4_agent_subagents_take_question(subagents, &question_id,
+                                             question_msg,
+                                             sizeof(question_msg),
+                                             question_choices,
+                                             &question_choice_count))
+        {
+            char *saved_input = NULL;
+            if (editor.active && editor.edit.buf && editor.edit.len)
+                saved_input = xstrndup(editor.edit.buf, editor.edit.len);
+            editor_stop(&editor);
+            editor_restore_terminal_layout(&editor);
+            bool question_interrupted = false;
+            char answer[AGENT_ASK_QUESTION_ANSWER_MAX] = {0};
+            bool answered = agent_prompt_ask_question(
+                question_msg, question_choices, question_choice_count, answer,
+                &question_interrupted);
+            ds4_agent_subagents_answer_question(
+                subagents, question_id, question_interrupted, answered ? answer : NULL,
+                (!answered && !question_interrupted) ? "question prompt failed" : NULL);
             worker_ptr = ds4_agent_subagents_active_worker(subagents);
             queue_ptr = ds4_agent_subagents_active_queue(subagents);
             worker_get_status(&worker, &st);
