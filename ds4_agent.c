@@ -41,6 +41,7 @@ static bool agent_parse_bool_default(const char *s, bool def);
 static bool agent_executable_exists(const char *path);
 static bool agent_command_in_path(const char *command);
 static bool agent_bash_use_docker_sandbox(const agent_worker *w);
+static void agent_bash_jobs_free(agent_worker *w);
 static bool agent_prompt_ask_question(const char *prompt,
                                       char choices[AGENT_ASK_QUESTION_MAX_CHOICES][AGENT_ASK_QUESTION_CHOICE_MAX],
                                       int choice_count,
@@ -360,6 +361,137 @@ void agent_path_list_free(agent_path_list *list) {
     for (int i = 0; i < list->len; i++) free(list->v[i]);
     free(list->v);
     memset(list, 0, sizeof(*list));
+}
+
+#define AGENT_TEMP_FILE_IDLE_SECONDS (5 * 60)
+
+static int agent_temp_files_index(const agent_temp_file_list *list,
+                                  const char *path) {
+    if (!list || !path) return -1;
+    for (int i = 0; i < list->len; i++) {
+        if (list->v[i].path && !strcmp(list->v[i].path, path)) return i;
+    }
+    return -1;
+}
+
+static void agent_temp_files_append(agent_temp_file_list *list,
+                                    const char *path,
+                                    uint64_t last_read_at,
+                                    uint64_t last_write_at) {
+    if (!list || !path || !path[0]) return;
+    if (list->len == list->cap) {
+        list->cap = list->cap ? list->cap * 2 : 4;
+        list->v = xrealloc(list->v, (size_t)list->cap * sizeof(list->v[0]));
+    }
+    list->v[list->len].path = xstrdup(path);
+    list->v[list->len].last_read_at = last_read_at;
+    list->v[list->len].last_write_at = last_write_at;
+    list->len++;
+}
+
+static void agent_temp_files_remove_at(agent_temp_file_list *list, int idx) {
+    if (!list || idx < 0 || idx >= list->len) return;
+    free(list->v[idx].path);
+    for (int j = idx + 1; j < list->len; j++)
+        list->v[j - 1] = list->v[j];
+    list->len--;
+    if (list->len >= 0)
+        memset(&list->v[list->len], 0, sizeof(list->v[list->len]));
+}
+
+static bool agent_temp_files_remove(agent_temp_file_list *list,
+                                    const char *path,
+                                    bool prefix) {
+    if (!list || !path) return false;
+    bool removed = false;
+    size_t plen = prefix ? strlen(path) : 0;
+    for (int i = 0; i < list->len; ) {
+        bool match = false;
+        if (list->v[i].path) {
+            if (prefix) {
+                match = strncmp(list->v[i].path, path, plen) == 0 &&
+                    (list->v[i].path[plen] == '/' ||
+                     list->v[i].path[plen] == '\0');
+            } else {
+                match = strcmp(list->v[i].path, path) == 0;
+            }
+        }
+        if (match) {
+            agent_temp_files_remove_at(list, i);
+            removed = true;
+            continue;
+        }
+        i++;
+    }
+    return removed;
+}
+
+static void agent_temp_files_free(agent_temp_file_list *list) {
+    if (!list) return;
+    for (int i = 0; i < list->len; i++) free(list->v[i].path);
+    free(list->v);
+    memset(list, 0, sizeof(*list));
+}
+
+static uint64_t agent_now_sec(void) {
+    time_t now = time(NULL);
+    return now > 0 ? (uint64_t)now : 0;
+}
+
+static void agent_temp_files_track(agent_worker *w, const char *path) {
+    if (!w || !path || !path[0]) return;
+    uint64_t now = agent_now_sec();
+    int idx = agent_temp_files_index(&w->temp_files, path);
+    if (idx >= 0) {
+        w->temp_files.v[idx].last_write_at = now;
+    } else {
+        agent_temp_files_append(&w->temp_files, path, 0, now);
+    }
+    if (!agent_path_list_contains(&w->auto_allowed_paths, path))
+        agent_path_list_append(&w->auto_allowed_paths, path);
+}
+
+static void agent_temp_files_note_read(agent_worker *w, const char *path) {
+    if (!w || !path) return;
+    int idx = agent_temp_files_index(&w->temp_files, path);
+    if (idx >= 0) w->temp_files.v[idx].last_read_at = agent_now_sec();
+}
+
+static void agent_temp_files_note_write(agent_worker *w, const char *path) {
+    if (!w || !path) return;
+    int idx = agent_temp_files_index(&w->temp_files, path);
+    if (idx >= 0) w->temp_files.v[idx].last_write_at = agent_now_sec();
+}
+
+static uint64_t agent_temp_file_last_access(const agent_temp_file *tf) {
+    if (!tf) return 0;
+    return tf->last_read_at > tf->last_write_at ?
+        tf->last_read_at : tf->last_write_at;
+}
+
+static void agent_temp_files_cleanup(agent_worker *w, uint64_t now) {
+    if (!w) return;
+    if (w->cfg && w->cfg->preserve_agent_files) return;
+    for (int i = 0; i < w->temp_files.len; ) {
+        agent_temp_file *tf = &w->temp_files.v[i];
+        uint64_t last = agent_temp_file_last_access(tf);
+        if (last && now < last + AGENT_TEMP_FILE_IDLE_SECONDS) {
+            i++;
+            continue;
+        }
+        if (tf->path && tf->path[0]) {
+            if (unlink(tf->path) != 0 && errno != ENOENT) {
+                i++;
+                continue;
+            }
+            agent_path_list_remove(&w->auto_allowed_paths, tf->path, false);
+        }
+        agent_temp_files_remove_at(&w->temp_files, i);
+    }
+}
+
+static void agent_temp_files_cleanup_now(agent_worker *w) {
+    agent_temp_files_cleanup(w, agent_now_sec());
 }
 
 static void write_all(int fd, const char *p, size_t n) {
@@ -7154,6 +7286,8 @@ static char *agent_read_range(agent_worker *w, const char *path, int start_line,
         char *result = agent_docker_read_range(w, file_path, start_line,
                                                max_lines, bare, set_more,
                                                &stderr_out);
+        if (result && strncmp(result, "Tool error:", 11) != 0)
+            agent_temp_files_note_read(w, file_path);
         free(file_path);
         if (stderr_out.ptr && result && strncmp(result, "Tool error:", 11) != 0) {
             agent_buf b = {0};
@@ -7185,6 +7319,7 @@ static char *agent_read_range(agent_worker *w, const char *path, int start_line,
             free(file_path);
             return agent_buf_take(&b);
         }
+        agent_temp_files_note_read(w, file_path);
     } else {
         file_path = agent_resolve_tool_path(w, path, AGENT_PATH_EXISTING,
                                             err, sizeof(err));
@@ -7204,6 +7339,7 @@ static char *agent_read_range(agent_worker *w, const char *path, int start_line,
             free(file_path);
             return agent_buf_take(&b);
         }
+        agent_temp_files_note_read(w, file_path);
     }
 
     if (!data) {
@@ -7328,8 +7464,7 @@ static char *agent_tool_write(agent_worker *w, const agent_tool_call *call) {
             free(file_path);
             return agent_buf_take(&b);
         }
-        if (!agent_path_list_contains(&w->auto_allowed_paths, file_path))
-            agent_path_list_append(&w->auto_allowed_paths, file_path);
+        agent_temp_files_note_write(w, file_path);
     } else {
         file_path = agent_resolve_tool_path(w, path, AGENT_PATH_PARENT,
                                             err, sizeof(err));
@@ -7360,8 +7495,7 @@ static char *agent_tool_write(agent_worker *w, const agent_tool_call *call) {
             free(file_path);
             return agent_buf_take(&b);
         }
-        if (!agent_path_list_contains(&w->auto_allowed_paths, file_path))
-            agent_path_list_append(&w->auto_allowed_paths, file_path);
+        agent_temp_files_note_write(w, file_path);
     }
     char msg[PATH_MAX + 160];
     snprintf(msg, sizeof(msg), "Wrote %zu bytes to %s\n", len, display_path);
@@ -8943,6 +9077,80 @@ static void test_agent_tool_write_preserves_literal_backslash_n(void) {
     rmdir(root);
 }
 
+static void test_agent_fake_worker_init(agent_worker *w, agent_config *cfg);
+
+static void test_agent_tool_write_survives_worker_free(void) {
+    char root_tmpl[] = "/tmp/ds4_agent_write_survives_XXXXXX";
+    char *root_tmp = mkdtemp(root_tmpl);
+    AGENT_TEST_ASSERT(root_tmp != NULL);
+    if (!root_tmp) return;
+
+    agent_config cfg = {.non_interactive = true};
+    agent_worker w;
+    test_agent_fake_worker_init(&w, &cfg);
+    char root[PATH_MAX];
+    AGENT_TEST_ASSERT(realpath(root_tmp, root) != NULL);
+    agent_path_list_append(&w.working_directories, root);
+
+    agent_tool_arg write_args[] = {
+        {.name = "path", .value = "durable.txt", .is_string = true},
+        {.name = "content", .value = "keep me\n", .is_string = true},
+    };
+    agent_tool_call write_call = {
+        .name = "write",
+        .args = write_args,
+        .argc = 2,
+    };
+    char *write_result = agent_tool_write(&w, &write_call);
+    AGENT_TEST_ASSERT(write_result != NULL);
+    AGENT_TEST_ASSERT(write_result && strstr(write_result, "Wrote ") != NULL);
+    free(write_result);
+
+    char file_path[PATH_MAX];
+    snprintf(file_path, sizeof(file_path), "%s/durable.txt", root);
+    AGENT_TEST_ASSERT(access(file_path, F_OK) == 0);
+    AGENT_TEST_ASSERT(w.auto_allowed_paths.len == 0);
+    AGENT_TEST_ASSERT(w.temp_files.len == 0);
+
+    agent_worker_free(&w);
+    AGENT_TEST_ASSERT(access(file_path, F_OK) == 0);
+    unlink(file_path);
+    rmdir(root);
+}
+
+static void test_agent_temp_files_cleanup_requires_idle_window(void) {
+    char path[] = "/tmp/ds4_agent_temp_idle_XXXXXX";
+    int fd = mkstemp(path);
+    AGENT_TEST_ASSERT(fd >= 0);
+    if (fd < 0) return;
+    write_all(fd, "temp\n", 5);
+    close(fd);
+
+    agent_config cfg = {.non_interactive = true};
+    agent_worker w;
+    test_agent_fake_worker_init(&w, &cfg);
+    agent_temp_files_track(&w, path);
+    AGENT_TEST_ASSERT(w.temp_files.len == 1);
+    AGENT_TEST_ASSERT(w.auto_allowed_paths.len == 1);
+
+    uint64_t now = agent_now_sec();
+    w.temp_files.v[0].last_write_at = now - (AGENT_TEMP_FILE_IDLE_SECONDS + 1);
+    w.temp_files.v[0].last_read_at = now - (AGENT_TEMP_FILE_IDLE_SECONDS - 1);
+    agent_temp_files_cleanup(&w, now);
+    AGENT_TEST_ASSERT(access(path, F_OK) == 0);
+    AGENT_TEST_ASSERT(w.temp_files.len == 1);
+    AGENT_TEST_ASSERT(w.auto_allowed_paths.len == 1);
+
+    w.temp_files.v[0].last_read_at = now - (AGENT_TEMP_FILE_IDLE_SECONDS + 1);
+    agent_temp_files_cleanup(&w, now);
+    AGENT_TEST_ASSERT(access(path, F_OK) != 0 && errno == ENOENT);
+    AGENT_TEST_ASSERT(w.temp_files.len == 0);
+    AGENT_TEST_ASSERT(w.auto_allowed_paths.len == 0);
+
+    agent_worker_free(&w);
+    unlink(path);
+}
+
 static void test_agent_tool_edit_preserves_literal_backslash_n(void) {
     char root_tmpl[] = "/tmp/ds4_agent_literal_edit_XXXXXX";
     char *root_tmp = mkdtemp(root_tmpl);
@@ -10500,6 +10708,9 @@ static void test_agent_docker_bash_publishes_command_output(void) {
     }
 
     free(w.out);
+    agent_bash_jobs_free(&w);
+    agent_temp_files_cleanup(&w, agent_now_sec() + AGENT_TEMP_FILE_IDLE_SECONDS + 1);
+    agent_temp_files_free(&w.temp_files);
     agent_path_list_free(&w.auto_allowed_paths);
     close(w.wake_fd[0]);
     close(w.wake_fd[1]);
@@ -11527,6 +11738,8 @@ static void ds4_agent_unit_tests_run(void) {
     test_agent_dsml_file_literal_escape_markup();
     test_agent_file_literal_escape_decode_function_only();
     test_agent_tool_write_preserves_literal_backslash_n();
+    test_agent_tool_write_survives_worker_free();
+    test_agent_temp_files_cleanup_requires_idle_window();
     test_agent_tool_edit_preserves_literal_backslash_n();
     test_agent_working_directory_path_resolution();
     test_agent_working_directory_file_tools();
@@ -11674,6 +11887,7 @@ static char *agent_apply_file_splice(agent_worker *w, const char *path,
         agent_buf_puts(&b, "\n");
         return agent_buf_take(&b);
     }
+    agent_temp_files_note_write(w, path);
 
     int start_line = 0, end_line = 0, delta = 0;
     agent_old_new_line_effect(data, len, out, out_len, offset, remove_len,
@@ -11737,6 +11951,7 @@ static char *agent_tool_edit(agent_worker *w, const agent_tool_call *call) {
             free(file_path);
             return agent_buf_take(&b);
         }
+        agent_temp_files_note_read(w, file_path);
     } else {
         file_path = agent_resolve_tool_path(w, path, AGENT_PATH_EXISTING,
                                             err, sizeof(err));
@@ -11756,6 +11971,7 @@ static char *agent_tool_edit(agent_worker *w, const agent_tool_call *call) {
             free(file_path);
             return agent_buf_take(&b);
         }
+        agent_temp_files_note_read(w, file_path);
     }
 
     const char *match = NULL;
@@ -12171,9 +12387,8 @@ static char *agent_tool_web_fetch(agent_worker *w, const agent_tool_call *call) 
         agent_buf_puts(&b, "\n");
         return agent_buf_take(&b);
     }
-    /* Allow the agent to read rendered page files without workspace approval. */
-    if (!agent_path_list_contains(&w->auto_allowed_paths, path))
-        agent_path_list_append(&w->auto_allowed_paths, path);
+    /* Allow the agent to read rendered page files and clean them up later. */
+    agent_temp_files_track(w, path);
     int total_lines = agent_count_lines(md);
     int shown_lines = 0;
     bool byte_limited = false;
@@ -12277,11 +12492,8 @@ static void agent_bash_job_free(agent_bash_job *job) {
     }
     if (job->pipe_fd >= 0) close(job->pipe_fd);
     if (job->tmp_fd >= 0) close(job->tmp_fd);
-    /* Delete the temp output file unless preserve_agent_files is set. */
-    if (job->worker && job->worker->cfg &&
-        !job->worker->cfg->preserve_agent_files &&
-        job->path[0])
-        unlink(job->path);
+    /* Temp output files are retained for later read/more calls and are cleaned
+     * by the worker only after they have been idle long enough. */
     free(job->cmd);
     free(job);
 }
@@ -12324,7 +12536,10 @@ static void agent_bash_drain(agent_bash_job *job) {
         ssize_t n = read(job->pipe_fd, tmp, sizeof(tmp));
         if (n > 0) {
             agent_bash_note_output(job, tmp, (size_t)n);
-            if (job->tmp_fd >= 0) write_all(job->tmp_fd, tmp, (size_t)n);
+            if (job->tmp_fd >= 0) {
+                write_all(job->tmp_fd, tmp, (size_t)n);
+                agent_temp_files_note_write(job->worker, job->path);
+            }
             agent_bash_publish_output_chunk(job, tmp, (size_t)n);
             continue;
         }
@@ -13171,9 +13386,8 @@ static agent_bash_job *agent_bash_start_mode(agent_worker *w, const char *cmd,
     job->pipe_fd = pipefd[0];
     job->tmp_fd = tmpfd;
     snprintf(job->path, sizeof(job->path), "%s", tmp_path);
-    /* Allow the agent to read bash output files without workspace approval. */
-    if (!agent_path_list_contains(&w->auto_allowed_paths, tmp_path))
-        agent_path_list_append(&w->auto_allowed_paths, tmp_path);
+    /* Allow the agent to read bash output files and clean them up later. */
+    agent_temp_files_track(w, tmp_path);
     job->cmd = xstrdup(cmd);
     job->start_time = now_sec();
     job->timeout_sec = timeout_sec;
@@ -13212,6 +13426,7 @@ static char *agent_bash_read_head(const agent_bash_job *job, int max_lines,
     if (!job || !job->path[0] || job->bytes == 0) return xstrdup("");
     FILE *fp = fopen(job->path, "rb");
     if (!fp) return xstrdup("<failed to reopen output file>\n");
+    agent_temp_files_note_read(job->worker, job->path);
 
     agent_buf out = {0};
     int lines = 0;
@@ -13241,6 +13456,7 @@ static char *agent_bash_read_tail_lines(const agent_bash_job *job, int max_lines
     if (!job || !job->path[0] || job->bytes == 0) return xstrdup("");
     FILE *fp = fopen(job->path, "rb");
     if (!fp) return xstrdup("<failed to reopen output file>\n");
+    agent_temp_files_note_read(job->worker, job->path);
 
     agent_buf tail = {0};
     char tmp[2048];
@@ -14805,6 +15021,7 @@ static void worker_update_status_docker_locked(agent_worker *w) {
 }
 
 static void worker_update_status_writable_locked(agent_worker *w) {
+    agent_temp_files_cleanup_now(w);
     agent_buf workspace = {0};
     agent_buf auto_allowed = {0};
     if (w->working_directories.len > 0) {
@@ -16421,9 +16638,9 @@ static void runtime_help(void) {
     puts("  /command_output on|off");
     puts("               Show or hide command output mirrored in the terminal.");
     puts("  /preserve_agent_files");
-    puts("               Preserve agent output files after reading them.");
+    puts("               Preserve agent temp files instead of idle cleanup.");
     puts("  /no_preserve_agent_files");
-    puts("               Delete agent output files after reading them (default).");
+    puts("               Delete agent temp files after 5 idle minutes (default).");
     puts("  /switch SHA  Load a saved session and show recent history.");
     puts("  /del SHA     Delete a saved session.");
     puts("  /strip SHA   Strip KV payload; /switch rebuilds it by prefill.");
@@ -16438,7 +16655,7 @@ static void runtime_help(void) {
     puts("  /disallow <tools>");
     puts("               Revoke tool access from the active session (e.g. /disallow web or /disallow all).");
     puts("  /purge_auto_files");
-    puts("               Delete auto-created files. Lists files, gives 5s to abort.");
+    puts("               Delete tracked temp files. Lists files, gives 5s to abort.");
     puts("  /new         Start a fresh session from the system prompt.");
     puts("  /quit, /exit Exit.");
     puts("  Ctrl+C       Interrupt generation; clear edited text.");
@@ -17862,9 +18079,8 @@ void agent_worker_free(agent_worker *w) {
     free(w->queued_user_drain_text);
     free(w->question_answer);
     agent_path_list_free(&w->working_directories);
-    /* Clean up auto-allowed temp files (web_fetch output, bash output, etc.). */
-    for (int i = 0; i < w->auto_allowed_paths.len; i++)
-        unlink(w->auto_allowed_paths.v[i]);
+    agent_temp_files_cleanup_now(w);
+    agent_temp_files_free(&w->temp_files);
     agent_path_list_free(&w->auto_allowed_paths);
     if (w->wake_fd[0] >= 0) close(w->wake_fd[0]);
     if (w->wake_fd[1] >= 0) close(w->wake_fd[1]);
@@ -18806,10 +19022,10 @@ static int run_agent(ds4_engine *engine, agent_config *cfg) {
                     }
                 } else if (!strcmp(cmd, "/preserve_agent_files")) {
                     worker.cfg->preserve_agent_files = true;
-                    printf("agent output files will be preserved\n");
+                    printf("agent temp files will be preserved\n");
                 } else if (!strcmp(cmd, "/no_preserve_agent_files")) {
                     worker.cfg->preserve_agent_files = false;
-                    printf("agent output files will be deleted after reading\n");
+                    printf("agent temp files will be deleted after 5 idle minutes\n");
                 } else if (!strcmp(cmd, "/docker help")) {
                     runtime_docker_help();
                 } else if (!strcmp(cmd, "/docker debug")) {
@@ -18942,18 +19158,18 @@ static int run_agent(ds4_engine *engine, agent_config *cfg) {
                     }
                 } else if (!strcmp(cmd, "/purge_auto_files")) {
                     pthread_mutex_lock(&worker.mu);
-                    int n = worker.auto_allowed_paths.len;
+                    int n = worker.temp_files.len;
                     if (n == 0) {
                         pthread_mutex_unlock(&worker.mu);
-                        printf("no auto-created files to purge\n");
+                        printf("no temp files to purge\n");
                     } else {
                         /* Copy list while holding the lock. */
                         char **paths = xmalloc((size_t)n * sizeof(char *));
                         for (int i = 0; i < n; i++)
-                            paths[i] = xstrdup(worker.auto_allowed_paths.v[i]);
+                            paths[i] = xstrdup(worker.temp_files.v[i].path);
                         pthread_mutex_unlock(&worker.mu);
 
-                        printf("auto-created files (%d):\n", n);
+                        printf("temp files (%d):\n", n);
                         for (int i = 0; i < n; i++)
                             printf("  %d. %s\n", i + 1, paths[i]);
 
@@ -18997,11 +19213,19 @@ static int run_agent(ds4_engine *engine, agent_config *cfg) {
                                 if (access(paths[i], F_OK) != 0) {
                                     printf("  stale entry (already deleted): %s\n",
                                            paths[i]);
+                                    agent_temp_files_remove(&worker.temp_files,
+                                                            paths[i], false);
+                                    agent_path_list_remove(&worker.auto_allowed_paths,
+                                                           paths[i], false);
                                     stale++;
                                     continue;
                                 }
                                 if (unlink(paths[i]) == 0) {
                                     printf("  deleted: %s\n", paths[i]);
+                                    agent_temp_files_remove(&worker.temp_files,
+                                                            paths[i], false);
+                                    agent_path_list_remove(&worker.auto_allowed_paths,
+                                                           paths[i], false);
                                     deleted++;
                                 } else {
                                     printf("  failed to delete: %s (%s)\n",
@@ -19009,11 +19233,6 @@ static int run_agent(ds4_engine *engine, agent_config *cfg) {
                                     failed++;
                                 }
                             }
-                            /* Clear the list. */
-                            agent_path_list_free(&worker.auto_allowed_paths);
-                            worker.auto_allowed_paths.v = NULL;
-                            worker.auto_allowed_paths.len = 0;
-                            worker.auto_allowed_paths.cap = 0;
                             pthread_mutex_unlock(&worker.mu);
                             printf("\n%d file%s deleted, %d stale, %d failed.\n",
                                    deleted, deleted == 1 ? "" : "s", stale, failed);

@@ -101,6 +101,18 @@ typedef struct {
 } agent_path_list;
 
 typedef struct {
+    char *path;
+    uint64_t last_read_at;
+    uint64_t last_write_at;
+} agent_temp_file;
+
+typedef struct {
+    agent_temp_file *v;
+    int len;
+    int cap;
+} agent_temp_file_list;
+
+typedef struct {
     ds4_engine_options engine;
     agent_generation_options gen;
     const char *chdir_path;
@@ -241,6 +253,7 @@ struct agent_worker {
     int next_bash_job_id;
     agent_path_list working_directories;
     agent_path_list auto_allowed_paths;
+    agent_temp_file_list temp_files;
     bool raw_mode_needs_restore;
     agent_docker_shell docker_shell;
     pthread_mutex_t *model_gate;
