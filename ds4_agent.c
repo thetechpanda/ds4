@@ -713,12 +713,9 @@ static agent_config parse_options(int argc, char **argv) {
         fprintf(stderr, "ds4-agent: --role worker is a serving mode; start workers with ./ds4\n");
         exit(2);
     }
-    /* If no explicit --tools flag, default to "read" (and "web" if configured). */
+    /* If no explicit --tools flag, start with all tools enabled. */
     if (!c.default_tools[0]) {
-        if (c.web_cdp_host[0] && c.web_cdp_port > 0)
-            snprintf(c.default_tools, sizeof(c.default_tools), "read, web");
-        else
-            snprintf(c.default_tools, sizeof(c.default_tools), "read");
+        snprintf(c.default_tools, sizeof(c.default_tools), "all");
     }
     return c;
 }
@@ -1118,7 +1115,7 @@ static const char agent_tools_prompt_rules[] =
     "unless explicitly asked otherwise by the user.\n";
 
 /* Map from concrete tool index to its schema string.  Indices match the
- * AGENT_TOOLS_CLASS_COUNT ordering: read(0), more(1), write(2),
+ * agent_tool_registry ordering: read(0), more(1), write(2),
  * list(3), edit(4), search(5), web_browse(6), web_fetch(7), bash(8),
  * bash_status(9), bash_stop(10), mkdir(11). */
 static const char *agent_tool_schemas[AGENT_TOOL_COUNT] = {
@@ -1151,15 +1148,41 @@ static const char *agent_tool_names[AGENT_TOOL_COUNT] = {
     [AGENT_TOOL_MKDIR]       = "mkdir",
 };
 
+static bool agent_tool_policy_includes_index(const ds4_agent_tool_policy *pol,
+                                             int idx) {
+    if (idx < 0 || idx >= AGENT_TOOL_COUNT) return false;
+    if (!pol || pol->allow_all) return true;
+    if (pol->allow_none) return false;
+    return pol->allowed[idx];
+}
+
+static void agent_append_available_tools(agent_buf *b,
+                                         const ds4_agent_tool_policy *pol) {
+    agent_buf_puts(b, "Available tools: ");
+    int first = 1;
+    for (int i = 0; i < AGENT_TOOL_COUNT; i++) {
+        const char *tool = agent_tool_names[i];
+        if (!tool) continue;
+        if (!agent_tool_policy_includes_index(pol, i)) continue;
+        if (!first) agent_buf_puts(b, ", ");
+        first = 0;
+        agent_buf_puts(b, tool);
+    }
+    if (first) agent_buf_puts(b, "none");
+    agent_buf_puts(b, "\n");
+}
+
 /* Build a filtered tools prompt that only includes schemas and guidance for
  * concrete tools allowed by the given policy.  If pol is NULL, all tools are
- * included (fallback for legacy callers).  Uses per-tool schema strings so
- * that only allowed tools are advertised — the model never sees schemas for
- * disallowed tools. */
+ * included (fallback for legacy callers).  The available-tool list and full
+ * schemas are both derived from the active policy. */
 static char *agent_build_filtered_tools_prompt(const ds4_agent_tool_policy *pol) {
     agent_buf b = {0};
     /* Always include the intro. */
     agent_buf_puts(&b, agent_tools_prompt_intro);
+    agent_buf_puts(&b, "\n");
+    agent_append_available_tools(&b, pol);
+    agent_buf_puts(&b, "\n");
 
     /* Include editing instructions if any WRITE-class tool is allowed
      * (includes READ-class tools since they're a subset of WRITE). */
@@ -10966,25 +10989,37 @@ static void test_agent_tool_policy_prompt_building(void) {
     prompt = agent_build_filtered_tools_prompt(&pol);
     AGENT_TEST_ASSERT(prompt != NULL);
     AGENT_TEST_ASSERT(strstr(prompt, "## Tools") != NULL);
+    AGENT_TEST_ASSERT(strstr(prompt, "Available tools: none") != NULL);
     AGENT_TEST_ASSERT(strstr(prompt, "## Editing files") == NULL);
     free(prompt);
     ds4_agent_tool_policy_parse("web", &pol);
     prompt = agent_build_filtered_tools_prompt(&pol);
     AGENT_TEST_ASSERT(prompt != NULL);
+    AGENT_TEST_ASSERT(strstr(prompt, "Available tools: web_browse, web_fetch") != NULL);
     AGENT_TEST_ASSERT(strstr(prompt, "Use web_browse") != NULL);
     AGENT_TEST_ASSERT(strstr(prompt, "## Editing files") == NULL);
     free(prompt);
     ds4_agent_tool_policy_parse("bash", &pol);
     prompt = agent_build_filtered_tools_prompt(&pol);
     AGENT_TEST_ASSERT(prompt != NULL);
+    AGENT_TEST_ASSERT(strstr(prompt, "Available tools: bash, bash_status, bash_stop") != NULL);
     AGENT_TEST_ASSERT(strstr(prompt, "Run a shell command") != NULL);
     AGENT_TEST_ASSERT(strstr(prompt, "## Editing files") == NULL);
     free(prompt);
     ds4_agent_tool_policy_parse("write", &pol);
     prompt = agent_build_filtered_tools_prompt(&pol);
     AGENT_TEST_ASSERT(prompt != NULL);
+    AGENT_TEST_ASSERT(strstr(prompt, "Available tools: read, more, write, list, edit, search") != NULL);
     AGENT_TEST_ASSERT(strstr(prompt, "## Editing files") != NULL);
-    AGENT_TEST_ASSERT(strstr(prompt, "web_browse") == NULL);
+    AGENT_TEST_ASSERT(strstr(prompt, "Use web_browse") == NULL);
+    free(prompt);
+
+    ds4_agent_tool_policy_parse("all", &pol);
+    prompt = agent_build_filtered_tools_prompt(&pol);
+    AGENT_TEST_ASSERT(prompt != NULL);
+    AGENT_TEST_ASSERT(strstr(prompt, "Available tools: read, more, write, list, edit, search, web_browse, web_fetch, bash, bash_status, bash_stop, mkdir") != NULL);
+    AGENT_TEST_ASSERT(strstr(prompt, "Use web_browse") != NULL);
+    AGENT_TEST_ASSERT(strstr(prompt, "Run a shell command") != NULL);
     free(prompt);
 }
 
@@ -11087,7 +11122,24 @@ static void test_agent_tool_policy_dispatch_enforcement(void) {
     AGENT_TEST_ASSERT(w.out && strstr(w.out, "blocked by tool-access policy") != NULL);
     free(blocked);
 
+    agent_tool_call grep_call = {
+        .name = "grep",
+        .args = read_args,
+        .argc = 1,
+    };
+    free(w.out);
+    w.out = NULL;
+    w.out_len = 0;
+    w.out_cap = 0;
     ds4_agent_tool_policy_parse("read", &w.tool_policy);
+    char *unknown = agent_execute_tool_call(&w, &grep_call);
+    AGENT_TEST_ASSERT(strstr(unknown, "Tool error: unknown tool: grep") != NULL);
+    AGENT_TEST_ASSERT(strstr(unknown, "Available tools:") != NULL);
+    AGENT_TEST_ASSERT(strstr(unknown, "search") != NULL);
+    AGENT_TEST_ASSERT(strstr(unknown, "bash") == NULL);
+    AGENT_TEST_ASSERT(w.out && strstr(w.out, "[tool:grep] unknown tool") != NULL);
+    free(unknown);
+
     char *allowed = agent_execute_tool_call(&w, &read_call);
     AGENT_TEST_ASSERT(strstr(allowed, "policy ok") != NULL);
     free(allowed);
@@ -13051,6 +13103,16 @@ static pid_t agent_tool_pid(const agent_tool_call *call) {
 static char *agent_execute_tool_call(agent_worker *w, const agent_tool_call *call) {
     agent_buf result = {0};
     if (!call->name) return xstrdup("Tool error: missing tool name\n");
+    if (agent_tool_index_for_name(call->name) < 0) {
+        char header[256];
+        snprintf(header, sizeof(header), "\n[tool:%s] unknown tool\n", call->name);
+        agent_publish(w, header, strlen(header));
+        agent_buf_puts(&result, "Tool error: unknown tool: ");
+        agent_buf_puts(&result, call->name);
+        agent_buf_puts(&result, "\n");
+        agent_append_available_tools(&result, &w->tool_policy);
+        return agent_buf_take(&result);
+    }
     if (!ds4_agent_tool_policy_allows(&w->tool_policy, call->name)) {
         char summary[256];
         ds4_agent_tool_policy_format(&w->tool_policy, summary, sizeof(summary));
@@ -13116,16 +13178,7 @@ static char *agent_execute_tool_call(agent_worker *w, const agent_tool_call *cal
         bool wait = stop;
         return agent_bash_job_tool_result(w, job, wait, refresh, stop, true);
     }
-
-    {
-        char header[256];
-        snprintf(header, sizeof(header), "\n[tool:%s] unknown tool\n", call->name);
-        agent_publish(w, header, strlen(header));
-        agent_buf_puts(&result, "Tool error: unknown tool: ");
-        agent_buf_puts(&result, call->name);
-        agent_buf_puts(&result, "\n");
-        return agent_buf_take(&result);
-    }
+    return xstrdup("Tool error: internal dispatcher mismatch\n");
 }
 
 /* Execute all tool calls from one DSML block, preserving per-call labels in the
@@ -17193,7 +17246,7 @@ int agent_worker_init(agent_worker *w, ds4_engine *engine, agent_config *cfg) {
     if (tools_explicit)
         ds4_agent_tool_policy_parse(cfg->default_tools, &w->tool_policy);
     else
-        ds4_agent_tool_policy_parse("read", &w->tool_policy);
+        ds4_agent_tool_policy_parse("all", &w->tool_policy);
     for (int i = 0; i < cfg->working_directories.len; i++)
         agent_path_list_append(&w->working_directories, cfg->working_directories.v[i]);
     if (pipe(w->wake_fd) != 0) return -1;
@@ -17223,9 +17276,6 @@ int agent_worker_init(agent_worker *w, ds4_engine *engine, agent_config *cfg) {
         .cancel_privdata = w,
     };
     w->web = ds4_web_create(&web_cfg);
-    /* If no explicit --tools and web is available, add web tools to the default. */
-    if (!tools_explicit && w->web)
-        ds4_agent_tool_policy_parse("web", &w->tool_policy);
     w->sysprompt_path = ds4_kvstore_path_join(w->cache_dir, "sysprompt.kv");
     if (cfg->gen.trace_path && cfg->gen.trace_path[0]) {
         w->trace = fopen(cfg->gen.trace_path, "ab");
@@ -17660,7 +17710,7 @@ static void test_agent_fake_worker_init(agent_worker *w, agent_config *cfg) {
     if (cfg->default_tools[0])
         ds4_agent_tool_policy_parse(cfg->default_tools, &w->tool_policy);
     else
-        ds4_agent_tool_policy_parse("read", &w->tool_policy);
+        ds4_agent_tool_policy_parse("all", &w->tool_policy);
 }
 
 typedef struct {

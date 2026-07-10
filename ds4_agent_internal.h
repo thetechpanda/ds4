@@ -46,23 +46,23 @@ typedef enum {
  * in that class.  The first element is the count of tools in the class,
  * followed by the indices. */
 static const int agent_tools_class_indices[AGENT_TOOLS_CLASS_COUNT][8] = {
-    [AGENT_TOOLS_CLASS_READ]  = {AGENT_TOOL_READ, AGENT_TOOL_MORE, AGENT_TOOL_LIST, AGENT_TOOL_SEARCH},
-    [AGENT_TOOLS_CLASS_WRITE] = {AGENT_TOOL_WRITE, AGENT_TOOL_EDIT, AGENT_TOOL_MKDIR, AGENT_TOOL_READ, AGENT_TOOL_MORE, AGENT_TOOL_LIST, AGENT_TOOL_SEARCH},
-    [AGENT_TOOLS_CLASS_WEB]   = {AGENT_TOOL_WEB_BROWSE, AGENT_TOOL_WEB_FETCH},
-    [AGENT_TOOLS_CLASS_BASH]  = {AGENT_TOOL_BASH, AGENT_TOOL_BASH_STATUS, AGENT_TOOL_BASH_STOP},
+    [AGENT_TOOLS_CLASS_READ]  = {4, AGENT_TOOL_READ, AGENT_TOOL_MORE, AGENT_TOOL_LIST, AGENT_TOOL_SEARCH},
+    [AGENT_TOOLS_CLASS_WRITE] = {7, AGENT_TOOL_READ, AGENT_TOOL_MORE, AGENT_TOOL_LIST, AGENT_TOOL_SEARCH, AGENT_TOOL_WRITE, AGENT_TOOL_EDIT, AGENT_TOOL_MKDIR},
+    [AGENT_TOOLS_CLASS_WEB]   = {2, AGENT_TOOL_WEB_BROWSE, AGENT_TOOL_WEB_FETCH},
+    [AGENT_TOOLS_CLASS_BASH]  = {3, AGENT_TOOL_BASH, AGENT_TOOL_BASH_STATUS, AGENT_TOOL_BASH_STOP},
 };
 
 typedef struct {
     bool allow_all;                          /* policy is "all" */
     bool allow_none;                         /* policy is "none" (or "off") */
-    bool allowed[AGENT_TOOLS_CLASS_COUNT];   /* per-tool allow bits */
+    bool allowed[AGENT_TOOL_COUNT];          /* per-tool allow bits */
 } ds4_agent_tool_policy;
 
 /* Parse a tool-access string into a normalized policy.
  * Accepts: "all", "none", "off", comma-separated tool names.
  * Meta-tool expansions:
  *   "read"  -> read, more, list, search
- *   "write" -> read, more, list, search, write, edit
+ *   "write" -> read, more, list, search, write, edit, mkdir
  *   "web"   -> web_browse, web_fetch
  *   "bash"  -> bash, bash_status, bash_stop
  * Returns 0 on success, -1 on parse error (unknown tool name).
