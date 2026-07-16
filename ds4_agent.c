@@ -363,6 +363,471 @@ void agent_path_list_free(agent_path_list *list) {
     memset(list, 0, sizeof(*list));
 }
 
+/* ============================================================================
+ * Skill System: registration, parsing, listing, prompt building
+ *
+ * Skills are lightweight metadata records (name, description, path) stored in a
+ * linked list owned by the agent worker.  Bodies are NOT cached — the LLM reads
+ * skill content through the normal file tools when it sees [skill:<name>](<path>).
+ * ============================================================================ */
+
+enum {
+    AGENT_SKILL_ERR_IO = -1,
+    AGENT_SKILL_ERR_FRONTMATTER = -2,
+    AGENT_SKILL_ERR_UTF8 = -3,
+    AGENT_SKILL_ERR_NAME = -4,
+    AGENT_SKILL_ERR_WORKSPACE = -5,
+    AGENT_SKILL_ERR_DUPLICATE = -6,
+    AGENT_SKILL_ERR_LINE_TOO_LONG = -7,
+};
+
+static agent_skill_registry *agent_skill_registry_create(void) {
+    agent_skill_registry *registry = xmalloc(sizeof(*registry));
+    memset(registry, 0, sizeof(*registry));
+    pthread_mutex_init(&registry->mu, NULL);
+    registry->refs = 1;
+    return registry;
+}
+
+static void agent_skill_registry_acquire(agent_skill_registry *registry) {
+    if (!registry) return;
+    pthread_mutex_lock(&registry->mu);
+    registry->refs++;
+    pthread_mutex_unlock(&registry->mu);
+}
+
+static void agent_skill_registry_release(agent_skill_registry *registry) {
+    if (!registry) return;
+    pthread_mutex_lock(&registry->mu);
+    if (--registry->refs != 0) {
+        pthread_mutex_unlock(&registry->mu);
+        return;
+    }
+    agent_skill *skill = registry->head;
+    registry->head = NULL;
+    while (skill) {
+        agent_skill *next = skill->next;
+        free(skill);
+        skill = next;
+    }
+    pthread_mutex_unlock(&registry->mu);
+    pthread_mutex_destroy(&registry->mu);
+    free(registry);
+}
+
+static bool agent_utf8_valid(const unsigned char *s, size_t len) {
+    size_t i = 0;
+    while (i < len) {
+        unsigned char c = s[i++];
+        if (c <= 0x7f) continue;
+        if (c >= 0xc2 && c <= 0xdf) {
+            if (i >= len || (s[i] & 0xc0) != 0x80) return false;
+            i++;
+            continue;
+        }
+        if (c >= 0xe0 && c <= 0xef) {
+            if (i + 1 >= len || (s[i] & 0xc0) != 0x80 ||
+                (s[i + 1] & 0xc0) != 0x80) return false;
+            if (c == 0xe0 && s[i] < 0xa0) return false;
+            if (c == 0xed && s[i] >= 0xa0) return false;
+            i += 2;
+            continue;
+        }
+        if (c >= 0xf0 && c <= 0xf4) {
+            if (i + 2 >= len || (s[i] & 0xc0) != 0x80 ||
+                (s[i + 1] & 0xc0) != 0x80 ||
+                (s[i + 2] & 0xc0) != 0x80) return false;
+            if (c == 0xf0 && s[i] < 0x90) return false;
+            if (c == 0xf4 && s[i] > 0x8f) return false;
+            i += 3;
+            continue;
+        }
+        return false;
+    }
+    return true;
+}
+
+bool agent_skill_name_valid(const char *name) {
+    if (!name || !name[0]) return false;
+    for (const char *p = name; *p; p++) {
+        if (!((*p >= 'a' && *p <= 'z') ||
+              (*p >= 'A' && *p <= 'Z') ||
+              (*p >= '0' && *p <= '9') ||
+              *p == '_' || *p == '-'))
+            return false;
+    }
+    return true;
+}
+
+static bool agent_skill_path_allowed(const agent_worker *w,
+                                     const char *resolved) {
+    if (!w || !resolved) return false;
+    for (int i = 0; i < w->working_directories.len; i++) {
+        size_t dlen = strlen(w->working_directories.v[i]);
+        if (strncmp(resolved, w->working_directories.v[i], dlen) == 0 &&
+            (resolved[dlen] == '/' || resolved[dlen] == '\0')) return true;
+    }
+    return false;
+}
+
+int agent_skill_parse_file(const char *path, char *name_out, size_t name_size,
+                           char *desc_out, size_t desc_size) {
+    if (!path || !path[0] || !name_out || name_size < 2 ||
+        !desc_out || desc_size < 2) return AGENT_SKILL_ERR_IO;
+
+    /* Open file, read at most 20 lines */
+    FILE *fp = fopen(path, "rb");
+    if (!fp) return AGENT_SKILL_ERR_IO;
+
+    char lines[20][512];
+    int nlines = 0;
+    bool frontmatter_open = false;
+    while (nlines < 20) {
+        if (!fgets(lines[nlines], (int)sizeof(lines[nlines]), fp)) break;
+        size_t len = strlen(lines[nlines]);
+        if (len > 0 && lines[nlines][len - 1] != '\n' && !feof(fp)) {
+            fclose(fp);
+            return AGENT_SKILL_ERR_LINE_TOO_LONG;
+        }
+        if (!agent_utf8_valid((const unsigned char *)lines[nlines], len)) {
+            fclose(fp);
+            return AGENT_SKILL_ERR_UTF8;
+        }
+        bool delimiter = strcmp(lines[nlines], "---\n") == 0 ||
+                         strcmp(lines[nlines], "---\r\n") == 0;
+        nlines++;
+        if (delimiter) {
+            if (frontmatter_open) break;
+            frontmatter_open = true;
+        }
+    }
+    fclose(fp);
+
+    /* Reject if fewer than 3 lines (need ---, frontmatter, ---) */
+    if (nlines < 3) return AGENT_SKILL_ERR_FRONTMATTER;
+
+    /* Check first line is "---\n" or "---\r\n" */
+    if (strcmp(lines[0], "---\n") != 0 && strcmp(lines[0], "---\r\n") != 0)
+        return AGENT_SKILL_ERR_FRONTMATTER;
+
+    /* Find second --- delimiter within first 20 lines */
+    int delim_idx = -1;
+    for (int i = 1; i < nlines; i++) {
+        if (strcmp(lines[i], "---\n") == 0 ||
+            strcmp(lines[i], "---\r\n") == 0) {
+            delim_idx = i;
+            break;
+        }
+    }
+    if (delim_idx < 0) return AGENT_SKILL_ERR_FRONTMATTER;
+
+    /* Parse frontmatter between first --- and second --- */
+    char name[AGENT_SKILL_NAME_MAX];
+    char desc[AGENT_SKILL_DESC_MAX];
+    name[0] = '\0';
+    desc[0] = '\0';
+
+    for (int i = 1; i < delim_idx; i++) {
+        const char *line = lines[i];
+        /* Trim trailing whitespace/newline */
+        size_t llen = strlen(line);
+        while (llen > 0 && (line[llen-1] == '\n' || line[llen-1] == '\r' ||
+               line[llen-1] == ' ' || line[llen-1] == '\t'))
+            llen--;
+        if (llen == 0) continue;
+
+        /* Parse key: value */
+        const char *colon = strchr(line, ':');
+        if (!colon) continue;
+        size_t key_len = (size_t)(colon - line);
+        if (key_len == 0) continue;
+
+        /* Extract key */
+        char key[64];
+        if (key_len >= sizeof(key)) key_len = sizeof(key) - 1;
+        memcpy(key, line, key_len);
+        key[key_len] = '\0';
+
+        /* Trim key */
+        while (key_len > 0 && (key[key_len-1] == ' ' || key[key_len-1] == '\t'))
+            key[--key_len] = '\0';
+
+        /* Value starts after colon */
+        const char *val = colon + 1;
+        while (*val == ' ' || *val == '\t') val++;
+        size_t val_off = (size_t)(val - line);
+        if (val_off >= llen) continue;
+        size_t vlen = llen - val_off;
+        if (vlen == 0) continue;
+
+        if (strcmp(key, "name") == 0) {
+            if (vlen >= sizeof(name) || vlen >= name_size)
+                return AGENT_SKILL_ERR_LINE_TOO_LONG;
+            size_t cp = vlen < name_size - 1 ? vlen : name_size - 1;
+            memcpy(name, val, cp);
+            name[cp] = '\0';
+        } else if (strcmp(key, "description") == 0) {
+            if (vlen >= sizeof(desc) || vlen >= desc_size)
+                return AGENT_SKILL_ERR_LINE_TOO_LONG;
+            size_t cp = vlen < desc_size - 1 ? vlen : desc_size - 1;
+            memcpy(desc, val, cp);
+            desc[cp] = '\0';
+        }
+    }
+
+    if (!name[0] || !desc[0]) return AGENT_SKILL_ERR_FRONTMATTER;
+
+    /* Validate name against [a-zA-Z0-9_-]+ */
+    if (!agent_skill_name_valid(name)) return AGENT_SKILL_ERR_NAME;
+
+    /* Copy outputs */
+    strncpy(name_out, name, name_size - 1);
+    name_out[name_size - 1] = '\0';
+    strncpy(desc_out, desc, desc_size - 1);
+    desc_out[desc_size - 1] = '\0';
+
+    return 0;
+}
+
+int agent_skill_register(agent_worker *w, const char *path) {
+    if (!w || !w->skill_registry || !path || !path[0])
+        return AGENT_SKILL_ERR_IO;
+
+    /* Resolve to absolute path */
+    char resolved[AGENT_SKILL_PATH_MAX];
+    if (!realpath(path, resolved)) {
+        fprintf(stderr, "ds4-agent: warning: cannot resolve skill %s: %s\n",
+                path, strerror(errno));
+        return AGENT_SKILL_ERR_IO;
+    }
+
+    /* Validate path is within allowed workspace directories */
+    if (!agent_skill_path_allowed(w, resolved))
+        return AGENT_SKILL_ERR_WORKSPACE;
+
+    /* Parse the file */
+    char name[AGENT_SKILL_NAME_MAX];
+    char desc[AGENT_SKILL_DESC_MAX];
+    int ret = agent_skill_parse_file(resolved, name, sizeof(name),
+                                     desc, sizeof(desc));
+    if (ret != 0) return ret;
+
+    /* Check for duplicate name */
+    agent_skill_registry *registry = w->skill_registry;
+    pthread_mutex_lock(&registry->mu);
+    for (agent_skill *s = registry->head; s; s = s->next) {
+        if (strcmp(s->name, name) == 0) {
+            pthread_mutex_unlock(&registry->mu);
+            return AGENT_SKILL_ERR_DUPLICATE;
+        }
+    }
+
+    /* Allocate and link new skill node */
+    agent_skill *sk = xmalloc(sizeof(*sk));
+    strncpy(sk->name, name, sizeof(sk->name) - 1);
+    sk->name[sizeof(sk->name) - 1] = '\0';
+    strncpy(sk->description, desc, sizeof(sk->description) - 1);
+    sk->description[sizeof(sk->description) - 1] = '\0';
+    strncpy(sk->path, resolved, sizeof(sk->path) - 1);
+    sk->path[sizeof(sk->path) - 1] = '\0';
+    sk->next = registry->head;
+    registry->head = sk;
+    registry->count++;
+    registry->generation++;
+    pthread_mutex_unlock(&registry->mu);
+    return 0;
+}
+
+static const char *agent_skill_error_text(int rc) {
+    switch (rc) {
+    case AGENT_SKILL_ERR_FRONTMATTER: return "invalid or incomplete frontmatter";
+    case AGENT_SKILL_ERR_UTF8: return "invalid UTF-8 metadata";
+    case AGENT_SKILL_ERR_NAME: return "invalid skill name";
+    case AGENT_SKILL_ERR_WORKSPACE: return "path outside allowed workspace dirs";
+    case AGENT_SKILL_ERR_DUPLICATE: return "duplicate skill name";
+    case AGENT_SKILL_ERR_LINE_TOO_LONG: return "frontmatter line too long";
+    default: return "filesystem error";
+    }
+}
+
+static bool agent_skill_markdown_path(const char *name) {
+    size_t len = name ? strlen(name) : 0;
+    return len >= 3 && strcmp(name + len - 3, ".md") == 0;
+}
+
+int agent_skill_register_dir(agent_worker *w, const char *dir) {
+    if (!w || !dir || !dir[0]) return -1;
+
+    DIR *d = opendir(dir);
+    if (!d) {
+        fprintf(stderr, "ds4-agent: warning: cannot scan skill dir %s: %s\n",
+                dir, strerror(errno));
+        return AGENT_SKILL_ERR_IO;
+    }
+
+    int count = 0;
+    struct dirent *ent;
+    while ((ent = readdir(d)) != NULL) {
+        if (ent->d_name[0] == '.') continue; /* skip hidden entries and . / .. */
+
+        char fullpath[AGENT_SKILL_PATH_MAX];
+        int path_len = snprintf(fullpath, sizeof(fullpath), "%s/%s",
+                                dir, ent->d_name);
+        if (path_len < 0 || (size_t)path_len >= sizeof(fullpath)) {
+            fprintf(stderr, "ds4-agent: warning: skill path too long: %s/%s\n",
+                    dir, ent->d_name);
+            continue;
+        }
+
+        struct stat st;
+        if (lstat(fullpath, &st) != 0) {
+            fprintf(stderr, "ds4-agent: warning: cannot inspect skill path %s: %s\n",
+                    fullpath, strerror(errno));
+            continue;
+        }
+
+        if (S_ISLNK(st.st_mode)) {
+            fprintf(stderr, "ds4-agent: warning: skipping symlink while scanning skills: %s\n",
+                    fullpath);
+            continue;
+        }
+
+        if (S_ISDIR(st.st_mode)) {
+            /* Recurse into subdirectories */
+            int sub = agent_skill_register_dir(w, fullpath);
+            if (sub > 0) count += sub;
+            continue;
+        }
+
+        if (!S_ISREG(st.st_mode) || !agent_skill_markdown_path(ent->d_name))
+            continue;
+
+        int ret = agent_skill_register(w, fullpath);
+        if (ret == 0) count++;
+        else fprintf(stderr, "ds4-agent: warning: skipped skill %s: %s\n",
+                     fullpath, agent_skill_error_text(ret));
+    }
+    closedir(d);
+    return count;
+}
+
+int agent_skills_init(agent_worker *w) {
+    if (!w) return -1;
+    int count = 0;
+    for (int i = 0; i < w->cfg->skill_dirs.len; i++) {
+        const char *raw = w->cfg->skill_dirs.v[i];
+        if (!raw || !raw[0]) continue;
+
+        /* Resolve to absolute path (like --workspace does) */
+        char resolved[PATH_MAX];
+        if (!realpath(raw, resolved)) {
+            fprintf(stderr, "ds4-agent: warning: cannot resolve skill dir %s: %s\n",
+                    raw, strerror(errno));
+            continue;
+        }
+        struct stat st;
+        if (stat(resolved, &st) != 0 || !S_ISDIR(st.st_mode)) {
+            fprintf(stderr, "ds4-agent: warning: skill dir not a directory: %s\n",
+                    resolved);
+            continue;
+        }
+
+        /* Ensure directory is in working_directories */
+        if (!agent_path_list_contains(&w->working_directories, resolved))
+            agent_path_list_append(&w->working_directories, resolved);
+        if (!agent_path_list_contains(&w->cfg->working_directories, resolved))
+            agent_path_list_append(&w->cfg->working_directories, resolved);
+
+        int ret = agent_skill_register_dir(w, resolved);
+        if (ret < 0) {
+            fprintf(stderr, "ds4-agent: warning: failed to scan skill dir %s\n", resolved);
+        } else {
+            count += ret;
+        }
+    }
+    return count;
+}
+
+agent_skill *agent_skill_find(agent_worker *w, const char *name) {
+    if (!w || !w->skill_registry || !name) return NULL;
+    agent_skill_registry *registry = w->skill_registry;
+    pthread_mutex_lock(&registry->mu);
+    for (agent_skill *s = registry->head; s; s = s->next) {
+        if (strcmp(s->name, name) == 0) {
+            pthread_mutex_unlock(&registry->mu);
+            return s;
+        }
+    }
+    pthread_mutex_unlock(&registry->mu);
+    return NULL;
+}
+
+void agent_skill_delete(agent_worker *w, const char *name) {
+    if (!w || !w->skill_registry || !name) return;
+    agent_skill_registry *registry = w->skill_registry;
+    pthread_mutex_lock(&registry->mu);
+    agent_skill **pp = &registry->head;
+    while (*pp) {
+        if (strcmp((*pp)->name, name) == 0) {
+            agent_skill *next = (*pp)->next;
+            free(*pp);
+            *pp = next;
+            registry->count--;
+            registry->generation++;
+            pthread_mutex_unlock(&registry->mu);
+            return;
+        }
+        pp = &(*pp)->next;
+    }
+    pthread_mutex_unlock(&registry->mu);
+}
+
+void agent_skill_list_all(agent_worker *w,
+                          void (*cb)(const agent_skill *s, void *ctx),
+                          void *ctx) {
+    if (!w || !w->skill_registry || !cb) return;
+    agent_skill_registry *registry = w->skill_registry;
+    pthread_mutex_lock(&registry->mu);
+    for (agent_skill *s = registry->head; s; s = s->next)
+        cb(s, ctx);
+    pthread_mutex_unlock(&registry->mu);
+}
+
+char *agent_build_skills_prompt(agent_worker *w) {
+    if (!w || !w->skill_registry) return xstrdup("");
+
+    agent_buf b = {0};
+    agent_skill_registry *registry = w->skill_registry;
+    pthread_mutex_lock(&registry->mu);
+    if (!registry->head) {
+        pthread_mutex_unlock(&registry->mu);
+        return xstrdup("");
+    }
+    agent_buf_puts(&b, "\n## Skills\n\n");
+    agent_buf_puts(&b, "Available skills (registered by the user or the system):\n\n");
+
+    for (agent_skill *s = registry->head; s; s = s->next) {
+        agent_buf_puts(&b, "- **");
+        agent_buf_puts(&b, s->name);
+        agent_buf_puts(&b, "**: ");
+        agent_buf_puts(&b, s->description);
+        agent_buf_puts(&b, "\n");
+    }
+    pthread_mutex_unlock(&registry->mu);
+
+    agent_buf_puts(&b,
+        "\n"
+        "### Usage\n\n"
+        "When the user includes **@<skill-name>** in their input, the system "
+        "replaces it with a `[skill:<skill-name>](<path>)` link before the input "
+        "is sent to you. Read that linked file before following the skill.\n\n"
+        "Use `\\@<skill-name>` to pass `@skill-name` through literally without invocation.\n\n"
+        "To discover available skills, use the `skill_list` DSML tool.\n"
+    );
+
+    return agent_buf_take(&b);
+}
+
 #define AGENT_TEMP_FILE_IDLE_SECONDS (5 * 60)
 
 static int agent_temp_files_index(const agent_temp_file_list *list,
@@ -592,6 +1057,7 @@ static bool agent_slash_command_known(const char *cmd) {
            agent_slash_command_with_args(cmd, "/subagent") ||
            agent_slash_command_with_args(cmd, "/allow") ||
            agent_slash_command_with_args(cmd, "/disallow") ||
+           agent_slash_command_with_args(cmd, "/skills") ||
            !strcmp(cmd, "/purge_auto_files");
 }
 
@@ -771,6 +1237,9 @@ static agent_config parse_options(int argc, char **argv) {
         } else if (!strcmp(arg, "--web-cdp-host")) {
             snprintf(c.web_cdp_host, sizeof(c.web_cdp_host), "%s",
                      need_arg(&i, argc, argv, arg));
+        } else if (!strcmp(arg, "--skill-dir")) {
+            agent_path_list_append(&c.skill_dirs,
+                                   need_arg(&i, argc, argv, arg));
         } else if (!strcmp(arg, "--web-cdp-port")) {
             int v = parse_int(need_arg(&i, argc, argv, arg), arg);
             if (v <= 0 || v > 65535) {
@@ -1052,6 +1521,25 @@ static const char agent_tool_schema_ask_question[] =
     "  }\n"
     "}\n\n";
 
+static const char agent_tool_schema_skill_list[] =
+    "Use the `skill_list` tool to discover registered skills. "
+    "When `has_more` is true, use different query substrings (e.g., narrower terms) "
+    "to discover the remaining skills.\n\n"
+    "{\n"
+    "  \"type\": \"function\",\n"
+    "  \"function\": {\n"
+    "    \"name\": \"skill_list\",\n"
+    "    \"description\": \"List registered skills. Accepts optional `query` (literal substring, case-insensitive) to filter by name. Returns at most 10 skills per call, with total count and has_more flag.\",\n"
+    "    \"parameters\": {\n"
+    "      \"type\": \"object\",\n"
+    "      \"properties\": {\n"
+    "        \"query\": {\"type\": \"string\"}\n"
+    "      },\n"
+    "      \"required\": []\n"
+    "    }\n"
+    "  }\n"
+    "}\n\n";
+
 static const char agent_tool_schema_bash[] =
     "For long-running bash commands, pass refresh_sec. If a bash job is still running, use "
     "bash_status to check it early or bash_stop to terminate it.\n\n"
@@ -1299,6 +1787,7 @@ static const char *agent_tool_schemas[AGENT_TOOL_COUNT] = {
     [AGENT_TOOL_BASH_STATUS] = agent_tool_schema_bash_status,
     [AGENT_TOOL_BASH_STOP]   = agent_tool_schema_bash_stop,
     [AGENT_TOOL_MKDIR]       = agent_tool_schema_mkdir,
+    [AGENT_TOOL_SKILL_LIST]  = agent_tool_schema_skill_list,
 };
 
 static const char *agent_tool_names[AGENT_TOOL_COUNT] = {
@@ -1314,6 +1803,7 @@ static const char *agent_tool_names[AGENT_TOOL_COUNT] = {
     [AGENT_TOOL_BASH_STATUS] = "bash_status",
     [AGENT_TOOL_BASH_STOP]   = "bash_stop",
     [AGENT_TOOL_MKDIR]       = "mkdir",
+    [AGENT_TOOL_SKILL_LIST]  = "skill_list",
 };
 
 static bool agent_tool_policy_includes_index(const ds4_agent_tool_policy *pol,
@@ -1325,7 +1815,8 @@ static bool agent_tool_policy_includes_index(const ds4_agent_tool_policy *pol,
 }
 
 static bool agent_tool_is_policy_exempt(const char *tool_name) {
-    return tool_name && !strcmp(tool_name, "ask_question");
+    return tool_name && (!strcmp(tool_name, "ask_question") ||
+                         !strcmp(tool_name, "skill_list"));
 }
 
 static void agent_append_available_tools(agent_buf *b,
@@ -1337,7 +1828,8 @@ static void agent_append_available_tools(agent_buf *b,
     for (int i = 0; i < AGENT_TOOL_COUNT; i++) {
         const char *tool = agent_tool_names[i];
         if (!tool) continue;
-        if (!agent_tool_policy_includes_index(pol, i)) continue;
+        if (!agent_tool_policy_includes_index(pol, i) &&
+            !agent_tool_is_policy_exempt(tool)) continue;
         if (!first) agent_buf_puts(b, ", ");
         first = 0;
         agent_buf_puts(b, tool);
@@ -1377,7 +1869,8 @@ static char *agent_build_filtered_tools_prompt(const ds4_agent_tool_policy *pol)
      * When pol is NULL, include all tools. */
     for (int i = 0; i < AGENT_TOOL_COUNT; i++) {
         bool include = !pol || pol->allow_all ||
-            (pol->allow_none ? false : pol->allowed[i]);
+            (pol->allow_none ? false : pol->allowed[i]) ||
+            agent_tool_is_policy_exempt(agent_tool_names[i]);
         if (include && agent_tool_schemas[i])
             agent_buf_puts(&b, agent_tool_schemas[i]);
     }
@@ -1407,27 +1900,37 @@ static const char agent_dsml_syntax_reminder[] =
 
 #define AGENT_SYSTEM_PROMPT_REMINDER_TOKENS 50000
 
-static char *agent_build_system_prompt_reminder(const ds4_agent_tool_policy *pol) {
-    char *tools = agent_build_filtered_tools_prompt(pol);
+static char *agent_build_system_prompt_reminder(agent_worker *w) {
+    char *tools = agent_build_filtered_tools_prompt(&w->tool_policy);
     const char *start = "\n\n[System prompt reminder follows.]\n";
     const char *end = "[End system prompt reminder.]\n\n";
-    size_t len = strlen(start) + strlen(tools) + strlen(end) + 1;
+    /* Include skills section */
+    char *skills = agent_build_skills_prompt(w);
+    size_t len = strlen(start) + strlen(tools) + strlen(end) + strlen(skills) + 1;
     char *out = xmalloc(len);
     out[0] = '\0';
     strcat(out, start);
     strcat(out, tools);
+    strcat(out, skills);
     strcat(out, end);
     free(tools);
+    free(skills);
     return out;
 }
 
-static void agent_append_system_prompt(ds4_engine *engine, ds4_tokens *tokens,
-                                       const char *extra,
-                                       const ds4_agent_tool_policy *pol) {
-    char *tools_prompt = agent_build_filtered_tools_prompt(pol);
+static void agent_append_system_prompt(agent_worker *w, ds4_engine *engine,
+                                       ds4_tokens *tokens, const char *extra) {
+    char *tools_prompt = agent_build_filtered_tools_prompt(&w->tool_policy);
     // fprintf(stdout, "--- agent prompt ---\n%s\n--- agent prompt ---\n", tools_prompt);
     ds4_tokenize_rendered_chat(engine, tools_prompt, tokens);
     free(tools_prompt);
+
+    /* Append skills section */
+    char *skills = agent_build_skills_prompt(w);
+    if (skills && skills[0]) {
+        ds4_tokenize_rendered_chat(engine, skills, tokens);
+    }
+    free(skills);
 
     if (!extra || !extra[0]) return;
     size_t n = strlen(extra);
@@ -1518,6 +2021,28 @@ static void agent_worker_note_system_prompt_seen(agent_worker *w) {
     w->last_system_prompt_reminder_at = w->transcript.len;
 }
 
+static void agent_worker_note_skills_prompt_seen(agent_worker *w) {
+    if (!w || !w->skill_registry) return;
+    pthread_mutex_lock(&w->skill_registry->mu);
+    w->skills_prompt_generation = w->skill_registry->generation;
+    pthread_mutex_unlock(&w->skill_registry->mu);
+}
+
+static void agent_worker_sync_skills_prompt(agent_worker *w) {
+    if (!w || !w->skill_registry) return;
+    pthread_mutex_lock(&w->skill_registry->mu);
+    bool changed = w->skills_prompt_generation != w->skill_registry->generation;
+    pthread_mutex_unlock(&w->skill_registry->mu);
+    if (!changed) return;
+
+    char *reminder = agent_build_system_prompt_reminder(w);
+    agent_publish_system_status(w, "Skills changed; re-injecting system prompt...");
+    ds4_tokenize_rendered_chat(w->engine, reminder, &w->transcript);
+    free(reminder);
+    agent_worker_note_system_prompt_seen(w);
+    agent_worker_note_skills_prompt_seen(w);
+}
+
 static void agent_worker_maybe_append_datetime_context(agent_worker *w) {
     if (w->datetime_context_injected) return;
 
@@ -1553,7 +2078,7 @@ static void agent_worker_maybe_append_system_prompt_reminder(agent_worker *w) {
         return;
     }
 
-    char *reminder = agent_build_system_prompt_reminder(&w->tool_policy);
+    char *reminder = agent_build_system_prompt_reminder(w);
     agent_publish_system_status(w, "Re-injecting system prompt reminder...");
     agent_trace(w, "system prompt reminder injected at transcript=%d",
                 w->transcript.len);
@@ -4661,7 +5186,7 @@ static void agent_worker_build_system_tokens(agent_worker *w, ds4_tokens *out) {
     if (w->cfg->gen.think_mode == DS4_THINK_MAX &&
         effective_think_mode(w->cfg) == DS4_THINK_MAX)
         ds4_chat_append_max_effort_prefix(w->engine, out);
-    agent_append_system_prompt(w->engine, out, w->cfg->gen.system, &w->tool_policy);
+    agent_append_system_prompt(w, w->engine, out, w->cfg->gen.system);
     const agent_path_list *roots = agent_working_directories(w);
     agent_append_project_instruction_prompt(w->engine, out,
                                             roots && roots->len ? roots->v[0] : NULL);
@@ -11317,6 +11842,10 @@ static bool agent_worker_apply_tool_policy_command(agent_worker *w,
 }
 
 #ifdef DS4_AGENT_TEST
+static char *agent_tool_skill_list(agent_worker *w,
+                                   const agent_tool_call *call);
+static char *agent_expand_skill_references(agent_worker *w, const char *text);
+
 static void test_agent_tool_policy_parse(void) {
     ds4_agent_tool_policy pol;
     char buf[256];
@@ -11726,6 +12255,279 @@ static void test_agent_ask_question_prompt_options(void) {
     close(saved_stdout);
 }
 
+static void test_agent_skill_write(const char *path, const void *data, size_t len) {
+    char err[160] = {0};
+    AGENT_TEST_ASSERT(agent_write_file_bytes(path, data, len, err, sizeof(err)) == 0);
+}
+
+static void test_agent_skill_add_direct(agent_skill_registry *registry,
+                                        const char *name,
+                                        const char *description,
+                                        const char *path) {
+    agent_skill *skill = xmalloc(sizeof(*skill));
+    memset(skill, 0, sizeof(*skill));
+    snprintf(skill->name, sizeof(skill->name), "%s", name);
+    snprintf(skill->description, sizeof(skill->description), "%s", description);
+    snprintf(skill->path, sizeof(skill->path), "%s", path);
+    pthread_mutex_lock(&registry->mu);
+    skill->next = registry->head;
+    registry->head = skill;
+    registry->count++;
+    registry->generation++;
+    pthread_mutex_unlock(&registry->mu);
+}
+
+static int test_agent_count_substring(const char *text, const char *needle) {
+    int count = 0;
+    size_t len = strlen(needle);
+    for (const char *p = text; p && (p = strstr(p, needle)); p += len) count++;
+    return count;
+}
+
+static void test_agent_skills(void) {
+    char root_tmpl[] = "/tmp/ds4_agent_skills_XXXXXX";
+    char outside_tmpl[] = "/tmp/ds4_agent_skills_outside_XXXXXX";
+    char *root_tmp = mkdtemp(root_tmpl);
+    char *outside_tmp = mkdtemp(outside_tmpl);
+    AGENT_TEST_ASSERT(root_tmp != NULL);
+    AGENT_TEST_ASSERT(outside_tmp != NULL);
+    if (!root_tmp || !outside_tmp) return;
+
+    char root[PATH_MAX], outside[PATH_MAX];
+    AGENT_TEST_ASSERT(realpath(root_tmp, root) != NULL);
+    AGENT_TEST_ASSERT(realpath(outside_tmp, outside) != NULL);
+    agent_config cfg = {0};
+    agent_worker a = {.cfg = &cfg};
+    agent_worker b = {.cfg = &cfg};
+    a.skill_registry = agent_skill_registry_create();
+    b.skill_registry = a.skill_registry;
+    agent_skill_registry_acquire(b.skill_registry);
+    agent_path_list_append(&a.working_directories, root);
+    agent_path_list_append(&b.working_directories, root);
+
+    char valid[PATH_MAX];
+    snprintf(valid, sizeof(valid), "%s/review.md", root);
+    const char valid_text[] =
+        "---\nname: review\ndescription: Review changes \"carefully\"\n---\nBody\n";
+    test_agent_skill_write(valid, valid_text, strlen(valid_text));
+    char name[AGENT_SKILL_NAME_MAX], desc[AGENT_SKILL_DESC_MAX];
+    AGENT_TEST_ASSERT(agent_skill_parse_file(valid, name, sizeof(name),
+                                             desc, sizeof(desc)) == 0);
+    AGENT_TEST_ASSERT(!strcmp(name, "review"));
+    AGENT_TEST_ASSERT(strstr(desc, "carefully") != NULL);
+    AGENT_TEST_ASSERT(agent_skill_register(&a, valid) == 0);
+    AGENT_TEST_ASSERT(agent_skill_register(&a, valid) == AGENT_SKILL_ERR_DUPLICATE);
+
+    agent_worker c = {.cfg = &cfg, .skill_registry = a.skill_registry};
+    agent_skill_registry_acquire(c.skill_registry);
+    agent_path_list_append(&c.working_directories, root);
+
+    char *prompt_before = agent_build_skills_prompt(&b);
+    AGENT_TEST_ASSERT(strstr(prompt_before, "**review**") != NULL);
+    AGENT_TEST_ASSERT(strstr(prompt_before, "When the user includes") != NULL);
+    char *new_session_prompt = agent_build_skills_prompt(&c);
+    AGENT_TEST_ASSERT(strstr(new_session_prompt, "**review**") != NULL);
+    free(new_session_prompt);
+
+    char *expanded = agent_expand_skill_references(
+        &b, "Use @review then @unknown and \\@review; finish");
+    char expected_link[PATH_MAX + 64];
+    snprintf(expected_link, sizeof(expected_link), "[skill:review](%s)", valid);
+    AGENT_TEST_ASSERT(strstr(expanded, expected_link) != NULL);
+    AGENT_TEST_ASSERT(strstr(expanded, "@unknown") != NULL);
+    AGENT_TEST_ASSERT(strstr(expanded, "and @review; finish") != NULL);
+    free(expanded);
+
+    char long_path[AGENT_SKILL_PATH_MAX];
+    memset(long_path, 'p', sizeof(long_path) - 1);
+    long_path[0] = '/';
+    long_path[sizeof(long_path) - 1] = '\0';
+    test_agent_skill_add_direct(a.skill_registry, "x", "long", long_path);
+    expanded = agent_expand_skill_references(&a, "@x trailing text");
+    AGENT_TEST_ASSERT(strlen(expanded) > strlen(long_path));
+    AGENT_TEST_ASSERT(strstr(expanded, " trailing text") != NULL);
+    free(expanded);
+
+    agent_tool_call list_call = {.name = "skill_list"};
+    char *json = agent_tool_skill_list(&a, &list_call);
+    AGENT_TEST_ASSERT(strstr(json, "\\\"carefully\\\"") != NULL);
+    AGENT_TEST_ASSERT(strstr(json, "\"total_count\": 2") != NULL);
+    free(json);
+    agent_tool_arg query_arg = {.name = "query", .value = "REV", .is_string = true};
+    list_call.args = &query_arg;
+    list_call.argc = 1;
+    json = agent_tool_skill_list(&a, &list_call);
+    AGENT_TEST_ASSERT(strstr(json, "\"total_count\": 1") != NULL);
+    AGENT_TEST_ASSERT(strstr(json, "\"name\": \"review\"") != NULL);
+    free(json);
+
+    test_agent_skill_add_direct(a.skill_registry, "escaped",
+                                "line\ncolumn\tcontrol\x01", "/tmp/a\\b");
+    for (int i = 0; i < 11; i++) {
+        char bulk_name[32];
+        snprintf(bulk_name, sizeof(bulk_name), "bulk-%02d", i);
+        test_agent_skill_add_direct(a.skill_registry, bulk_name, "bulk", "/tmp/bulk");
+    }
+    list_call.args = NULL;
+    list_call.argc = 0;
+    json = agent_tool_skill_list(&a, &list_call);
+    AGENT_TEST_ASSERT(strstr(json, "\"total_count\": 14") != NULL);
+    AGENT_TEST_ASSERT(strstr(json, "\"has_more\": true") != NULL);
+    AGENT_TEST_ASSERT(test_agent_count_substring(json, "\"name\":") == 10);
+    free(json);
+    query_arg.value = "escaped";
+    list_call.args = &query_arg;
+    list_call.argc = 1;
+    json = agent_tool_skill_list(&a, &list_call);
+    AGENT_TEST_ASSERT(strstr(json, "line\\ncolumn\\tcontrol\\u0001") != NULL);
+    AGENT_TEST_ASSERT(strstr(json, "/tmp/a\\\\b") != NULL);
+    free(json);
+
+    ds4_agent_tool_policy none;
+    ds4_agent_tool_policy_parse("none", &none);
+    char *tools = agent_build_filtered_tools_prompt(&none);
+    AGENT_TEST_ASSERT(strstr(tools, "Available tools: ask_question, skill_list") != NULL);
+    AGENT_TEST_ASSERT(test_agent_count_substring(tools, "\"name\": \"skill_list\"") == 1);
+    free(tools);
+    AGENT_TEST_ASSERT(agent_slash_command_known("/skills add foo"));
+    AGENT_TEST_ASSERT(agent_slash_command_known("/skills list"));
+    AGENT_TEST_ASSERT(agent_slash_command_known("/skills del foo"));
+
+    char missing_desc[PATH_MAX];
+    snprintf(missing_desc, sizeof(missing_desc), "%s/missing.md", root);
+    const char missing_text[] = "---\nname: missing\n---\n";
+    test_agent_skill_write(missing_desc, missing_text, strlen(missing_text));
+    AGENT_TEST_ASSERT(agent_skill_parse_file(missing_desc, name, sizeof(name),
+                                             desc, sizeof(desc)) == AGENT_SKILL_ERR_FRONTMATTER);
+
+    char invalid_name[PATH_MAX];
+    snprintf(invalid_name, sizeof(invalid_name), "%s/invalid-name.md", root);
+    const char invalid_name_text[] =
+        "---\nname: bad name\ndescription: invalid\n---\n";
+    test_agent_skill_write(invalid_name, invalid_name_text, strlen(invalid_name_text));
+    AGENT_TEST_ASSERT(agent_skill_parse_file(invalid_name, name, sizeof(name),
+                                             desc, sizeof(desc)) == AGENT_SKILL_ERR_NAME);
+
+    char invalid_utf8[PATH_MAX];
+    snprintf(invalid_utf8, sizeof(invalid_utf8), "%s/utf8.md", root);
+    const unsigned char invalid_utf8_text[] =
+        "---\nname: utf8\ndescription: \xc0\xaf\n---\n";
+    test_agent_skill_write(invalid_utf8, invalid_utf8_text,
+                           sizeof(invalid_utf8_text) - 1);
+    AGENT_TEST_ASSERT(agent_skill_parse_file(invalid_utf8, name, sizeof(name),
+                                             desc, sizeof(desc)) == AGENT_SKILL_ERR_UTF8);
+    const unsigned char valid_emoji[] = {0xf0, 0x9f, 0x98, 0x80};
+    const unsigned char surrogate[] = {0xed, 0xa0, 0x80};
+    const unsigned char above_unicode[] = {0xf4, 0x90, 0x80, 0x80};
+    AGENT_TEST_ASSERT(agent_utf8_valid(valid_emoji, sizeof(valid_emoji)));
+    AGENT_TEST_ASSERT(!agent_utf8_valid(surrogate, sizeof(surrogate)));
+    AGENT_TEST_ASSERT(!agent_utf8_valid(above_unicode, sizeof(above_unicode)));
+
+    char overlong[PATH_MAX];
+    snprintf(overlong, sizeof(overlong), "%s/overlong.md", root);
+    char overlong_text[700];
+    memset(overlong_text, 'a', sizeof(overlong_text));
+    memcpy(overlong_text, "---\nname: ", 10);
+    overlong_text[sizeof(overlong_text) - 1] = '\n';
+    test_agent_skill_write(overlong, overlong_text, sizeof(overlong_text));
+    AGENT_TEST_ASSERT(agent_skill_parse_file(overlong, name, sizeof(name),
+                                             desc, sizeof(desc)) == AGENT_SKILL_ERR_LINE_TOO_LONG);
+
+    char too_many_lines[PATH_MAX];
+    snprintf(too_many_lines, sizeof(too_many_lines), "%s/lines.md", root);
+    agent_buf many = {0};
+    agent_buf_puts(&many, "---\nname: lines\ndescription: lines\n");
+    for (int i = 0; i < 18; i++) agent_buf_puts(&many, "extra: value\n");
+    agent_buf_puts(&many, "---\n");
+    char *many_text = agent_buf_take(&many);
+    test_agent_skill_write(too_many_lines, many_text, strlen(many_text));
+    free(many_text);
+    AGENT_TEST_ASSERT(agent_skill_parse_file(too_many_lines, name, sizeof(name),
+                                             desc, sizeof(desc)) == AGENT_SKILL_ERR_FRONTMATTER);
+
+    char symlink_path[PATH_MAX];
+    snprintf(symlink_path, sizeof(symlink_path), "%s/loop", root);
+    AGENT_TEST_ASSERT(symlink(root, symlink_path) == 0);
+    int warning_pipe[2];
+    AGENT_TEST_ASSERT(pipe(warning_pipe) == 0);
+    int saved_stderr = dup(STDERR_FILENO);
+    AGENT_TEST_ASSERT(saved_stderr >= 0);
+    fflush(stderr);
+    AGENT_TEST_ASSERT(dup2(warning_pipe[1], STDERR_FILENO) >= 0);
+    close(warning_pipe[1]);
+    AGENT_TEST_ASSERT(agent_skill_register_dir(&a, root) == 0);
+    fflush(stderr);
+    AGENT_TEST_ASSERT(dup2(saved_stderr, STDERR_FILENO) >= 0);
+    close(saved_stderr);
+    char warnings[8192];
+    ssize_t warning_len = read(warning_pipe[0], warnings, sizeof(warnings) - 1);
+    close(warning_pipe[0]);
+    AGENT_TEST_ASSERT(warning_len > 0);
+    if (warning_len > 0) {
+        warnings[warning_len] = '\0';
+        AGENT_TEST_ASSERT(strstr(warnings, missing_desc) != NULL);
+        AGENT_TEST_ASSERT(strstr(warnings, "invalid or incomplete frontmatter") != NULL);
+        AGENT_TEST_ASSERT(strstr(warnings, "skipping symlink") != NULL);
+    }
+
+    char outside_file[PATH_MAX];
+    snprintf(outside_file, sizeof(outside_file), "%s/outside.md", outside);
+    const char outside_text[] =
+        "---\nname: outside\ndescription: Outside\n---\n";
+    test_agent_skill_write(outside_file, outside_text, strlen(outside_text));
+    AGENT_TEST_ASSERT(agent_skill_register(&a, outside_file) == AGENT_SKILL_ERR_WORKSPACE);
+
+    agent_skill_delete(&a, "review");
+    char *prompt_after = agent_build_skills_prompt(&b);
+    AGENT_TEST_ASSERT(strstr(prompt_before, "**review**") != NULL);
+    AGENT_TEST_ASSERT(strstr(prompt_after, "**review**") == NULL);
+    free(prompt_before);
+    free(prompt_after);
+    agent_skill_delete(&a, "x");
+    agent_skill_delete(&a, "escaped");
+    for (int i = 0; i < 11; i++) {
+        char bulk_name[32];
+        snprintf(bulk_name, sizeof(bulk_name), "bulk-%02d", i);
+        agent_skill_delete(&a, bulk_name);
+    }
+    char *empty_prompt = agent_build_skills_prompt(&a);
+    AGENT_TEST_ASSERT(empty_prompt[0] == '\0');
+    free(empty_prompt);
+    json = agent_tool_skill_list(&a, &(agent_tool_call){.name = "skill_list"});
+    AGENT_TEST_ASSERT(strstr(json, "\"skills\": [\n\n  ]") != NULL);
+    AGENT_TEST_ASSERT(strstr(json, "\"total_count\": 0") != NULL);
+    free(json);
+
+    agent_config startup_cfg = {0};
+    agent_worker startup = {.cfg = &startup_cfg};
+    startup.skill_registry = agent_skill_registry_create();
+    agent_path_list_append(&startup_cfg.skill_dirs, outside);
+    AGENT_TEST_ASSERT(agent_skills_init(&startup) == 1);
+    AGENT_TEST_ASSERT(agent_path_list_contains(&startup.working_directories, outside));
+    AGENT_TEST_ASSERT(agent_path_list_contains(&startup_cfg.working_directories, outside));
+    agent_path_list_free(&startup_cfg.skill_dirs);
+    agent_path_list_free(&startup_cfg.working_directories);
+    agent_path_list_free(&startup.working_directories);
+    agent_skill_registry_release(startup.skill_registry);
+
+    unlink(symlink_path);
+    unlink(valid);
+    unlink(missing_desc);
+    unlink(invalid_name);
+    unlink(invalid_utf8);
+    unlink(overlong);
+    unlink(too_many_lines);
+    unlink(outside_file);
+    agent_path_list_free(&a.working_directories);
+    agent_path_list_free(&b.working_directories);
+    agent_path_list_free(&c.working_directories);
+    agent_skill_registry_release(c.skill_registry);
+    agent_skill_registry_release(b.skill_registry);
+    agent_skill_registry_release(a.skill_registry);
+    rmdir(root);
+    rmdir(outside);
+}
+
 static void test_agent_worker_model_gate_serializes(void);
 
 static void ds4_agent_unit_tests_run(void) {
@@ -11805,6 +12607,7 @@ static void ds4_agent_unit_tests_run(void) {
     test_agent_ask_question_stream_preview();
     test_agent_ask_question_interactive_flow();
     test_agent_ask_question_prompt_options();
+    test_agent_skills();
     ds4_agent_subagent_unit_tests_run();
     test_agent_worker_model_gate_serializes();
 }
@@ -13855,19 +14658,120 @@ static char *agent_tool_ask_question(agent_worker *w,
     return result;
 }
 
+/* --- skill_list tool handler --- */
+static void agent_json_escape(agent_buf *out, const char *text) {
+    static const char hex[] = "0123456789abcdef";
+    if (!out || !text) return;
+    for (const unsigned char *p = (const unsigned char *)text; *p; p++) {
+        switch (*p) {
+        case '"': agent_buf_puts(out, "\\\""); break;
+        case '\\': agent_buf_puts(out, "\\\\"); break;
+        case '\b': agent_buf_puts(out, "\\b"); break;
+        case '\f': agent_buf_puts(out, "\\f"); break;
+        case '\n': agent_buf_puts(out, "\\n"); break;
+        case '\r': agent_buf_puts(out, "\\r"); break;
+        case '\t': agent_buf_puts(out, "\\t"); break;
+        default:
+            if (*p < 0x20) {
+                char escaped[] = "\\u0000";
+                escaped[4] = hex[*p >> 4];
+                escaped[5] = hex[*p & 0x0f];
+                agent_buf_append_full(out, escaped, 6);
+            } else {
+                agent_buf_append_full(out, (const char *)p, 1);
+            }
+            break;
+        }
+    }
+}
+
+static char *agent_tool_skill_list(agent_worker *w,
+                                   const agent_tool_call *call) {
+    agent_buf result = {0};
+    const char *query = agent_tool_arg_value(call, "query");
+
+    /* Collect matching skills, up to 10 */
+    struct { char name[AGENT_SKILL_NAME_MAX]; char desc[AGENT_SKILL_DESC_MAX]; char path[AGENT_SKILL_PATH_MAX]; } matches[10];
+    int nmatches = 0;
+    int total = 0;
+
+    agent_skill_registry *registry = w->skill_registry;
+    if (!registry) return xstrdup("{\"skills\":[],\"total_count\":0,\"has_more\":false}\n");
+    pthread_mutex_lock(&registry->mu);
+    for (agent_skill *s = registry->head; s; s = s->next) {
+        bool match = true;
+        if (query && query[0]) {
+            /* Case-insensitive substring match on name */
+            match = false;
+            const char *sname = s->name;
+            for (const char *sp = sname; *sp; sp++) {
+                const char *p = sp;
+                const char *q = query;
+                while (*p && *q) {
+                    char pc = *p >= 'A' && *p <= 'Z' ? *p + 32 : *p;
+                    char qc = *q >= 'A' && *q <= 'Z' ? *q + 32 : *q;
+                    if (pc == qc) { p++; q++; }
+                    else break;
+                }
+                if (!*q) { match = true; break; }
+            }
+        }
+        if (match) {
+            total++;
+            if (nmatches < 10) {
+                strncpy(matches[nmatches].name, s->name, sizeof(matches[nmatches].name) - 1);
+                matches[nmatches].name[sizeof(matches[nmatches].name) - 1] = '\0';
+                strncpy(matches[nmatches].desc, s->description, sizeof(matches[nmatches].desc) - 1);
+                matches[nmatches].desc[sizeof(matches[nmatches].desc) - 1] = '\0';
+                strncpy(matches[nmatches].path, s->path, sizeof(matches[nmatches].path) - 1);
+                matches[nmatches].path[sizeof(matches[nmatches].path) - 1] = '\0';
+                nmatches++;
+            }
+        }
+    }
+    pthread_mutex_unlock(&registry->mu);
+
+    /* Build JSON response */
+    agent_buf_puts(&result, "{\n");
+    agent_buf_puts(&result, "  \"skills\": [\n");
+    for (int i = 0; i < nmatches; i++) {
+        if (i > 0) agent_buf_puts(&result, ",\n");
+        agent_buf_puts(&result, "    {\n");
+        agent_buf_puts(&result, "      \"name\": \"");
+        agent_json_escape(&result, matches[i].name);
+        agent_buf_puts(&result, "\",\n");
+        agent_buf_puts(&result, "      \"description\": \"");
+        agent_json_escape(&result, matches[i].desc);
+        agent_buf_puts(&result, "\",\n");
+        agent_buf_puts(&result, "      \"path\": \"");
+        agent_json_escape(&result, matches[i].path);
+        agent_buf_puts(&result, "\"\n");
+        agent_buf_puts(&result, "    }");
+    }
+    agent_buf_puts(&result, "\n  ],\n");
+    agent_buf_puts(&result, "  \"total_count\": ");
+    char cnt[32];
+    snprintf(cnt, sizeof(cnt), "%d", total);
+    agent_buf_puts(&result, cnt);
+    agent_buf_puts(&result, ",\n");
+    agent_buf_puts(&result, "  \"has_more\": ");
+    agent_buf_puts(&result, nmatches < total ? "true" : "false");
+    agent_buf_puts(&result, "\n}\n");
+    return agent_buf_take(&result);
+}
+
 /* ============================================================================
  * Tool Dispatch
  * ============================================================================
  */
 
-/* Execute one parsed DSML tool call and return the text that will be appended as
- * the tool-role result.  UI visualization already happened while streaming; this
- * function is only about side effects and the model-visible observation. */
 static char *agent_execute_tool_call(agent_worker *w, const agent_tool_call *call) {
     agent_buf result = {0};
     if (!call->name) return xstrdup("Tool error: missing tool name\n");
-    if (agent_tool_is_policy_exempt(call->name))
+    if (!strcmp(call->name, "ask_question"))
         return agent_tool_ask_question(w, call);
+    if (!strcmp(call->name, "skill_list"))
+        return agent_tool_skill_list(w, call);
     if (agent_tool_index_for_name(call->name) < 0) {
         char header[256];
         snprintf(header, sizeof(header), "\n[tool:%s] unknown tool\n", call->name);
@@ -14379,6 +15283,64 @@ static void worker_set_greedy_sampling(agent_worker *w, bool greedy) {
     pthread_mutex_unlock(&w->mu);
 }
 
+static bool agent_skill_name_char(char c) {
+    return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
+           (c >= '0' && c <= '9') || c == '_' || c == '-';
+}
+
+static char *agent_expand_skill_references(agent_worker *w, const char *text) {
+    if (!text) return xstrdup("");
+    if (!w || !w->skill_registry) return xstrdup(text);
+
+    agent_buf out = {0};
+    agent_skill_registry *registry = w->skill_registry;
+    pthread_mutex_lock(&registry->mu);
+    const char *cursor = text;
+    while (*cursor) {
+        if (cursor[0] == '\\' && cursor[1] == '@') {
+            agent_buf_append_full(&out, "@", 1);
+            cursor += 2;
+            continue;
+        }
+        if (*cursor != '@') {
+            agent_buf_append_full(&out, cursor++, 1);
+            continue;
+        }
+
+        const char *name = cursor + 1;
+        const char *end = name;
+        while (*end && agent_skill_name_char(*end)) end++;
+        size_t name_len = (size_t)(end - name);
+        const agent_skill *best = NULL;
+        size_t best_len = 0;
+        for (size_t try_len = name_len; try_len > 0 && !best; try_len--) {
+            for (const agent_skill *skill = registry->head;
+                 skill; skill = skill->next) {
+                if (strlen(skill->name) == try_len &&
+                    memcmp(skill->name, name, try_len) == 0) {
+                    best = skill;
+                    best_len = try_len;
+                    break;
+                }
+            }
+        }
+        if (!best) {
+            agent_buf_append_full(&out, cursor, 1 + name_len);
+            cursor = end;
+            continue;
+        }
+
+        agent_buf_puts(&out, "[skill:");
+        agent_buf_puts(&out, best->name);
+        agent_buf_puts(&out, "](");
+        agent_buf_puts(&out, best->path);
+        agent_buf_puts(&out, ")");
+        cursor = name + best_len;
+    }
+    pthread_mutex_unlock(&registry->mu);
+    return agent_buf_take(&out);
+}
+
 /* Run one user turn until the assistant stops or returns a tool call.  Tool
  * results are appended to the transcript and the loop continues, which gives
  * the model native DSML tool iteration without a client/server protocol. */
@@ -14406,6 +15368,7 @@ static int worker_run_turn(agent_worker *w, const char *user_text) {
         agent_set_error(w, compact_err[0] ? compact_err : "context compaction failed");
         return 1;
     }
+    agent_worker_sync_skills_prompt(w);
     agent_worker_maybe_append_datetime_context(w);
     agent_trace_text(w, "user", user_text ? user_text : "",
                      user_text ? strlen(user_text) : 0);
@@ -14415,7 +15378,10 @@ static int worker_run_turn(agent_worker *w, const char *user_text) {
         agent_session_identity_sha(w->session_title, w->session_created_at,
                                    w->session_sha);
     }
+    char *replaced = agent_expand_skill_references(w, user_text);
+    user_text = replaced;
     ds4_chat_append_message(w->engine, &w->transcript, "user", user_text);
+    free(replaced);
 
     uint64_t rng = cfg->gen.seed ? cfg->gen.seed :
         ((uint64_t)time(NULL) ^ ((uint64_t)getpid() << 32) ^ (uint64_t)clock());
@@ -18006,6 +18972,15 @@ int agent_worker_init(agent_worker *w, ds4_engine *engine, agent_config *cfg) {
     w->docker_shell.stdin_fd = -1;
     w->docker_shell.stdout_fd = -1;
     pthread_mutex_init(&w->docker_shell.mu, NULL);
+    bool created_skill_registry = false;
+    if (cfg->skill_registry) {
+        w->skill_registry = cfg->skill_registry;
+        agent_skill_registry_acquire(w->skill_registry);
+    } else {
+        w->skill_registry = agent_skill_registry_create();
+        cfg->skill_registry = w->skill_registry;
+        created_skill_registry = true;
+    }
     w->status.state = AGENT_WORKER_IDLE;
     w->status.think_mode = cfg->gen.think_mode;
     bool tools_explicit = cfg->default_tools[0];
@@ -18015,6 +18990,11 @@ int agent_worker_init(agent_worker *w, ds4_engine *engine, agent_config *cfg) {
         ds4_agent_tool_policy_parse("all", &w->tool_policy);
     for (int i = 0; i < cfg->working_directories.len; i++)
         agent_path_list_append(&w->working_directories, cfg->working_directories.v[i]);
+    /* Startup directories populate the shared registry exactly once. */
+    if (created_skill_registry) agent_skills_init(w);
+    pthread_mutex_lock(&w->skill_registry->mu);
+    w->skills_prompt_generation = w->skill_registry->generation;
+    pthread_mutex_unlock(&w->skill_registry->mu);
     if (pipe(w->wake_fd) != 0) return -1;
     int old_flags;
     set_nonblock(w->wake_fd[0], true, &old_flags);
@@ -18079,6 +19059,8 @@ void agent_worker_free(agent_worker *w) {
     free(w->queued_user_drain_text);
     free(w->question_answer);
     agent_path_list_free(&w->working_directories);
+    agent_skill_registry_release(w->skill_registry);
+    w->skill_registry = NULL;
     agent_temp_files_cleanup_now(w);
     agent_temp_files_free(&w->temp_files);
     agent_path_list_free(&w->auto_allowed_paths);
@@ -19260,7 +20242,7 @@ static int run_agent(ds4_engine *engine, agent_config *cfg) {
                                                              summary, sizeof(summary));
                                 printf("tool-access policy updated: %s\n", summary);
                                 char *reminder =
-                                    agent_build_system_prompt_reminder(&worker.tool_policy);
+                                    agent_build_system_prompt_reminder(&worker);
                                 agent_publish_system_status(
                                     &worker,
                                     "Tool policy changed; re-injecting system prompt...");
@@ -19272,7 +20254,7 @@ static int run_agent(ds4_engine *engine, agent_config *cfg) {
                         }
                     }
                 } else if (!strncmp(cmd, "/disallow", 9) &&
-                           (cmd[9] == '\0' || cmd[9] == ' ' || cmd[9] == '\t')) {
+                            (cmd[9] == '\0' || cmd[9] == ' ' || cmd[9] == '\t')) {
                     if (busy) {
                         printf("command requires the model to be idle: %s\n", cmd);
                     } else {
@@ -19291,7 +20273,7 @@ static int run_agent(ds4_engine *engine, agent_config *cfg) {
                                                              summary, sizeof(summary));
                                 printf("tool-access policy updated: %s\n", summary);
                                 char *reminder =
-                                    agent_build_system_prompt_reminder(&worker.tool_policy);
+                                    agent_build_system_prompt_reminder(&worker);
                                 agent_publish_system_status(
                                     &worker,
                                     "Tool policy changed; re-injecting system prompt...");
@@ -19302,6 +20284,135 @@ static int run_agent(ds4_engine *engine, agent_config *cfg) {
                             }
                         }
                     }
+                } else if (agent_slash_command_with_args(cmd, "/skills")) {
+                    /* Parse subcommand */
+                    char *arg = cmd + 8;
+                    while (*arg == ' ' || *arg == '\t') arg++;
+                    if (!arg[0]) {
+                        if (busy) printf("command requires the model to be idle: %s\n", cmd);
+                        else printf("usage: /skills add <path>, /skills list, /skills del <name>\n");
+                    } else if (!strncmp(arg, "add ", 4) || !strncmp(arg, "add\t", 4)) {
+                        if (busy) {
+                            printf("command requires the model to be idle: %s\n", cmd);
+                        } else {
+                            const char *path = arg + 4;
+                            while (*path == ' ' || *path == '\t') path++;
+                            if (!path[0]) {
+                                printf("usage: /skills add <path>\n");
+                            } else {
+                                /* Resolve relative path */
+                                char abs_path[PATH_MAX];
+                                if (path[0] != '/') {
+                                    char cwd[PATH_MAX];
+                                    if (getcwd(cwd, sizeof(cwd))) {
+                                        int n = snprintf(abs_path, sizeof(abs_path),
+                                                         "%s/%s", cwd, path);
+                                        if (n < 0 || (size_t)n >= sizeof(abs_path)) {
+                                            printf("error: skill path too long\n");
+                                            goto skills_done;
+                                        }
+                                    } else {
+                                        printf("error: failed to get cwd\n");
+                                        goto skills_done;
+                                    }
+                                } else {
+                                    int n = snprintf(abs_path, sizeof(abs_path), "%s", path);
+                                    if (n < 0 || (size_t)n >= sizeof(abs_path)) {
+                                        printf("error: skill path too long\n");
+                                        goto skills_done;
+                                    }
+                                }
+                                char resolved_path[PATH_MAX];
+                                if (!realpath(abs_path, resolved_path)) {
+                                    printf("error: path not found: %s\n", abs_path);
+                                    goto skills_done;
+                                }
+                                struct stat st;
+                                if (stat(resolved_path, &st) != 0) {
+                                    printf("error: path not found: %s\n", resolved_path);
+                                    goto skills_done;
+                                }
+                                if (!agent_skill_path_allowed(&worker, resolved_path)) {
+                                    printf("error: path outside allowed workspace dirs\n");
+                                    goto skills_done;
+                                }
+                                int count = 0;
+                                if (S_ISDIR(st.st_mode)) {
+                                    count = agent_skill_register_dir(&worker, resolved_path);
+                                } else {
+                                    int ret = agent_skill_register(&worker, resolved_path);
+                                    if (ret == 0) count = 1;
+                                    else if (ret == -6) printf("error: duplicate skill name\n");
+                                    else if (ret == -5) printf("error: path outside allowed workspace dirs\n");
+                                    else if (ret == -4) printf("error: invalid skill name\n");
+                                    else if (ret == -3) printf("error: non-UTF-8 content\n");
+                                    else if (ret == -2) printf("error: no valid frontmatter\n");
+                                    else printf("error: failed to register skill (code %d)\n", ret);
+                                }
+                                if (count > 0) {
+                                    printf("registered %d skill(s)\n", count);
+                                    char *reminder = agent_build_system_prompt_reminder(
+                                        &worker);
+                                    agent_publish_system_status(&worker,
+                                        "Skills changed; re-injecting system prompt...");
+                                    ds4_tokenize_rendered_chat(worker.engine, reminder,
+                                                               &worker.transcript);
+                                    free(reminder);
+                                    agent_worker_note_system_prompt_seen(&worker);
+                                    agent_worker_note_skills_prompt_seen(&worker);
+                                }
+                            }
+                        }
+                    } else if (!strcmp(arg, "list")) {
+                        if (busy) {
+                            printf("command requires the model to be idle: %s\n", cmd);
+                        } else {
+                            printf("Registered skills:\n");
+                            agent_skill_registry *registry = worker.skill_registry;
+                            pthread_mutex_lock(&registry->mu);
+                            for (agent_skill *s = registry->head; s; s = s->next)
+                                printf("  @%s\n    - %s\n    - path:%s)\n", s->name, s->description, s->path);
+                            if (!registry->head) printf("  (none)\n");
+                            pthread_mutex_unlock(&registry->mu);
+                        }
+                    } else if (!strncmp(arg, "del ", 4) || !strncmp(arg, "del\t", 4)) {
+                        if (busy) {
+                            printf("command requires the model to be idle: %s\n", cmd);
+                        } else {
+                            const char *name = arg + 4;
+                            while (*name == ' ' || *name == '\t') name++;
+                            if (!name[0]) {
+                                printf("usage: /skills del <name>\n");
+                            } else {
+                                agent_skill_registry *registry = worker.skill_registry;
+                                pthread_mutex_lock(&registry->mu);
+                                bool found = false;
+                                for (agent_skill *s = registry->head; s; s = s->next) {
+                                    if (strcmp(s->name, name) == 0) { found = true; break; }
+                                }
+                                pthread_mutex_unlock(&registry->mu);
+                                if (!found) {
+                                    printf("error: skill not found: %s\n", name);
+                                } else {
+                                    agent_skill_delete(&worker, name);
+                                    printf("deleted skill: %s\n", name);
+                                    char *reminder = agent_build_system_prompt_reminder(
+                                        &worker);
+                                    agent_publish_system_status(&worker,
+                                        "Skills changed; re-injecting system prompt...");
+                                    ds4_tokenize_rendered_chat(worker.engine, reminder,
+                                                               &worker.transcript);
+                                    free(reminder);
+                                    agent_worker_note_system_prompt_seen(&worker);
+                                    agent_worker_note_skills_prompt_seen(&worker);
+                                }
+                            }
+                        }
+                    } else {
+                        if (busy) printf("command requires the model to be idle: %s\n", cmd);
+                        else printf("unknown /skills subcommand: %s\n", arg);
+                    }
+skills_done: ;
                 } else if (ds4_agent_subagents_handle_command(subagents, cmd, busy)) {
                     worker_ptr = ds4_agent_subagents_active_worker(subagents);
                     queue_ptr = ds4_agent_subagents_active_queue(subagents);

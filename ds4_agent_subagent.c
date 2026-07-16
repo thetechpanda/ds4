@@ -305,6 +305,9 @@ static void ds4_agent_subagent_config_copy(agent_config *dst,
     dst->working_directories.v = NULL;
     dst->working_directories.len = 0;
     dst->working_directories.cap = 0;
+    dst->skill_dirs.v = NULL;
+    dst->skill_dirs.len = 0;
+    dst->skill_dirs.cap = 0;
     if (src) {
         for (int i = 0; i < src->working_directory_args.len; i++)
             agent_path_list_append(&dst->working_directory_args,
@@ -312,6 +315,8 @@ static void ds4_agent_subagent_config_copy(agent_config *dst,
         for (int i = 0; i < src->working_directories.len; i++)
             agent_path_list_append(&dst->working_directories,
                                    src->working_directories.v[i]);
+        for (int i = 0; i < src->skill_dirs.len; i++)
+            agent_path_list_append(&dst->skill_dirs, src->skill_dirs.v[i]);
     }
 }
 
@@ -319,6 +324,7 @@ static void ds4_agent_subagent_config_free(agent_config *cfg) {
     if (!cfg) return;
     agent_path_list_free(&cfg->working_directory_args);
     agent_path_list_free(&cfg->working_directories);
+    agent_path_list_free(&cfg->skill_dirs);
     memset(cfg, 0, sizeof(*cfg));
 }
 

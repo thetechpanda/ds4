@@ -287,6 +287,7 @@ static void print_agent_specific(FILE *fp, const help_colors *c) {
     opt(fp, c, "--no-docker-auto", "Disables automatic selection of the first tagged Docker sandbox at startup if --docker-container is not defined.");
     opt(fp, c, "--docker-container NAME", "Run bash tools in an existing Docker container.");
     opt(fp, c, "--workspace DIR", "Add a jailed workspace root. Repeatable; defaults to the launch directory.");
+    opt(fp, c, "--skill-dir DIR", "Add a directory of skill .md files. Repeatable; files are scanned at startup.");
     opt(fp, c, "--temp-directory DIR", "Temporary file directory (default: /tmp).");
     opt(fp, c, "--web-cdp-host HOST", "Use an existing Chrome DevTools Protocol host instead of starting Chrome.");
     opt(fp, c, "--web-cdp-port N", "Use an existing Chrome DevTools Protocol port instead of starting Chrome.");
@@ -308,6 +309,9 @@ static void print_agent_sessions(FILE *fp, const help_colors *c) {
     opt(fp, c, "/docker create IMAGE NAME COMMAND", "Create and switch to a tagged Docker sandbox.");
     opt(fp, c, "/docker list", "List Docker containers tagged ds4:sandbox.");
     opt(fp, c, "/workspace [+-DIR]", "List workspace roots; +DIR adds, -DIR removes. The first root is active.");
+    opt(fp, c, "/skills add <path>", "Register a skill file or directory at runtime.");
+    opt(fp, c, "/skills list", "List all registered skills with name, description, and path.");
+    opt(fp, c, "/skills del <name>", "Remove a registered skill by name.");
     opt(fp, c, "/new", "Start a fresh session from the system prompt.");
     opt(fp, c, "/quit, /exit", "Exit.");
     fputc('\n', fp);

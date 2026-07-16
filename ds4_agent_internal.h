@@ -19,6 +19,25 @@
 #define AGENT_ASK_QUESTION_MAX_CHOICES 16
 #define AGENT_ASK_QUESTION_ANSWER_MAX 4096
 
+#define AGENT_SKILL_NAME_MAX 256
+#define AGENT_SKILL_DESC_MAX 1024
+#define AGENT_SKILL_PATH_MAX PATH_MAX
+
+typedef struct agent_skill {
+    char name[AGENT_SKILL_NAME_MAX];
+    char description[AGENT_SKILL_DESC_MAX];
+    char path[AGENT_SKILL_PATH_MAX];
+    struct agent_skill *next;
+} agent_skill;
+
+typedef struct agent_skill_registry {
+    pthread_mutex_t mu;
+    agent_skill *head;
+    int count;
+    unsigned refs;
+    uint64_t generation;
+} agent_skill_registry;
+
 typedef struct agent_worker agent_worker;
 
 /* Agent tool list */
@@ -35,6 +54,7 @@ typedef enum {
     AGENT_TOOL_BASH_STATUS,
     AGENT_TOOL_BASH_STOP,
     AGENT_TOOL_MKDIR,
+    AGENT_TOOL_SKILL_LIST,
     AGENT_TOOL_COUNT
 } agent_tool_registry;
 
@@ -123,6 +143,8 @@ typedef struct {
     char launch_working_directory[PATH_MAX];
     agent_path_list working_directory_args;
     agent_path_list working_directories;
+    agent_path_list skill_dirs;
+    agent_skill_registry *skill_registry;
     char temp_directory[PATH_MAX];
     char web_cdp_host[256];
     int web_cdp_port;
@@ -266,6 +288,8 @@ struct agent_worker {
     int background_sessions;
     int unread_sessions;
     ds4_agent_tool_policy tool_policy;
+    agent_skill_registry *skill_registry;
+    uint64_t skills_prompt_generation;
 };
 
 typedef struct {
@@ -391,6 +415,18 @@ void ds4_agent_subagents_submit_ready(ds4_agent_subagents *mgr);
 bool ds4_agent_subagents_handle_command(ds4_agent_subagents *mgr,
                                        char *cmd,
                                        bool busy);
+
+/* --- Skill system API --- */
+int agent_skill_register(agent_worker *w, const char *path);
+int agent_skill_register_dir(agent_worker *w, const char *dir);
+int agent_skills_init(agent_worker *w);
+agent_skill *agent_skill_find(agent_worker *w, const char *name);
+void agent_skill_delete(agent_worker *w, const char *name);
+void agent_skill_list_all(agent_worker *w, void (*cb)(const agent_skill *s, void *ctx), void *ctx);
+char *agent_build_skills_prompt(agent_worker *w);
+bool agent_skill_name_valid(const char *name);
+int agent_skill_parse_file(const char *path, char *name_out, size_t name_size,
+                           char *desc_out, size_t desc_size);
 
 #ifdef DS4_AGENT_TEST
 extern int agent_test_failures;
