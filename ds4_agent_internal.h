@@ -292,6 +292,8 @@ struct agent_worker {
     uint64_t skills_prompt_generation;
 };
 
+#define DS4_AGENT_DEFAULT_MODEL_TOOL_ROUND_BUDGET (-1)
+
 typedef struct {
     char *ptr;
     size_t len;

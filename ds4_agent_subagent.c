@@ -2,6 +2,7 @@
 
 #include <errno.h>
 #include <inttypes.h>
+#include <limits.h>
 #include <poll.h>
 #include <stdarg.h>
 #include <stdio.h>
@@ -79,6 +80,17 @@ static bool ds4_agent_subagent_parse_think_mode(const char *text,
         return true;
     }
     return false;
+}
+
+static bool ds4_agent_subagent_parse_round_budget(const char *text, int *out) {
+    if (!text || !text[0] || !out) return false;
+    errno = 0;
+    char *end = NULL;
+    long value = strtol(text, &end, 10);
+    if (errno || !end || *end || value > INT_MAX) return false;
+    if (value == 0 || value < -1) return false;
+    *out = (int)value;
+    return true;
 }
 
 static void ds4_agent_subagents_set_error(ds4_agent_subagents *mgr,
@@ -351,8 +363,10 @@ int ds4_agent_subagents_create(ds4_agent_subagents **out,
     mgr->engine = engine;
     mgr->next_id = 1;
     mgr->default_ctx_size = opt ? opt->default_context_size : 0;
-    mgr->default_round_budget = opt && opt->default_round_budget > 0 ?
-        opt->default_round_budget : 16;
+    mgr->default_round_budget = opt &&
+        (opt->default_round_budget > 0 || opt->default_round_budget == -1) ?
+        opt->default_round_budget :
+        DS4_AGENT_DEFAULT_MODEL_TOOL_ROUND_BUDGET;
     pthread_mutex_init(&mgr->model_gate, NULL);
     *out = mgr;
     return 0;
@@ -363,7 +377,7 @@ int ds4_agent_subagents_create_for_agent(ds4_agent_subagents **out,
                                         const agent_config *cfg) {
     ds4_agent_subagent_options opt = {
         .default_context_size = cfg ? cfg->gen.ctx_size : 0,
-        .default_round_budget = 16,
+        .default_round_budget = DS4_AGENT_DEFAULT_MODEL_TOOL_ROUND_BUDGET,
     };
     if (ds4_agent_subagents_create(out, engine, &opt) != 0) return -1;
     ds4_agent_subagent_create_request req = {
@@ -423,7 +437,6 @@ static char *ds4_agent_subagent_mission_envelope(
     const char *goal,
     ds4_agent_subagent_autonomy autonomy,
     const ds4_agent_tool_policy *tool_policy,
-    const char *write_policy,
     int budget,
     const char *stop_conditions,
     const char *report_format) {
@@ -444,12 +457,15 @@ static char *ds4_agent_subagent_mission_envelope(
     } else {
         agent_buf_puts(&b, "none");
     }
-    agent_buf_puts(&b, "\nWrite policy: ");
-    agent_buf_puts(&b, write_policy && write_policy[0] ?
-                   write_policy : "no file edits unless explicitly allowed");
     char tmp[96];
-    snprintf(tmp, sizeof(tmp), "\nBudget: stop after %d model/tool rounds.",
-             budget > 0 ? budget : 16);
+    if (budget < 0) {
+        snprintf(tmp, sizeof(tmp),
+                 "\nBudget: disabled; no model/tool round limit.");
+    } else {
+        snprintf(tmp, sizeof(tmp), "\nBudget: stop after %d model/tool rounds.",
+                 budget > 0 ? budget :
+                 DS4_AGENT_DEFAULT_MODEL_TOOL_ROUND_BUDGET);
+    }
     agent_buf_puts(&b, tmp);
     agent_buf_puts(&b, "\nStop conditions: ");
     agent_buf_puts(&b, stop_conditions && stop_conditions[0] ?
@@ -499,7 +515,8 @@ int ds4_agent_subagent_create(ds4_agent_subagents *mgr,
             slot->tool_policy.allow_none = true;
     }
     slot->autonomy = req ? req->autonomy : DS4_AGENT_SUBAGENT_AUTONOMY_TAB;
-    slot->budget_limit = req && req->round_budget > 0 ?
+    slot->budget_limit = req &&
+        (req->round_budget > 0 || req->round_budget == -1) ?
         req->round_budget : mgr->default_round_budget;
     snprintf(slot->name, sizeof(slot->name), "%s", requested);
 
@@ -537,8 +554,7 @@ int ds4_agent_subagent_create(ds4_agent_subagents *mgr,
     if (req && req->prompt && req->prompt[0]) {
         char *mission = ds4_agent_subagent_mission_envelope(
             slot->name, req->prompt, slot->autonomy, &slot->tool_policy,
-            req->write_policy, slot->budget_limit, req->stop_conditions,
-            req->report_format);
+            slot->budget_limit, req->stop_conditions, req->report_format);
         agent_prompt_queue_push(&slot->queue, mission);
         free(mission);
     }
@@ -1024,7 +1040,7 @@ static void ds4_agent_subagent_emit_usage(ds4_agent_subagents *mgr) {
     ds4_agent_subagents_active_printf(mgr, "usage:\n");
     ds4_agent_subagents_active_printf(
         mgr,
-        "  /subagent new [--tab|--background|--auto] [--thinking off|default|max] [--tools POLICY] [name] [prompt]\n");
+        "  /subagent new [--tab|--background|--auto] [--budget N] [--thinking off|default|max] [--tools POLICY] [name] [prompt]\n");
     ds4_agent_subagents_active_printf(mgr, "  /subagent list\n");
     ds4_agent_subagents_active_printf(mgr, "  /subagent switch <id|name>\n");
     ds4_agent_subagents_active_printf(mgr, "  /subagent send <id|name> <prompt>\n");
@@ -1073,6 +1089,8 @@ bool ds4_agent_subagents_handle_command(ds4_agent_subagents *mgr,
         ds4_agent_subagent_autonomy mode = DS4_AGENT_SUBAGENT_AUTONOMY_BACKGROUND;
         ds4_think_mode think_mode = DS4_THINK_HIGH;
         bool think_mode_set = false;
+        int round_budget = 0;
+        bool round_budget_set = false;
         char *allowed_tools = NULL;
         char *name = NULL;
         for (;;) {
@@ -1090,12 +1108,35 @@ bool ds4_agent_subagents_handle_command(ds4_agent_subagents *mgr,
                 mode = DS4_AGENT_SUBAGENT_AUTONOMY_AUTONOMOUS;
                 continue;
             }
+            if (!strcmp(arg, "--budget")) {
+                char *value = ds4_agent_subagent_next_arg(&args);
+                if (!ds4_agent_subagent_parse_round_budget(value,
+                                                            &round_budget)) {
+                    ds4_agent_subagents_active_printf(
+                        mgr,
+                        "usage: /subagent new --auto [--budget N] [--thinking off|default|max] [--tools POLICY] [name] [prompt]\n");
+                    return true;
+                }
+                round_budget_set = true;
+                continue;
+            }
+            if (!strncmp(arg, "--budget=", 9)) {
+                if (!ds4_agent_subagent_parse_round_budget(arg + 9,
+                                                            &round_budget)) {
+                    ds4_agent_subagents_active_printf(
+                        mgr,
+                        "usage: /subagent new --auto [--budget N] [--thinking off|default|max] [--tools POLICY] [name] [prompt]\n");
+                    return true;
+                }
+                round_budget_set = true;
+                continue;
+            }
             if (!strcmp(arg, "--thinking")) {
                 char *value = ds4_agent_subagent_next_arg(&args);
                 if (!ds4_agent_subagent_parse_think_mode(value, &think_mode)) {
                     ds4_agent_subagents_active_printf(
                         mgr,
-                        "usage: /subagent new [--tab|--background|--auto] [--thinking off|default|max] [name] [prompt]\n");
+                        "usage: /subagent new [--tab|--background|--auto] [--budget N] [--thinking off|default|max] [--tools POLICY] [name] [prompt]\n");
                     return true;
                 }
                 think_mode_set = true;
@@ -1105,18 +1146,18 @@ bool ds4_agent_subagents_handle_command(ds4_agent_subagents *mgr,
                 if (!ds4_agent_subagent_parse_think_mode(arg + 11, &think_mode)) {
                     ds4_agent_subagents_active_printf(
                         mgr,
-                        "usage: /subagent new [--tab|--background|--auto] [--thinking off|default|max] [name] [prompt]\n");
+                        "usage: /subagent new [--tab|--background|--auto] [--budget N] [--thinking off|default|max] [--tools POLICY] [name] [prompt]\n");
                     return true;
                 }
-	                think_mode_set = true;
-	                continue;
-	            }
+                think_mode_set = true;
+                continue;
+            }
             if (!strcmp(arg, "--tools") || !strcmp(arg, "--allowed-tools")) {
                 char *value = ds4_agent_subagent_next_arg(&args);
                 if (!value) {
                     ds4_agent_subagents_active_printf(
                         mgr,
-                        "usage: /subagent new [--tab|--background|--auto] [--thinking off|default|max] [--tools POLICY] [name] [prompt]\n");
+                        "usage: /subagent new [--tab|--background|--auto] [--budget N] [--thinking off|default|max] [--tools POLICY] [name] [prompt]\n");
                     return true;
                 }
                 allowed_tools = value;
@@ -1130,9 +1171,15 @@ bool ds4_agent_subagents_handle_command(ds4_agent_subagents *mgr,
                 allowed_tools = arg + 16;
                 continue;
             }
-	            name = arg;
-	            break;
-	        }
+            name = arg;
+            break;
+        }
+        if (round_budget_set &&
+            mode != DS4_AGENT_SUBAGENT_AUTONOMY_AUTONOMOUS) {
+            ds4_agent_subagents_active_printf(mgr,
+                                             "--budget requires --auto\n");
+            return true;
+        }
         while (args && (*args == ' ' || *args == '\t')) args++;
         const char *prompt = args && args[0] ? args : NULL;
         if (!prompt && mode == DS4_AGENT_SUBAGENT_AUTONOMY_BACKGROUND)
@@ -1140,15 +1187,16 @@ bool ds4_agent_subagents_handle_command(ds4_agent_subagents *mgr,
         ds4_agent_subagent_create_request req = {
             .name = name,
             .prompt = prompt,
-	            .autonomy = mode,
-	            .think_mode = think_mode,
-	            .think_mode_set = think_mode_set,
-	            .allowed_tools = allowed_tools,
-	        };
+            .autonomy = mode,
+            .think_mode = think_mode,
+            .think_mode_set = think_mode_set,
+            .allowed_tools = allowed_tools,
+            .round_budget = round_budget
+        };
         ds4_agent_subagent_id id = {0};
         if (ds4_agent_subagent_create(mgr, &req, &id) != 0)
             ds4_agent_subagents_active_printf(
-                mgr, "subagent create failed: %s\n",
+                mgr, "subagent new failed: %s\n",
                 ds4_agent_subagents_last_error(mgr));
         else
             ds4_agent_subagents_active_printf(
@@ -1403,6 +1451,64 @@ static void test_agent_subagent_new_command_accepts_tools_flag(void) {
     ds4_agent_subagents_destroy(mgr);
 }
 
+static void test_agent_subagent_new_command_accepts_auto_budget(void) {
+    ds4_agent_subagents *mgr = NULL;
+    AGENT_TEST_ASSERT(ds4_agent_subagents_create(&mgr, NULL, NULL) == 0);
+    AGENT_TEST_ASSERT(mgr->default_round_budget ==
+                      DS4_AGENT_DEFAULT_MODEL_TOOL_ROUND_BUDGET);
+
+    ds4_agent_subagent_id main_id = {0};
+    ds4_agent_subagent_create_request main_req = {
+        .name = "main",
+        .autonomy = DS4_AGENT_SUBAGENT_AUTONOMY_TAB,
+    };
+    AGENT_TEST_ASSERT(ds4_agent_subagent_create(mgr, &main_req, &main_id) == 0);
+
+    char custom[] = "/subagent new --auto --budget 42 scout inspect docs";
+    AGENT_TEST_ASSERT(ds4_agent_subagents_handle_command(mgr, custom, false));
+    AGENT_TEST_ASSERT(mgr->len == 2);
+    AGENT_TEST_ASSERT(mgr->slots[1].autonomy ==
+                      DS4_AGENT_SUBAGENT_AUTONOMY_AUTONOMOUS);
+    AGENT_TEST_ASSERT(mgr->slots[1].budget_limit == 42);
+    AGENT_TEST_ASSERT(mgr->slots[1].queue.len == 1);
+    AGENT_TEST_ASSERT(strstr(mgr->slots[1].queue.v[0],
+                             "Budget: stop after 42 model/tool rounds.") != NULL);
+
+    char default_budget[] = "/subagent new --auto default inspect tests";
+    AGENT_TEST_ASSERT(ds4_agent_subagents_handle_command(
+        mgr, default_budget, false));
+    AGENT_TEST_ASSERT(mgr->len == 3);
+    AGENT_TEST_ASSERT(mgr->slots[2].budget_limit ==
+                      DS4_AGENT_DEFAULT_MODEL_TOOL_ROUND_BUDGET);
+    AGENT_TEST_ASSERT(mgr->slots[2].budget_limit == -1);
+    AGENT_TEST_ASSERT(strstr(mgr->slots[2].queue.v[0],
+                             "Budget: disabled; no model/tool round limit.") != NULL);
+
+    char disabled[] = "/subagent new --auto --budget -1 unlimited inspect repo";
+    AGENT_TEST_ASSERT(ds4_agent_subagents_handle_command(mgr, disabled, false));
+    AGENT_TEST_ASSERT(mgr->len == 4);
+    AGENT_TEST_ASSERT(mgr->slots[3].budget_limit == -1);
+    AGENT_TEST_ASSERT(strstr(mgr->slots[3].queue.v[0],
+                             "Budget: disabled; no model/tool round limit.") != NULL);
+
+    char invalid_mode[] = "/subagent new --budget 7 manual";
+    AGENT_TEST_ASSERT(ds4_agent_subagents_handle_command(
+        mgr, invalid_mode, false));
+    AGENT_TEST_ASSERT(mgr->len == 4);
+
+    char invalid_value[] = "/subagent new --auto --budget 0 invalid";
+    AGENT_TEST_ASSERT(ds4_agent_subagents_handle_command(
+        mgr, invalid_value, false));
+    AGENT_TEST_ASSERT(mgr->len == 4);
+
+    char invalid_negative[] = "/subagent new --auto --budget -2 invalid";
+    AGENT_TEST_ASSERT(ds4_agent_subagents_handle_command(
+        mgr, invalid_negative, false));
+    AGENT_TEST_ASSERT(mgr->len == 4);
+
+    ds4_agent_subagents_destroy(mgr);
+}
+
 static void test_agent_subagent_switch_preserves_thinking_modes(void) {
     ds4_agent_subagents *mgr = NULL;
     AGENT_TEST_ASSERT(ds4_agent_subagents_create(&mgr, NULL, NULL) == 0);
@@ -1588,6 +1694,7 @@ void ds4_agent_subagent_unit_tests_run(void) {
     test_agent_subagent_create_think_mode_inherits_or_overrides();
     test_agent_subagent_new_command_accepts_thinking_flag();
     test_agent_subagent_new_command_accepts_tools_flag();
+    test_agent_subagent_new_command_accepts_auto_budget();
     test_agent_subagent_switch_preserves_thinking_modes();
 }
 #endif

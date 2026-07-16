@@ -55,7 +55,6 @@ typedef struct {
     ds4_think_mode think_mode;
     bool think_mode_set;
     const char *allowed_tools;
-    const char *write_policy;
     int round_budget;
     const char *stop_conditions;
     const char *report_format;

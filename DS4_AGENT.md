@@ -245,7 +245,7 @@ Model-facing work is serialized through a shared gate.
 
 Subagent commands:
 
-- `/subagent new [--tab|--background|--auto] [--thinking off|default|max] [--tools POLICY] [name] [prompt]`
+- `/subagent new [--tab|--background|--auto] [--budget N] [--thinking off|default|max] [--tools POLICY] [name] [prompt]`
 - `/subagent list`
 - `/subagent switch <id|name>`
 - `/subagent send <id|name> <prompt>`
@@ -265,7 +265,11 @@ cannot create nested subagents (the active session must be the main session).
 |-----------------|----------|
 | `--tab`         | A manual session you can switch to with `/subagent switch`. No background execution — work only happens while it is the active session. |
 | `--background`  | A background worker that processes its prompt queue autonomously. Output accumulates in a background buffer. If no prompt is given, `--tab` is forced so the session is not useless. |
-| `--auto`        | An autonomous delegated worker. A mission envelope is prepended to the prompt with the tool policy, round budget, stop conditions, and report format. The worker runs until the budget is exhausted, an error occurs, it is interrupted, or it reports completion. The worker's tool round budget defaults to 16. |
+| `--auto`        | An autonomous delegated worker. A mission envelope is prepended to the prompt with the tool policy, round budget, stop conditions, and report format. The worker runs until the budget is exhausted, an error occurs, it is interrupted, or it reports completion. The worker's tool round budget defaults to `-1` (disabled). |
+
+With `--auto`, `--budget N` overrides the default model/tool round budget. `N`
+must be `-1` or a positive integer. `-1` disables the round budget. The option
+is rejected for non-autonomous modes.
 
 **Thinking mode** (optional):
 
@@ -287,15 +291,14 @@ cannot create nested subagents (the active session must be the main session).
 - `<prompt>` — optional initial prompt. If given, the subagent begins processing
   immediately (for `--background`/`--auto`) or is queued (for `--tab`). For
   `--auto` and `--background`, the prompt is wrapped in a mission envelope
-  containing the autonomy mode, tool policy, write policy, budget, stop
-  conditions, and report format.
+  containing the autonomy mode, tool policy, budget, stop conditions, and
+  report format.
 
-**Limitation**: the CLI handler only exposes `--tools` and `--thinking` flags.
-The underlying `ds4_agent_subagent_create_request` struct also supports
-`write_policy`, `round_budget`, `stop_conditions`, and `report_format`, but
-those are not currently available as command-line flags. They are always left at
-sensible defaults (no file edits unless explicitly allowed, budget 16, stop on
-done/blocked/interrupted/budget-exhausted, concise result with evidence).
+**Limitation**: the underlying `ds4_agent_subagent_create_request` struct also
+supports `stop_conditions` and `report_format`, but those fields are not
+currently available as command-line flags. They are left at sensible defaults
+(stop on done/blocked/interrupted/budget-exhausted, concise result with
+evidence).
 
 ### `/subagent list` — list subagents
 
