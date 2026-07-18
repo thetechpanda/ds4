@@ -58,7 +58,7 @@ static const char *ds4_agent_subagent_autonomy_name(ds4_agent_subagent_autonomy 
 static const char *ds4_agent_subagent_think_mode_name(ds4_think_mode mode) {
     switch (mode) {
     case DS4_THINK_NONE: return "off";
-    case DS4_THINK_HIGH: return "default";
+    case DS4_THINK_HIGH: return "def";
     case DS4_THINK_MAX: return "max";
     default: return ds4_think_mode_name(mode);
     }
@@ -681,6 +681,20 @@ int ds4_agent_subagent_list(ds4_agent_subagents *mgr,
         snprintf(out[i].stop_reason, sizeof(out[i].stop_reason), "%s",
                  slot->stop_reason[0] ? slot->stop_reason :
                  (slot->has_worker ? slot->worker.autonomy_stop_reason : ""));
+        /* Format tool_permissions in RWBX format: R=read, W=write, B=browse, X=bash.
+         * Replicate the logic from worker_update_status_tool_policy_locked in ds4_agent.c. */
+        const ds4_agent_tool_policy *pol = &slot->tool_policy;
+        bool none = !pol || pol->allow_none;
+        bool all = pol && pol->allow_all;
+        out[i].tool_permissions[0] = none ? '-' : (all ? 'R' :
+            ds4_agent_tool_policy_allows(pol, "read")   ? 'R' : '-');
+        out[i].tool_permissions[1] = none ? '-' : (all ? 'W' :
+            ds4_agent_tool_policy_allows(pol, "write")  ? 'W' : '-');
+        out[i].tool_permissions[2] = none ? '-' : (all ? 'B' :
+            ds4_agent_tool_policy_allows(pol, "web_browse") ? 'B' : '-');
+        out[i].tool_permissions[3] = none ? '-' : (all ? 'X' :
+            ds4_agent_tool_policy_allows(pol, "bash")   ? 'X' : '-');
+        out[i].tool_permissions[4] = '\0';
     }
     return 0;
 }

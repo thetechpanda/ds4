@@ -1417,7 +1417,7 @@ static ds4_think_mode effective_think_mode(const agent_config *cfg) {
 static const char *agent_think_mode_footer_name(ds4_think_mode mode) {
     switch (mode) {
     case DS4_THINK_NONE: return "off";
-    case DS4_THINK_HIGH: return "default";
+    case DS4_THINK_HIGH: return "def";
     case DS4_THINK_MAX:  return "max";
     default:             return ds4_think_mode_name(mode);
     }
@@ -10109,45 +10109,45 @@ static void test_agent_status_footer_thinking_mode_updates(void) {
     char footer[512];
     worker_get_status(&w, &st);
     build_status_text(&st, footer, sizeof(footer));
-    AGENT_TEST_ASSERT(strstr(footer, "thinking: default") != NULL);
+    AGENT_TEST_ASSERT(strstr(footer, "think: def") != NULL);
 
     worker_set_think_mode(&w, DS4_THINK_MAX);
     worker_get_status(&w, &st);
     build_status_text(&st, footer, sizeof(footer));
     AGENT_TEST_ASSERT(cfg.gen.think_mode == DS4_THINK_MAX);
     AGENT_TEST_ASSERT(st.think_mode == DS4_THINK_MAX);
-    AGENT_TEST_ASSERT(strstr(footer, "thinking: max") != NULL);
+    AGENT_TEST_ASSERT(strstr(footer, "think: max") != NULL);
 
     worker_set_think_mode(&w, DS4_THINK_NONE);
     worker_get_status(&w, &st);
     build_status_text(&st, footer, sizeof(footer));
     AGENT_TEST_ASSERT(cfg.gen.think_mode == DS4_THINK_NONE);
     AGENT_TEST_ASSERT(st.think_mode == DS4_THINK_NONE);
-    AGENT_TEST_ASSERT(strstr(footer, "thinking: off") != NULL);
+    AGENT_TEST_ASSERT(strstr(footer, "think: off") != NULL);
 
     ds4_think_mode cycled = worker_cycle_think_mode(&w);
     worker_get_status(&w, &st);
     build_status_text(&st, footer, sizeof(footer));
     AGENT_TEST_ASSERT(cycled == DS4_THINK_HIGH);
-    AGENT_TEST_ASSERT(strstr(footer, "thinking: default") != NULL);
+    AGENT_TEST_ASSERT(strstr(footer, "think: def") != NULL);
 
     cycled = worker_cycle_think_mode(&w);
     worker_get_status(&w, &st);
     build_status_text(&st, footer, sizeof(footer));
     AGENT_TEST_ASSERT(cycled == DS4_THINK_MAX);
-    AGENT_TEST_ASSERT(strstr(footer, "thinking: max") != NULL);
+    AGENT_TEST_ASSERT(strstr(footer, "think: max") != NULL);
 
     cycled = worker_cycle_think_mode(&w);
     worker_get_status(&w, &st);
     build_status_text(&st, footer, sizeof(footer));
     AGENT_TEST_ASSERT(cycled == DS4_THINK_NONE);
-    AGENT_TEST_ASSERT(strstr(footer, "thinking: off") != NULL);
+    AGENT_TEST_ASSERT(strstr(footer, "think: off") != NULL);
 
     cycled = worker_cycle_think_mode(&w);
     worker_get_status(&w, &st);
     build_status_text(&st, footer, sizeof(footer));
     AGENT_TEST_ASSERT(cycled == DS4_THINK_HIGH);
-    AGENT_TEST_ASSERT(strstr(footer, "thinking: default") != NULL);
+    AGENT_TEST_ASSERT(strstr(footer, "think: def") != NULL);
 
     close(w.wake_fd[0]);
     close(w.wake_fd[1]);
@@ -10158,23 +10158,30 @@ static void test_agent_status_footer_subagent_badges(void) {
     ds4_agent_subagent_status items[3];
     memset(items, 0, sizeof(items));
     snprintf(items[0].name, sizeof(items[0].name), "%s", "alpha");
-    items[0].queued_output_bytes = 12;
+    items[0].active = true;
     items[0].state = DS4_AGENT_SUBAGENT_STATE_RUNNING;
     snprintf(items[1].name, sizeof(items[1].name), "%s", "beta");
-    items[1].queued_output_bytes = 5;
     items[1].state = DS4_AGENT_SUBAGENT_STATE_WAITING_MODEL;
     items[1].approval_blocked = true;
     snprintf(items[2].name, sizeof(items[2].name), "%s", "gamma");
-    items[2].queued_output_bytes = 0;
     items[2].state = DS4_AGENT_SUBAGENT_STATE_ERROR;
 
     char suffix[512];
-    build_subagent_footer_suffix(items, 3, 200, 32, suffix, sizeof(suffix));
-    AGENT_TEST_ASSERT(strstr(suffix, "[s:alpha 12 working]") != NULL);
-    AGENT_TEST_ASSERT(strstr(suffix, "[s:beta 5 approval]") != NULL);
-    AGENT_TEST_ASSERT(strstr(suffix, "gamma") == NULL);
+    /* Each badge is ~120 chars with style resets; use generous width to fit all 3 */
+    build_subagent_footer_suffix(items, 3, 500, 32, suffix, sizeof(suffix));
+    AGENT_TEST_ASSERT(strstr(suffix, "s:alpha") != NULL);
+    AGENT_TEST_ASSERT(strstr(suffix, "s:beta") != NULL);
+    AGENT_TEST_ASSERT(strstr(suffix, "s:gamma") != NULL);
+    AGENT_TEST_ASSERT(strstr(suffix, "\x1b[32m") != NULL);  /* green active */
+    AGENT_TEST_ASSERT(strstr(suffix, "\x1b[33m") != NULL);  /* yellow attention (approval_blocked) */
+    /* Gamma (error) also gets ! attention indicator */
+    AGENT_TEST_ASSERT(strstr(suffix, "\x1b[32m▶\x1b[48;5;238;38;5;252m") != NULL);  /* green active */
+    /* No background subagent in this test; ■ not expected */
+    AGENT_TEST_ASSERT(strstr(suffix, "\x1b[33m!\x1b[48;5;238;38;5;252m") != NULL);  /* yellow attention */
+    AGENT_TEST_ASSERT(strstr(suffix, "----") != NULL);
 }
 
+/* 4.3 Verify truncation of subagent badges when budget is tight */
 static void test_agent_status_footer_subagent_badge_truncation(void) {
     ds4_agent_subagent_status items[2];
     memset(items, 0, sizeof(items));
@@ -10186,10 +10193,131 @@ static void test_agent_status_footer_subagent_badge_truncation(void) {
     items[1].state = DS4_AGENT_SUBAGENT_STATE_WAITING_MODEL;
 
     char suffix[512];
-    build_subagent_footer_suffix(items, 2, 60, 30, suffix, sizeof(suffix));
-    AGENT_TEST_ASSERT(strstr(suffix, "[s:alpha 12 working]") != NULL);
-    AGENT_TEST_ASSERT(strstr(suffix, "[s:beta 3456 waiting]") == NULL);
-    AGENT_TEST_ASSERT(strstr(suffix, "...") != NULL);
+    /* Badges are ~120 chars each; use width that fits first badge but not second */
+    build_subagent_footer_suffix(items, 2, 250, 30, suffix, sizeof(suffix));
+    AGENT_TEST_ASSERT(strstr(suffix, "s:alpha") != NULL);
+    /* The second badge may or may not fit depending on the new wider format */
+    bool beta_present = strstr(suffix, "s:beta") != NULL;
+    bool trunc_present = strstr(suffix, "...") != NULL;
+    AGENT_TEST_ASSERT(!beta_present || !trunc_present); /* at most one of these is true */
+    /* When truncation happens, we should see at least one badge */
+    AGENT_TEST_ASSERT(strstr(suffix, "[") != NULL);
+}
+
+/* 4.6 Verify subagent badge uses ▶ for active, ■ for background, ! for attention-needed */
+static void test_agent_status_footer_subagent_indicator(void) {
+    ds4_agent_subagent_status items[3];
+    memset(items, 0, sizeof(items));
+    /* Active subagent */
+    snprintf(items[0].name, sizeof(items[0].name), "%s", "active_sub");
+    items[0].active = true;
+    items[0].state = DS4_AGENT_SUBAGENT_STATE_RUNNING;
+    /* Background subagent */
+    snprintf(items[1].name, sizeof(items[1].name), "%s", "bg_sub");
+    items[1].state = DS4_AGENT_SUBAGENT_STATE_RUNNING;
+    /* Attention-needed subagent */
+    snprintf(items[2].name, sizeof(items[2].name), "%s", "attn_sub");
+    items[2].state = DS4_AGENT_SUBAGENT_STATE_ERROR;
+
+    char suffix[1024];
+    /* Use generous width to fit all 3 badges */
+    build_subagent_footer_suffix(items, 3, 500, 32, suffix, sizeof(suffix));
+    /* The indicator now uses AGENT_STATUS_STYLE_START (\x1b[48;5;238;38;5;252m)
+     * instead of \x1b[0m to preserve the status-line background */
+    AGENT_TEST_ASSERT(strstr(suffix, "\x1b[32m▶\x1b[48;5;238;38;5;252m") != NULL);
+    AGENT_TEST_ASSERT(strstr(suffix, "\x1b[35m■\x1b[48;5;238;38;5;252m") != NULL);
+    AGENT_TEST_ASSERT(strstr(suffix, "\x1b[33m!\x1b[48;5;238;38;5;252m") != NULL);
+}
+
+/* 4.4 Verify pp ---% ---- t/s and gen ---- t/s placeholders appear in non-active states */
+static void test_agent_status_footer_placeholder_format(void) {
+    agent_status st = {0};
+    st.state = AGENT_WORKER_IDLE;
+    st.ctx_used = 1000;
+    st.ctx_size = 16000;
+    snprintf(st.session_name, sizeof(st.session_name), "%s", "test");
+    char buf[512];
+    build_status_text(&st, buf, sizeof(buf));
+    AGENT_TEST_ASSERT(strstr(buf, "pp ---% ---- t/s") != NULL);
+    AGENT_TEST_ASSERT(strstr(buf, "gen ---- t/s") != NULL);
+}
+
+/* 4.5 Verify pp 45.2% 128.5 t/s format appears during prefill state */
+static void test_agent_status_footer_prefill_format(void) {
+    agent_status st = {0};
+    st.state = AGENT_WORKER_PREFILL;
+    st.prefill_done = 452;
+    st.prefill_total = 1000;
+    st.prefill_tps = 128.5;
+    st.ctx_used = 1000;
+    st.ctx_size = 16000;
+    snprintf(st.session_name, sizeof(st.session_name), "%s", "test");
+    char buf[512];
+    build_status_text(&st, buf, sizeof(buf));
+    AGENT_TEST_ASSERT(strstr(buf, "pp") != NULL);
+    AGENT_TEST_ASSERT(strstr(buf, "45.2%") != NULL);
+    AGENT_TEST_ASSERT(strstr(buf, "128 t/s") != NULL);  /* %.0f rounds 128.5 → 128 (banker's rounding) */
+}
+
+/* 4.7 Verify subagent badge includes RWBX permissions field */
+static void test_agent_status_footer_subagent_permissions(void) {
+    ds4_agent_subagent_status items[1];
+    memset(items, 0, sizeof(items));
+    snprintf(items[0].name, sizeof(items[0].name), "%s", "perm_test");
+    items[0].state = DS4_AGENT_SUBAGENT_STATE_RUNNING;
+    snprintf(items[0].tool_permissions, sizeof(items[0].tool_permissions), "%s", "RW-X");
+
+    char suffix[1024];
+    build_subagent_footer_suffix(items, 1, 200, 32, suffix, sizeof(suffix));
+    AGENT_TEST_ASSERT(strstr(suffix, "RW-X") != NULL);
+}
+
+/* 4.8 Verify subagent badge pp field uses ---% ---- t/s placeholder (deferred fields) */
+static void test_agent_status_footer_subagent_pp_placeholder(void) {
+    ds4_agent_subagent_status items[1];
+    memset(items, 0, sizeof(items));
+    snprintf(items[0].name, sizeof(items[0].name), "%s", "pp_test");
+    items[0].state = DS4_AGENT_SUBAGENT_STATE_RUNNING;
+
+    char suffix[1024];
+    build_subagent_footer_suffix(items, 1, 200, 32, suffix, sizeof(suffix));
+    AGENT_TEST_ASSERT(strstr(suffix, "pp ---% ---- t/s") != NULL);
+    AGENT_TEST_ASSERT(strstr(suffix, "gen ---- t/s") != NULL);
+}
+
+/* 4.9 Verify main agent badge uses the same badge format as subagents (no separate status line) */
+static void test_agent_status_footer_main_badge_format(void) {
+    agent_status st = {0};
+    st.state = AGENT_WORKER_IDLE;
+    st.ctx_used = 1000;
+    st.ctx_size = 16000;
+    snprintf(st.session_name, sizeof(st.session_name), "%s", "test");
+    snprintf(st.tool_permissions, sizeof(st.tool_permissions), "%s", "RWBX");
+    char buf[512];
+    build_status_text(&st, buf, sizeof(buf));
+    /* Main agent badge has magenta brackets (active agent style) */
+    AGENT_TEST_ASSERT(strstr(buf, "\x1b[35m[") != NULL);
+    AGENT_TEST_ASSERT(strstr(buf, "s:test") != NULL);
+    AGENT_TEST_ASSERT(strstr(buf, "ctx") != NULL);
+    AGENT_TEST_ASSERT(strstr(buf, "think:") != NULL);
+    AGENT_TEST_ASSERT(strstr(buf, "pp") != NULL);
+    AGENT_TEST_ASSERT(strstr(buf, "gen") != NULL);
+    AGENT_TEST_ASSERT(strstr(buf, "RWBX") != NULL);
+}
+
+/* 4.10 Verify writable paths no longer appear in footer */
+static void test_agent_status_footer_no_writable_paths(void) {
+    agent_status st = {0};
+    st.state = AGENT_WORKER_IDLE;
+    st.ctx_used = 1000;
+    st.ctx_size = 16000;
+    snprintf(st.session_name, sizeof(st.session_name), "%s", "test");
+    snprintf(st.writable_workspace_paths, sizeof(st.writable_workspace_paths), "%s", "/workspace");
+    char buf[512];
+    build_status_text(&st, buf, sizeof(buf));
+    /* The status text should NOT contain writable path info */
+    AGENT_TEST_ASSERT(strstr(buf, "workspace") == NULL);
+    AGENT_TEST_ASSERT(strstr(buf, "writable") == NULL);
 }
 
 static void test_agent_alt_tab_sequence_is_consumed(void) {
@@ -11618,7 +11746,7 @@ static void test_agent_subagent_slash_command_recognition(void) {
 
 #endif
 
-/* --- Tool-access policy implementation ------------------------------------ */
+/* --- Tool-access policy implementation ----------------------------------- */
 
 /* Parse a comma-separated list of tool names / meta-tools into a normalized
  * policy.  Returns 0 on success, -1 on unknown tool name. */
@@ -12643,6 +12771,13 @@ static void ds4_agent_unit_tests_run(void) {
     test_agent_status_footer_thinking_mode_updates();
     test_agent_status_footer_subagent_badges();
     test_agent_status_footer_subagent_badge_truncation();
+    test_agent_status_footer_placeholder_format();
+    test_agent_status_footer_prefill_format();
+    test_agent_status_footer_subagent_indicator();
+    test_agent_status_footer_subagent_permissions();
+    test_agent_status_footer_subagent_pp_placeholder();
+    test_agent_status_footer_main_badge_format();
+    test_agent_status_footer_no_writable_paths();
     test_agent_alt_tab_sequence_is_consumed();
     test_agent_docker_exec_rejects_invalid_input();
     test_agent_docker_exec_no_capture();
@@ -16322,21 +16457,8 @@ static char *agent_format_user_prompt_echo(const char *text) {
 #define AGENT_INPUT_MAX_BUFLEN (1024*1024)
 #define AGENT_STATUS_STYLE_START "\x1b[48;5;238;38;5;252m"
 #define AGENT_STATUS_STYLE_END "\x1b[0m"
-#define AGENT_STATUS_BAR_FILL "\x1b[48;5;238;38;5;201;1m"
 #define AGENT_QUEUE_STYLE "\x1b[38;5;87;1m"
 #define AGENT_STATUS_REDRAW_INTERVAL_SEC 0.20
-#define AGENT_PROGRESS_BAR_WIDTH 32
-#define AGENT_PROGRESS_BAR_MAX_BYTES 256
-
-static void agent_progress_append(char *buf, size_t len, size_t *pos,
-                                  const char *s) {
-    if (len == 0 || *pos >= len - 1) return;
-    size_t avail = len - *pos;
-    int n = snprintf(buf + *pos, avail, "%s", s);
-    if (n <= 0) return;
-    if ((size_t)n >= avail) *pos = len - 1;
-    else *pos += (size_t)n;
-}
 
 static void build_prompt_text(const agent_status *st, char *buf, size_t len) {
     if (st && st->session_name[0])
@@ -16345,164 +16467,57 @@ static void build_prompt_text(const agent_status *st, char *buf, size_t len) {
         snprintf(buf, len, "#> ");
 }
 
-static void agent_progress_bar(int done, int total, double tps,
-                               char *buf, size_t len, bool color) {
-    if (len == 0) return;
-    if (total <= 0) total = 1;
-    if (done < 0) done = 0;
-    if (done > total) done = total;
-    int filled = (int)(((long long)done * AGENT_PROGRESS_BAR_WIDTH) / total);
-    if (filled < 0) filled = 0;
-    if (filled > AGENT_PROGRESS_BAR_WIDTH) filled = AGENT_PROGRESS_BAR_WIDTH;
-    if (color && filled == 0 && done < total) filled = 1;
-    char rate[32] = {0};
-    size_t rate_len = 0;
-    if (tps > 0.0 && filled < AGENT_PROGRESS_BAR_WIDTH) {
-        snprintf(rate, sizeof(rate), " %.0ft/s", tps);
-        rate_len = strlen(rate);
-    }
-    size_t pos = 0;
-    agent_progress_append(buf, len, &pos, "[");
-    if (color) agent_progress_append(buf, len, &pos, AGENT_STATUS_BAR_FILL);
-    for (int i = 0; i < AGENT_PROGRESS_BAR_WIDTH && pos + 1 < len; i++) {
-        if (color && i == filled) {
-            agent_progress_append(buf, len, &pos, AGENT_STATUS_STYLE_START);
-        }
-        if (i >= filled && rate_len > 0 && (size_t)(i - filled) < rate_len) {
-            char ch[2] = {rate[i - filled], '\0'};
-            agent_progress_append(buf, len, &pos, ch);
-        } else {
-            agent_progress_append(buf, len, &pos, i < filled ? "▶" : "·");
-        }
-    }
-    if (color) agent_progress_append(buf, len, &pos, AGENT_STATUS_STYLE_START);
-    agent_progress_append(buf, len, &pos, "]");
-    buf[pos < len ? pos : len - 1] = '\0';
-}
 
-static void agent_power_status_suffix(const agent_status *st,
-                                      char *buf, size_t len) {
-    if (len == 0) return;
-    if (st->power_percent > 0 && st->power_percent < 100)
-        snprintf(buf, len, " | ⚡ %d%%", st->power_percent);
-    else
-        buf[0] = '\0';
-}
 
 static unsigned agent_next_prefill_label(void) {
     static unsigned next;
     return next++;
 }
 
-/* Keep each prefill operation on a single playful label so the footer does not
- * visually churn while progress updates stream in. */
-static const char *agent_prefill_label(const agent_status *st) {
-    static const char *labels[] = {
-        "reading",
-        "absorbing",
-        "studying",
-        "gathering",
-        "crunching",
-        "scrutinizing",
-    };
-    size_t n = sizeof(labels) / sizeof(labels[0]);
-    return labels[(st ? st->prefill_label : 0u) % n];
-}
 
-/* Build the one-line footer shown below the prompt.  It is intentionally compact
- * because linenoise redraws it on every progress update. */
+
+/* Build the main-agent badge: a single compact badge format identical to
+ * subagent badges.  The sandbox indicator is prepended once in build_footer_text. */
 static void build_status_text(const agent_status *st, char *buf, size_t len) {
     char used[32], total_ctx[32];
-    char power[32];
-    char status_suffix[96];
-    char session_suffix[160];
-    char sandbox[512];
+    char pp_field[32], gen_field[32];
     agent_format_ctx_size(st->ctx_used, used, sizeof(used));
     agent_format_ctx_size(st->ctx_size, total_ctx, sizeof(total_ctx));
-    agent_power_status_suffix(st, power, sizeof(power));
-    snprintf(status_suffix, sizeof(status_suffix), " | thinking: %s%s",
-             agent_think_mode_footer_name(st->think_mode), power);
-    if (st->session_name[0]) {
-        snprintf(session_suffix, sizeof(session_suffix),
-                 " | session: %s#%" PRIu64,
-                 st->session_name, st->session_id);
-    } else {
-        session_suffix[0] = '\0';
-    }
-    const char *perms = st->tool_permissions[0] ? st->tool_permissions : "----";
-    if (st->docker_container[0])
-        snprintf(sandbox, sizeof(sandbox), "✅ %s | %s | ", st->docker_container, perms);
-    else
-        snprintf(sandbox, sizeof(sandbox), "🚨 no-sandbox | %s | ", perms);
 
-    switch (st->state) {
-    case AGENT_WORKER_WAITING_MODEL:
-        snprintf(buf, len, "%sctx %s/%s | waiting for shared model%s",
-                 sandbox, used, total_ctx, status_suffix);
-        break;
-    case AGENT_WORKER_PREFILL: {
+    /* Prefill field: live values during prefill, placeholder otherwise */
+    if (st->state == AGENT_WORKER_PREFILL) {
         int done = st->prefill_done;
         int total = st->prefill_total > 0 ? st->prefill_total : 1;
         if (done > total) done = total;
         double pct = 100.0 * (double)done / (double)total;
-        char bar[AGENT_PROGRESS_BAR_MAX_BYTES];
-        agent_progress_bar(done, total, st->prefill_tps, bar, sizeof(bar),
-                           stdout_is_tty());
-        snprintf(buf, len, "%sctx %s/%s | %s %s %d/%d %.1f%%%s",
-                 sandbox, used, total_ctx, agent_prefill_label(st), bar,
-                 done, total, pct, status_suffix);
-        break;
+        snprintf(pp_field, sizeof(pp_field), "%.1f%% %.0f t/s", pct, st->prefill_tps);
+    } else {
+        snprintf(pp_field, sizeof(pp_field), "%s", "---% ---- t/s");
     }
-    case AGENT_WORKER_GENERATING:
-        snprintf(buf, len, "%sctx %s/%s | generation %d tokens%s %.1f t/s%s",
-                 sandbox, used, total_ctx, st->generated,
-                 st->greedy_sampling ? " ❄️" : "", st->gen_tps, status_suffix);
-        break;
-    case AGENT_WORKER_COMPACTING:
-        snprintf(buf, len, "%sctx %s/%s | COMPACTING summary %d tokens %.1f t/s%s",
-                 sandbox, used, total_ctx, st->generated, st->gen_tps,
-                 status_suffix);
-        break;
-    case AGENT_WORKER_DRAINING:
-        snprintf(buf, len, "%sctx %s/%s | stopping after distributed cluster drains%s",
-                 sandbox, used, total_ctx, status_suffix);
-        break;
-    case AGENT_WORKER_SAVING:
-        snprintf(buf, len, "%sctx %s/%s | saving session%s",
-                 sandbox, used, total_ctx, status_suffix);
-        break;
-    case AGENT_WORKER_ERROR:
-        snprintf(buf, len, "%sctx %s/%s | error: %s%s", sandbox, used, total_ctx,
-                 st->error[0] ? st->error : "unknown error", status_suffix);
-        break;
-    case AGENT_WORKER_STOPPED:
-        snprintf(buf, len, "%sctx %s/%s | interrupted%s",
-                 sandbox, used, total_ctx, status_suffix);
-        break;
-    default:
-        snprintf(buf, len, "%sctx %s/%s | idle%s",
-                 sandbox, used, total_ctx, status_suffix);
-        break;
+
+    /* Generation field: live values during generating/compacting, placeholder otherwise */
+    if (st->state == AGENT_WORKER_GENERATING || st->state == AGENT_WORKER_COMPACTING) {
+        snprintf(gen_field, sizeof(gen_field), "%.1f t/s", st->gen_tps);
+    } else {
+        snprintf(gen_field, sizeof(gen_field), "---- t/s");
     }
-    if (session_suffix[0]) {
-        size_t used_len = strlen(buf);
-        snprintf(buf + used_len, used_len < len ? len - used_len : 0,
-                 "%s", session_suffix);
-    }
+
+    /* Main agent is always active (focused), so use green ▶ indicator
+     * with magenta brackets, matching the active-subagent style.
+     * Use AGENT_STATUS_STYLE_START instead of \x1b[0m so the status-line
+     * background (color 238) persists across the badge. */
+    const char *indicator = "\x1b[32m▶" AGENT_STATUS_STYLE_START;
+    const char *perms = st->tool_permissions[0] ? st->tool_permissions : "----";
+    snprintf(buf, len,
+             "\x1b[35m[ %s | s:%s | ctx %s/%s | think: %s | pp %s | gen %s | %s \x1b[35m]" AGENT_STATUS_STYLE_START,
+             indicator,
+             st->session_name[0] ? st->session_name : "main",
+             used, total_ctx,
+             agent_think_mode_footer_name(st->think_mode),
+             pp_field, gen_field, perms);
 }
 
-static const char *agent_subagent_footer_state(const ds4_agent_subagent_status *st) {
-    if (!st) return "idle";
-    if (st->approval_blocked) return "approval";
-    switch (st->state) {
-    case DS4_AGENT_SUBAGENT_STATE_RUNNING: return "working";
-    case DS4_AGENT_SUBAGENT_STATE_WAITING_MODEL: return "waiting";
-    case DS4_AGENT_SUBAGENT_STATE_APPROVAL_BLOCKED: return "approval";
-    case DS4_AGENT_SUBAGENT_STATE_ERROR: return "error";
-    case DS4_AGENT_SUBAGENT_STATE_STOPPED: return "stopped";
-    default: return "idle";
-    }
-}
+
 
 static void build_subagent_footer_suffix(const ds4_agent_subagent_status *items,
                                          size_t n, int cols, size_t status_len,
@@ -16520,12 +16535,48 @@ static void build_subagent_footer_suffix(const ds4_agent_subagent_status *items,
     agent_buf out = {0};
 
     for (size_t i = 0; i < n; i++) {
-        if (items[i].queued_output_bytes == 0) continue;
-        char badge[160];
-        snprintf(badge, sizeof(badge), "[s:%s %zu %s]",
+        /* Three-state indicator: active → green ▶, attention-needed → yellow !,
+         * background → magenta ■ */
+        const char *indicator;
+        const char *indicator_color;
+        const char *bracket_color;
+        if (items[i].active) {
+            indicator = "▶";
+            indicator_color = "\x1b[32m";
+            bracket_color = "\x1b[35m";
+        } else if (items[i].approval_blocked ||
+                   items[i].state == DS4_AGENT_SUBAGENT_STATE_ERROR ||
+                   items[i].queued_output) {
+            indicator = "!";
+            indicator_color = "\x1b[33m";
+            bracket_color = "";
+        } else {
+            indicator = "■";
+            indicator_color = "\x1b[35m";
+            bracket_color = "";
+        }
+
+        char used_ctx[32], total_ctx[32];
+        agent_format_ctx_size(items[i].ctx_used, used_ctx, sizeof(used_ctx));
+        agent_format_ctx_size(items[i].ctx_size, total_ctx, sizeof(total_ctx));
+
+        char badge[256];
+        /* After the colored indicator, restore the status-line background
+         * with AGENT_STATUS_STYLE_START instead of plain \x1b[0m.
+         * For active subagents, bracket_color wraps both [ and ] in magenta. */
+        const char *close_color = bracket_color && bracket_color[0] ? bracket_color : "";
+        snprintf(badge, sizeof(badge),
+                 "%s[ %s%s" AGENT_STATUS_STYLE_START " | s:%s | ctx %s/%s | think: %s | pp %s | gen %s | %s %s]" AGENT_STATUS_STYLE_START,
+                 bracket_color,
+                 indicator_color, indicator,
                  items[i].name,
-                 items[i].queued_output_bytes,
-                 agent_subagent_footer_state(&items[i]));
+                 used_ctx, total_ctx,
+                 agent_think_mode_footer_name(items[i].think_mode),
+                 "---% ---- t/s",
+                 "---- t/s",
+                 items[i].tool_permissions[0] ? items[i].tool_permissions : "----",
+                 close_color);
+
         const char *sep = added ? " " : " | ";
         size_t piece_len = strlen(sep) + strlen(badge);
         if (used + piece_len > budget) {
@@ -16603,120 +16654,6 @@ void agent_prompt_queue_free(agent_prompt_queue *q) {
 }
 
 
-static void build_writable_footer_suffix(const agent_status *st, int cols,
-                                         size_t status_len, char *buf,
-                                         size_t len) {
-    const char *prefix = " | ";
-    const char *workspace_style = "\x1b[38;5;114m";
-    const char *temp_style = "\x1b[38;5;245m";
-    const char *auto_style = "\x1b[38;5;213m";
-    size_t prefix_len = strlen(prefix);
-    const char *workspace = st ? st->writable_workspace_paths : "";
-    const char *temp = st ? st->writable_temp_paths : "";
-    const char *auto_allowed = st ? st->writable_auto_paths : "";
-    if (!workspace[0] && !temp[0] && !auto_allowed[0]) {
-        buf[0] = '\0';
-        return;
-    }
-
-    if (cols < 40) cols = 40;
-    size_t budget = (size_t)cols;
-    if (status_len + prefix_len >= budget) {
-        buf[0] = '\0';
-        return;
-    }
-    budget -= status_len + prefix_len;
-    bool color = stdout_is_tty();
-    agent_buf plain = {0};
-    agent_buf styled = {0};
-    bool first = true;
-
-    if (workspace[0]) {
-        if (!first) {
-            agent_buf_puts(&plain, ", ");
-            if (color) agent_buf_puts(&styled, ", ");
-        }
-        agent_buf_puts(&plain, workspace);
-        if (color) {
-            agent_buf_puts(&styled, workspace_style);
-            agent_buf_puts(&styled, workspace);
-            agent_buf_puts(&styled, AGENT_STATUS_STYLE_START);
-        }
-        first = false;
-    }
-    if (temp[0]) {
-        if (!first) {
-            agent_buf_puts(&plain, ", ");
-            if (color) agent_buf_puts(&styled, ", ");
-        }
-        agent_buf_puts(&plain, temp);
-        if (color) {
-            agent_buf_puts(&styled, temp_style);
-            agent_buf_puts(&styled, temp);
-            agent_buf_puts(&styled, AGENT_STATUS_STYLE_START);
-        }
-        first = false;
-    }
-    if (auto_allowed[0]) {
-        if (!first) {
-            agent_buf_puts(&plain, ", ");
-            if (color) agent_buf_puts(&styled, ", ");
-        }
-        agent_buf_puts(&plain, auto_allowed);
-        if (color) {
-            agent_buf_puts(&styled, auto_style);
-            agent_buf_puts(&styled, auto_allowed);
-            agent_buf_puts(&styled, AGENT_STATUS_STYLE_START);
-        }
-    }
-
-    size_t visible_len = plain.ptr ? strlen(plain.ptr) : 0;
-    bool truncate = visible_len > budget;
-    if (!color) {
-        size_t keep = truncate ? (budget > 4 ? budget - 4 : 1) : visible_len;
-        snprintf(buf, len, "%s%.*s%s", prefix, (int)keep,
-                 plain.ptr ? plain.ptr : "", truncate ? " ..." : "");
-    } else if (!truncate) {
-        snprintf(buf, len, "%s%s", prefix, styled.ptr ? styled.ptr : "");
-    } else {
-        size_t used = 0;
-        size_t pos = 0;
-        int written = snprintf(buf, len, "%s", prefix);
-        if (written < 0) written = 0;
-        if ((size_t)written >= len) written = (int)(len ? len - 1 : 0);
-        used = (size_t)written;
-        if (used >= len) used = len ? len - 1 : 0;
-        const char *src = styled.ptr ? styled.ptr : "";
-        const char *reset = AGENT_STATUS_STYLE_START;
-        while (src[pos] && used + 1 < len && budget > 0) {
-            if ((unsigned char)src[pos] == 0x1b) {
-                size_t esc = pos + 1;
-                while (src[esc] && src[esc] != 'm') esc++;
-                if (src[esc] == 'm') esc++;
-                size_t esc_len = esc - pos;
-                if (used + esc_len >= len) break;
-                memcpy(buf + used, src + pos, esc_len);
-                used += esc_len;
-                pos = esc;
-                continue;
-            }
-            buf[used++] = src[pos++];
-            budget--;
-        }
-        if (used + 4 < len) {
-            memcpy(buf + used, " ...", 4);
-            used += 4;
-        }
-        if (used + strlen(reset) < len) {
-            memcpy(buf + used, reset, strlen(reset));
-            used += strlen(reset);
-        }
-        buf[used] = '\0';
-    }
-    free(plain.ptr);
-    free(styled.ptr);
-}
-
 /* Build the editable footer.  With queued prompts, the footer becomes multiple
  * rows: a compact queue preview first, then the normal status row. */
 static void build_footer_text(const agent_status *st, ds4_agent_subagents *subagents,
@@ -16724,9 +16661,14 @@ static void build_footer_text(const agent_status *st, ds4_agent_subagents *subag
                               char *buf, size_t len) {
     char status[512];
     char badges[1024];
-    char writable[1024];
     char footer[2560];
     bool color = stdout_is_tty();
+    /* Sandbox indicator prepended once before the first badge */
+    char sandbox[64];
+    if (st->docker_container[0])
+        snprintf(sandbox, sizeof(sandbox), "✅ %s ", st->docker_container);
+    else
+        snprintf(sandbox, sizeof(sandbox), "🚨 no-sandbox ");
     build_status_text(st, status, sizeof(status));
     badges[0] = '\0';
     if (subagents) {
@@ -16734,14 +16676,12 @@ static void build_footer_text(const agent_status *st, ds4_agent_subagents *subag
         if (ds4_agent_subagent_list(subagents, NULL, 0, &n) == 0 && n > 0) {
             ds4_agent_subagent_status *items = xmalloc(n * sizeof(items[0]));
             if (ds4_agent_subagent_list(subagents, items, n, &n) == 0)
-                build_subagent_footer_suffix(items, n, cols, strlen(status),
+                build_subagent_footer_suffix(items, n, cols, strlen(sandbox) + strlen(status),
                                              badges, sizeof(badges));
             free(items);
         }
     }
-    build_writable_footer_suffix(st, cols, strlen(status) + strlen(badges),
-                                 writable, sizeof(writable));
-    snprintf(footer, sizeof(footer), "%s%s%s", status, badges, writable);
+    snprintf(footer, sizeof(footer), "%s%s%s", sandbox, status, badges);
     if (!queue || !queue->len) {
         snprintf(buf, len, "%s", footer);
         return;

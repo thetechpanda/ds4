@@ -77,6 +77,7 @@ typedef struct {
     ds4_think_mode think_mode;
     bool report_available;
     char stop_reason[DS4_AGENT_SUBAGENT_TEXT_MAX];
+    char tool_permissions[5];
 } ds4_agent_subagent_status;
 
 typedef struct {
