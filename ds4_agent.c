@@ -217,6 +217,8 @@ typedef struct {
     agent_dsml_marker_detector think_dsml;
     bool dsml_in_think;
     bool dsml_in_think_reported;
+    bool dsml_origin_in_think;
+    bool dsml_origin_rendered;
     bool post_think_gap;
     bool tool_preflight_error;
     char tool_preflight_error_msg[256];
@@ -248,6 +250,10 @@ static void agent_web_log(void *privdata, const char *message);
 static bool agent_preflight_edit_old(agent_worker *w, const agent_tool_call *call,
                                      char *err, size_t err_len);
 static char *agent_execute_tool_call(agent_worker *w, const agent_tool_call *call);
+static char *agent_execute_tool_calls_ordered(agent_worker *w,
+                                              const agent_tool_calls *calls,
+                                              bool stop_on_interrupt,
+                                              bool *interrupted);
 static void agent_string_array_free(char **v, int count);
 static bool agent_json_parse_string_array(const char *json,
                                           char ***out_v,
@@ -1457,7 +1463,9 @@ static const char agent_tools_prompt_intro[] =
     "<｜DSML｜parameter name=\"$PARAMETER_NAME\" string=\"true|false\">$PARAMETER_VALUE</｜DSML｜parameter>\n"
     "</｜DSML｜invoke>\n"
     "</｜DSML｜tool_calls>\n\n"
-    "Tool calls are not allowed inside <think></think>; finish thinking before emitting DSML.\n\n"
+    "Inside <think></think>, only read, more, list, search, web_browse, web_fetch, and skill_list "
+    "may be called. Read and web calls still require permission from the current tool-access policy; "
+    "skill_list is always available. Finish thinking before calling any other tool.\n\n"
     "String parameters use raw text and string=\"true\". Numbers and booleans use JSON text and string=\"false\".\n\n"
     "Read defaults to a bounded chunk: path alone returns the first 500 lines, not the whole file. "
     "If read says more lines are available, call more with count=<lines> to read the next chunk; "
@@ -2693,6 +2701,43 @@ static void agent_dsml_feed(agent_dsml_parser *p, const char *s, size_t n) {
         else
             p->param_close_prefix = false;
     }
+}
+
+static bool agent_tool_phase_eligible_during_thinking(const char *name) {
+    return name && (!strcmp(name, "read") || !strcmp(name, "more") ||
+        !strcmp(name, "list") || !strcmp(name, "search") ||
+        !strcmp(name, "web_browse") || !strcmp(name, "web_fetch") ||
+        !strcmp(name, "skill_list"));
+}
+
+/* This is structural/phase validation only. Handler argument validation and
+ * worker policy authorization deliberately remain ordered dispatch concerns. */
+static bool agent_thinking_tool_block_validate(const agent_dsml_parser *p,
+                                                char *err, size_t err_len) {
+    if (!p || p->state == AGENT_DSML_ERROR) {
+        snprintf(err, err_len, "%s", p && p->error[0] ? p->error :
+                 "malformed DSML tool call");
+        return false;
+    }
+    if (p->state != AGENT_DSML_DONE) {
+        snprintf(err, err_len, "incomplete DSML tool call");
+        return false;
+    }
+    if (p->calls.len == 0) {
+        snprintf(err, err_len, "empty in-thinking tool call block");
+        return false;
+    }
+    for (int i = 0; i < p->calls.len; i++) {
+        const char *name = p->calls.v[i].name;
+        if (!agent_tool_phase_eligible_during_thinking(name)) {
+            snprintf(err, err_len,
+                     "tool %s is not allowed inside <think></think>",
+                     name && name[0] ? name : "<missing>");
+            return false;
+        }
+    }
+    if (err_len) err[0] = '\0';
+    return true;
 }
 
 /* ============================================================================
@@ -4271,6 +4316,44 @@ static void agent_tool_viz_finish(agent_stream_renderer *sr, const char *status)
     v->active = false;
 }
 
+static void agent_stream_render_rejected_thinking_block(
+    agent_stream_renderer *sr, const char *detail) {
+    if (!sr || sr->dsml_origin_rendered) return;
+    sr->dsml_origin_rendered = true;
+    if (!sr->renderer->last_output_newline)
+        renderer_plain(sr->renderer, "\n", 1);
+    renderer_color(sr->renderer, "\x1b[1;31m");
+    renderer_plain(sr->renderer, "[tool call rejected: ", 21);
+    renderer_plain(sr->renderer, detail && detail[0] ? detail :
+                   "invalid in-thinking tool block",
+                   strlen(detail && detail[0] ? detail :
+                          "invalid in-thinking tool block"));
+    renderer_plain(sr->renderer, "]\n", 2);
+    renderer_color(sr->renderer, "\x1b[0m");
+}
+
+/* In-thinking calls stay invisible until the complete block passes phase
+ * validation. Render from parsed calls afterward; never replay raw DSML. */
+static void agent_stream_render_validated_thinking_block(
+    agent_stream_renderer *sr) {
+    if (!sr || sr->dsml_origin_rendered) return;
+    sr->dsml_origin_rendered = true;
+    for (int i = 0; i < sr->parser->calls.len; i++) {
+        const agent_tool_call *call = &sr->parser->calls.v[i];
+        agent_tool_viz_start(sr);
+        agent_tool_viz_tool(sr, call->name ? call->name : "tool");
+        for (int j = 0; j < call->argc; j++) {
+            const agent_tool_arg *arg = &call->args[j];
+            agent_tool_viz_param_begin(sr, arg->name);
+            if (arg->value)
+                for (const char *p = arg->value; *p; p++)
+                    agent_tool_viz_param_raw_byte(sr, *p);
+            agent_tool_viz_param_end(sr);
+        }
+        agent_tool_viz_finish(sr, NULL);
+    }
+}
+
 static void agent_tool_viz_dump_invalid_dsml(agent_stream_renderer *sr) {
     agent_tool_visualizer *v = &sr->viz;
     if (!v->active) return;
@@ -4297,7 +4380,7 @@ static void agent_tool_viz_dump_invalid_dsml(agent_stream_renderer *sr) {
 static void agent_stream_finish_ignored_dsml(agent_stream_renderer *sr, const char *detail) {
     const char *msg =
         detail && detail[0] ? detail :
-        "tool calling is not allowed inside <think></think>";
+        "malformed DSML tool call inside <think></think>";
     sr->dsml_in_think = true;
     sr->dsml_in_think_reported = true;
     agent_trace(sr->renderer->worker, "dsml ignored inside thinking: %s", msg);
@@ -4353,7 +4436,8 @@ static void agent_stream_tool_events(agent_stream_renderer *sr) {
 }
 
 static void agent_stream_preflight_closed_param(agent_stream_renderer *sr) {
-    if (!sr || sr->replay || sr->dsml_ignored || sr->tool_preflight_error)
+    if (!sr || sr->replay || sr->dsml_ignored || sr->dsml_origin_in_think ||
+        sr->tool_preflight_error)
         return;
     agent_dsml_parser *p = sr->parser;
     agent_tool_visualizer *v = &sr->viz;
@@ -4376,9 +4460,10 @@ static void agent_stream_preflight_closed_param(agent_stream_renderer *sr) {
 }
 
 static void agent_stream_feed_dsml_byte(agent_stream_renderer *sr, char c) {
-    bool was_param = !sr->dsml_ignored && sr->viz.param_active;
+    bool defer_render = sr->dsml_origin_in_think;
+    bool was_param = !sr->dsml_ignored && !defer_render && sr->viz.param_active;
     agent_dsml_feed(sr->parser, &c, 1);
-    if (!sr->dsml_ignored) {
+    if (!sr->dsml_ignored && !defer_render) {
         agent_stream_tool_events(sr);
         if (was_param) agent_tool_viz_param_value_byte(sr, c);
         if (was_param && sr->parser->state != AGENT_DSML_PARAM_VALUE &&
@@ -4392,7 +4477,7 @@ static void agent_stream_feed_dsml_byte(agent_stream_renderer *sr, char c) {
         if (sr->dsml_ignored) {
             agent_stream_finish_ignored_dsml(
                 sr, "tool calling is not allowed inside <think></think>");
-        } else {
+        } else if (!defer_render) {
             agent_trace(sr->renderer->worker, "dsml done calls=%d",
                         sr->parser->calls.len);
             agent_tool_viz_finish(sr, NULL);
@@ -4402,6 +4487,10 @@ static void agent_stream_feed_dsml_byte(agent_stream_renderer *sr, char c) {
         if (sr->dsml_ignored) {
             agent_stream_finish_ignored_dsml(
                 sr, "malformed tool call inside <think></think>");
+        } else if (defer_render) {
+            agent_stream_render_rejected_thinking_block(
+                sr, sr->parser->error[0] ? sr->parser->error : "parse error");
+            sr->dsml_active = false;
         } else {
             char status[220];
             snprintf(status, sizeof(status), "[invalid tool call: %s]\n",
@@ -4418,28 +4507,32 @@ static void agent_stream_feed_dsml_byte(agent_stream_renderer *sr, char c) {
 /* Start a DSML block from the streaming detector.  The detector may accept a
  * known malformed opening form for robustness, but the parser is seeded with
  * canonical bytes so all later parsing remains strict. */
-static void agent_stream_start_dsml(agent_stream_renderer *sr, bool ignored) {
+static void agent_stream_start_dsml(agent_stream_renderer *sr, bool in_think) {
     sr->dsml_active = true;
-    sr->dsml_ignored = ignored;
-    if (ignored) sr->dsml_in_think = true;
+    sr->dsml_ignored = false;
+    sr->dsml_origin_in_think = in_think;
+    sr->dsml_origin_rendered = false;
     sr->dsml_start_len = 0;
     sr->post_think_gap = false;
     agent_trace(sr->renderer->worker, "dsml start detected%s",
-                ignored ? " inside thinking" : "");
+                in_think ? " inside thinking" : "");
     agent_dsml_start(sr->parser);
-    if (!ignored) {
+    if (!in_think) {
         agent_tool_viz_start(sr);
         agent_stream_tool_events(sr);
     }
 }
 
 static void agent_stream_note_plain_dsml_byte(agent_stream_renderer *sr, char c);
+static void agent_stream_note_thinking_dsml_byte(agent_stream_renderer *sr,
+                                                 char c);
 
 static void agent_stream_flush_start_tail(agent_stream_renderer *sr) {
     if (!sr->dsml_start_len) return;
     sr->post_think_gap = false;
     for (size_t i = 0; i < sr->dsml_start_len; i++) {
         renderer_write_char(sr->renderer, sr->dsml_start_tail[i]);
+        agent_stream_note_thinking_dsml_byte(sr, sr->dsml_start_tail[i]);
         agent_stream_note_plain_dsml_byte(sr, sr->dsml_start_tail[i]);
         if (sr->parser->state == AGENT_DSML_ERROR) break;
     }
@@ -4510,7 +4603,7 @@ static bool agent_dsml_marker_detector_feed(agent_dsml_marker_detector *d,
 
 static void agent_stream_note_thinking_dsml_byte(agent_stream_renderer *sr,
                                                  char c) {
-    if (!sr->in_think || sr->dsml_in_think) return;
+    if (!sr->in_think || sr->dsml_active || sr->dsml_in_think) return;
     if (agent_dsml_marker_detector_feed(&sr->think_dsml, c))
         sr->dsml_in_think = true;
 }
@@ -4532,7 +4625,6 @@ static void agent_stream_normal_byte(agent_stream_renderer *sr, char c) {
     static const char start[] = "<｜DSML｜tool_calls>";
     static const char canonical_invoke[] = "<｜DSML｜invoke";
     if (sr->parser->state == AGENT_DSML_ERROR) return;
-    agent_stream_note_thinking_dsml_byte(sr, c);
 
     /* DeepSeek usually emits one or more blank lines after </think> before
      * either prose or a DSML tool stanza.  At that point the bytes are just a
@@ -4592,6 +4684,7 @@ static void agent_stream_normal_byte(agent_stream_renderer *sr, char c) {
 
     sr->post_think_gap = false;
     renderer_write_char(sr->renderer, c);
+    agent_stream_note_thinking_dsml_byte(sr, c);
     agent_stream_note_plain_dsml_byte(sr, c);
 }
 
@@ -4672,7 +4765,15 @@ static void agent_stream_text(agent_stream_renderer *sr, const char *text, size_
         agent_stream_flush_start_tail(sr);
         sr->post_think_gap = false;
         if (sr->dsml_active) {
-            if (sr->dsml_ignored) {
+            if (sr->dsml_origin_in_think) {
+                char err[192];
+                if (agent_thinking_tool_block_validate(sr->parser,
+                                                       err, sizeof(err)))
+                    agent_stream_render_validated_thinking_block(sr);
+                else
+                    agent_stream_render_rejected_thinking_block(sr, err);
+                sr->dsml_active = false;
+            } else if (sr->dsml_ignored) {
                 agent_stream_finish_ignored_dsml(
                     sr, "tool calling is not allowed inside <think></think>");
             } else {
@@ -4684,7 +4785,7 @@ static void agent_stream_text(agent_stream_renderer *sr, const char *text, size_
         }
         if (sr->dsml_in_think && !sr->dsml_in_think_reported) {
             agent_stream_finish_ignored_dsml(
-                sr, "tool calling is not allowed inside <think></think>");
+                sr, "malformed DSML tool call inside <think></think>");
         }
     }
 }
@@ -11980,6 +12081,8 @@ static char *agent_tool_skill_list(agent_worker *w,
                                    const agent_tool_call *call);
 static char *agent_expand_skill_references(agent_worker *w, const char *text);
 static void agent_json_escape(agent_buf *out, const char *text);
+static void agent_json_escape_n(agent_buf *out, const char *text,
+                                size_t text_len);
 
 static void test_agent_tool_policy_parse(void) {
     ds4_agent_tool_policy pol;
@@ -12246,6 +12349,362 @@ static void test_agent_tool_policy_dispatch_enforcement(void) {
     pthread_mutex_destroy(&w.docker_shell.mu);
 }
 
+static char *test_agent_thinking_stream(const char *text, bool replay,
+                                        agent_dsml_parser *parser,
+                                        agent_stream_renderer *stream) {
+    agent_tail_capture *capture = xmalloc(sizeof(*capture));
+    memset(capture, 0, sizeof(*capture));
+    capture->cap = 16384;
+    agent_token_renderer *renderer = xmalloc(sizeof(*renderer));
+    memset(renderer, 0, sizeof(*renderer));
+    renderer->format_thinking = true;
+    renderer->in_think = true;
+    renderer->last_output_newline = true;
+    renderer->capture = capture;
+    memset(parser, 0, sizeof(*parser));
+    parser->state = AGENT_DSML_SEARCH;
+    memset(stream, 0, sizeof(*stream));
+    stream->renderer = renderer;
+    stream->parser = parser;
+    stream->in_think = true;
+    stream->replay = replay;
+    size_t split = strlen(text) > 13 ? 13 : strlen(text);
+    agent_stream_text(stream, text, split, false);
+    agent_stream_text(stream, text + split, strlen(text) - split, true);
+    size_t out_len = 0;
+    char *out = agent_tail_capture_take(capture, &out_len);
+    (void)out_len;
+    free(capture);
+    renderer->capture = NULL;
+    return out;
+}
+
+typedef struct {
+    agent_worker *worker;
+    bool path;
+    const char *requested_path;
+    const char *directory;
+    bool ok;
+    char err[160];
+} test_agent_thinking_approval_ctx;
+
+static void *test_agent_thinking_approval_thread(void *arg) {
+    test_agent_thinking_approval_ctx *ctx = arg;
+    if (ctx->path) {
+        ctx->ok = agent_request_working_directory(
+            ctx->worker, ctx->requested_path, ctx->directory,
+            ctx->err, sizeof(ctx->err));
+    } else {
+        ctx->ok = agent_web_confirm(ctx->worker, "Start test browser?",
+                                    ctx->err, sizeof(ctx->err)) != 0;
+    }
+    return NULL;
+}
+
+static void test_agent_wait_for_approval(agent_worker *worker, bool path) {
+    for (int i = 0; i < 1000; i++) {
+        pthread_mutex_lock(&worker->mu);
+        bool pending = path ? worker->path_approval_pending :
+                              worker->web_approval_pending;
+        pthread_mutex_unlock(&worker->mu);
+        if (pending) return;
+        usleep(1000);
+    }
+    AGENT_TEST_ASSERT(false);
+}
+
+static void test_agent_thinking_tool_access(void) {
+    static const char *eligible[] = {
+        "read", "more", "list", "search", "web_browse", "web_fetch",
+        "skill_list",
+    };
+    static const char *forbidden[] = {
+        "write", "edit", "mkdir", "bash", "bash_status", "bash_stop",
+        "ask_question", "subagent", "future_observer", NULL,
+    };
+    AGENT_TEST_ASSERT(strstr(agent_tools_prompt_intro,
+                             "Inside <think></think>, only read, more, list") != NULL);
+    AGENT_TEST_ASSERT(strstr(agent_tools_prompt_intro,
+                             "skill_list is always available") != NULL);
+    AGENT_TEST_ASSERT(strstr(agent_tools_prompt_intro,
+                             "Tool calls are not allowed inside") == NULL);
+    for (size_t i = 0; i < sizeof(eligible) / sizeof(eligible[0]); i++)
+        AGENT_TEST_ASSERT(agent_tool_phase_eligible_during_thinking(eligible[i]));
+    for (size_t i = 0; i < sizeof(forbidden) / sizeof(forbidden[0]); i++)
+        AGENT_TEST_ASSERT(!agent_tool_phase_eligible_during_thinking(forbidden[i]));
+
+    const char *allowed =
+        "<｜DSML｜tool_calls>"
+        "<｜DSML｜invoke name=\"read\">"
+        "<｜DSML｜parameter name=\"path\" string=\"true\">a.c</｜DSML｜parameter>"
+        "</｜DSML｜invoke>"
+        "<｜DSML｜invoke name=\"skill_list\"></｜DSML｜invoke>"
+        "</｜DSML｜tool_calls>";
+    agent_dsml_parser parser;
+    agent_stream_renderer stream;
+    char *out = test_agent_thinking_stream(allowed, false, &parser, &stream);
+    AGENT_TEST_ASSERT(parser.state == AGENT_DSML_DONE);
+    AGENT_TEST_ASSERT(stream.dsml_origin_in_think);
+    AGENT_TEST_ASSERT(parser.calls.len == 2);
+    char validation[192];
+    AGENT_TEST_ASSERT(agent_thinking_tool_block_validate(
+        &parser, validation, sizeof(validation)));
+    AGENT_TEST_ASSERT(strstr(out, "Reading a.c") != NULL);
+    AGENT_TEST_ASSERT(strstr(out, "skill_list") != NULL);
+    AGENT_TEST_ASSERT(strstr(out, "DSML") == NULL);
+    AGENT_TEST_ASSERT(strstr(out, "tool calling is not allowed") == NULL);
+    free(out);
+    free(stream.renderer);
+    agent_dsml_parser_free(&parser);
+
+    const char *mixed =
+        "<｜DSML｜tool_calls>"
+        "<｜DSML｜invoke name=\"read\"></｜DSML｜invoke>"
+        "<｜DSML｜invoke name=\"edit\">"
+        "<｜DSML｜parameter name=\"path\" string=\"true\">never-read.c</｜DSML｜parameter>"
+        "<｜DSML｜parameter name=\"old\" string=\"true\">old</｜DSML｜parameter>"
+        "</｜DSML｜invoke>"
+        "</｜DSML｜tool_calls>";
+    out = test_agent_thinking_stream(mixed, false, &parser, &stream);
+    AGENT_TEST_ASSERT(!agent_thinking_tool_block_validate(
+        &parser, validation, sizeof(validation)));
+    AGENT_TEST_ASSERT(strstr(validation, "edit is not allowed") != NULL);
+    AGENT_TEST_ASSERT(strstr(out, "tool call rejected") != NULL);
+    AGENT_TEST_ASSERT(strstr(out, "Reading") == NULL);
+    AGENT_TEST_ASSERT(strstr(out, "DSML") == NULL);
+    AGENT_TEST_ASSERT(!stream.tool_preflight_error);
+    free(out);
+    free(stream.renderer);
+    agent_dsml_parser_free(&parser);
+
+    const char *empty =
+        "<｜DSML｜tool_calls></｜DSML｜tool_calls>";
+    out = test_agent_thinking_stream(empty, false, &parser, &stream);
+    AGENT_TEST_ASSERT(!agent_thinking_tool_block_validate(
+        &parser, validation, sizeof(validation)));
+    AGENT_TEST_ASSERT(strstr(validation, "empty") != NULL);
+    AGENT_TEST_ASSERT(strstr(out, "tool call rejected") != NULL);
+    free(out);
+    free(stream.renderer);
+    agent_dsml_parser_free(&parser);
+
+    const char *incomplete =
+        "<｜DSML｜tool_calls><｜DSML｜invoke name=\"read\">";
+    out = test_agent_thinking_stream(incomplete, false, &parser, &stream);
+    AGENT_TEST_ASSERT(!agent_thinking_tool_block_validate(
+        &parser, validation, sizeof(validation)));
+    AGENT_TEST_ASSERT(strstr(validation, "incomplete") != NULL);
+    AGENT_TEST_ASSERT(strstr(out, "tool call rejected") != NULL);
+    free(out);
+    free(stream.renderer);
+    agent_dsml_parser_free(&parser);
+
+    /* Replay classifies/render calls but never dispatches forbidden work. */
+    out = test_agent_thinking_stream(mixed, true, &parser, &stream);
+    AGENT_TEST_ASSERT(strstr(out, "tool call rejected") != NULL);
+    AGENT_TEST_ASSERT(strstr(out, "Reading") == NULL);
+    free(out);
+    free(stream.renderer);
+    agent_dsml_parser_free(&parser);
+
+    /* Same block outside thinking keeps existing immediate semantic rendering. */
+    agent_tail_capture outside_capture = {.cap = 4096};
+    agent_token_renderer outside_renderer = {
+        .last_output_newline = true,
+        .capture = &outside_capture,
+    };
+    agent_dsml_parser outside_parser = {.state = AGENT_DSML_SEARCH};
+    agent_stream_renderer outside_stream = {
+        .renderer = &outside_renderer,
+        .parser = &outside_parser,
+    };
+    agent_stream_text(&outside_stream, allowed, strlen(allowed), true);
+    size_t outside_out_len = 0;
+    char *outside_out = agent_tail_capture_take(&outside_capture,
+                                                &outside_out_len);
+    (void)outside_out_len;
+    AGENT_TEST_ASSERT(outside_parser.state == AGENT_DSML_DONE);
+    AGENT_TEST_ASSERT(!outside_stream.dsml_origin_in_think);
+    AGENT_TEST_ASSERT(strstr(outside_out, "Reading a.c") != NULL);
+    free(outside_out);
+    agent_dsml_parser_free(&outside_parser);
+
+    agent_config cfg = {.non_interactive = true};
+    agent_worker worker;
+    test_agent_fake_worker_init(&worker, &cfg);
+    ds4_agent_tool_policy_set_none(&worker.tool_policy);
+    agent_tool_arg read_args[] = {
+        {.name = "path", .value = "missing", .is_string = true},
+    };
+    agent_tool_call calls_array[] = {
+        {.name = "read", .args = read_args, .argc = 1},
+        {.name = "skill_list"},
+    };
+    agent_tool_calls calls = {.v = calls_array, .len = 2, .cap = 2};
+    bool interrupted = false;
+    char *result = agent_execute_tool_calls_ordered(
+        &worker, &calls, true, &interrupted);
+    AGENT_TEST_ASSERT(!interrupted);
+    AGENT_TEST_ASSERT(strstr(result, "read is not allowed") != NULL);
+    AGENT_TEST_ASSERT(strstr(result, "Tool result 2 (skill_list)") != NULL);
+    AGENT_TEST_ASSERT(strstr(result, "\"total_count\":0") != NULL ||
+                      strstr(result, "\"total_count\": 0") != NULL);
+    free(result);
+
+    agent_tool_call web_call = {.name = "web_browse"};
+    result = agent_execute_tool_call(&worker, &web_call);
+    AGENT_TEST_ASSERT(strstr(result, "is not allowed") != NULL);
+    free(result);
+
+    char root_tmpl[] = "/tmp/ds4_agent_thinking_root_XXXXXX";
+    char outside_tmpl[] = "/tmp/ds4_agent_thinking_outside_XXXXXX";
+    char *root = mkdtemp(root_tmpl);
+    char *outside_root = mkdtemp(outside_tmpl);
+    AGENT_TEST_ASSERT(root != NULL && outside_root != NULL);
+    if (root && outside_root) {
+        agent_path_list_append(&worker.working_directories, root);
+        char outside_path[PATH_MAX];
+        snprintf(outside_path, sizeof(outside_path), "%s/evidence.txt",
+                 outside_root);
+        char write_err[128];
+        AGENT_TEST_ASSERT(agent_write_file_bytes(
+            outside_path, "outside\n", 8, write_err, sizeof(write_err)) == 0);
+        read_args[0].value = outside_path;
+        ds4_agent_tool_policy_parse("read", &worker.tool_policy);
+        result = agent_execute_tool_call(&worker, &calls_array[0]);
+        AGENT_TEST_ASSERT(strstr(result, "outside configured working directories") != NULL);
+        AGENT_TEST_ASSERT(worker.working_directories.len == 1);
+        free(result);
+        unlink(outside_path);
+        rmdir(outside_root);
+        rmdir(root);
+    }
+
+    pthread_mutex_lock(&worker.mu);
+    worker.interrupt = true;
+    pthread_mutex_unlock(&worker.mu);
+    result = agent_execute_tool_calls_ordered(
+        &worker, &calls, true, &interrupted);
+    AGENT_TEST_ASSERT(interrupted);
+    AGENT_TEST_ASSERT(strstr(result, "interrupted by user") != NULL);
+    AGENT_TEST_ASSERT(strstr(result, "Tool result 1") == NULL);
+    free(result);
+    worker_clear_interrupt(&worker);
+    agent_worker_free(&worker);
+
+    agent_config interactive_cfg = {0};
+    agent_worker approval_worker, sibling_worker;
+    test_agent_fake_worker_init(&approval_worker, &interactive_cfg);
+    test_agent_fake_worker_init(&sibling_worker, &interactive_cfg);
+    pthread_t approval_thread;
+    test_agent_thinking_approval_ctx approval = {
+        .worker = &approval_worker,
+    };
+
+    AGENT_TEST_ASSERT(pthread_create(&approval_thread, NULL,
+                                     test_agent_thinking_approval_thread,
+                                     &approval) == 0);
+    test_agent_wait_for_approval(&approval_worker, false);
+    char approval_message[256];
+    AGENT_TEST_ASSERT(worker_take_web_approval_request(
+        &approval_worker, approval_message, sizeof(approval_message)));
+    AGENT_TEST_ASSERT(!worker_take_web_approval_request(
+        &sibling_worker, approval_message, sizeof(approval_message)));
+    worker_answer_web_approval(&approval_worker, false, "web denied for test");
+    pthread_join(approval_thread, NULL);
+    AGENT_TEST_ASSERT(!approval.ok);
+    AGENT_TEST_ASSERT(strstr(approval.err, "web denied") != NULL);
+
+    memset(&approval, 0, sizeof(approval));
+    approval.worker = &approval_worker;
+    AGENT_TEST_ASSERT(pthread_create(&approval_thread, NULL,
+                                     test_agent_thinking_approval_thread,
+                                     &approval) == 0);
+    test_agent_wait_for_approval(&approval_worker, false);
+    pthread_mutex_lock(&approval_worker.mu);
+    approval_worker.interrupt = true;
+    pthread_cond_broadcast(&approval_worker.cond);
+    pthread_mutex_unlock(&approval_worker.mu);
+    pthread_join(approval_thread, NULL);
+    AGENT_TEST_ASSERT(!approval.ok);
+    AGENT_TEST_ASSERT(!strcmp(approval.err, "interrupted"));
+    worker_clear_interrupt(&approval_worker);
+
+    char approved_tmpl[] = "/tmp/ds4_agent_thinking_approved_XXXXXX";
+    char denied_tmpl[] = "/tmp/ds4_agent_thinking_denied_XXXXXX";
+    char *approved_dir = mkdtemp(approved_tmpl);
+    char *denied_dir = mkdtemp(denied_tmpl);
+    AGENT_TEST_ASSERT(approved_dir != NULL && denied_dir != NULL);
+    if (approved_dir && denied_dir) {
+        memset(&approval, 0, sizeof(approval));
+        approval.worker = &approval_worker;
+        approval.path = true;
+        approval.requested_path = "/tmp/requested-evidence.txt";
+        approval.directory = approved_dir;
+        AGENT_TEST_ASSERT(pthread_create(&approval_thread, NULL,
+                                         test_agent_thinking_approval_thread,
+                                         &approval) == 0);
+        test_agent_wait_for_approval(&approval_worker, true);
+        char path_message[PATH_MAX + 256];
+        char options[3][PATH_MAX];
+        int option_count = 0;
+        AGENT_TEST_ASSERT(worker_take_path_approval_request(
+            &approval_worker, path_message, sizeof(path_message),
+            options, &option_count));
+        AGENT_TEST_ASSERT(option_count > 0);
+        AGENT_TEST_ASSERT(!worker_take_path_approval_request(
+            &sibling_worker, path_message, sizeof(path_message),
+            options, &option_count));
+        worker_answer_path_approval(&approval_worker, true, approved_dir, NULL);
+        pthread_join(approval_thread, NULL);
+        AGENT_TEST_ASSERT(approval.ok);
+        AGENT_TEST_ASSERT(agent_path_list_contains(
+            &approval_worker.working_directories, approved_dir));
+        AGENT_TEST_ASSERT(!agent_path_list_contains(
+            &sibling_worker.working_directories, approved_dir));
+
+        int roots_before = approval_worker.working_directories.len;
+        memset(&approval, 0, sizeof(approval));
+        approval.worker = &approval_worker;
+        approval.path = true;
+        approval.requested_path = "/tmp/denied-evidence.txt";
+        approval.directory = denied_dir;
+        AGENT_TEST_ASSERT(pthread_create(&approval_thread, NULL,
+                                         test_agent_thinking_approval_thread,
+                                         &approval) == 0);
+        test_agent_wait_for_approval(&approval_worker, true);
+        worker_answer_path_approval(&approval_worker, false, NULL,
+                                    "path denied for test");
+        pthread_join(approval_thread, NULL);
+        AGENT_TEST_ASSERT(!approval.ok);
+        AGENT_TEST_ASSERT(strstr(approval.err, "path denied") != NULL);
+        AGENT_TEST_ASSERT(approval_worker.working_directories.len == roots_before);
+
+        memset(&approval, 0, sizeof(approval));
+        approval.worker = &approval_worker;
+        approval.path = true;
+        approval.requested_path = "/tmp/interrupted-evidence.txt";
+        approval.directory = denied_dir;
+        AGENT_TEST_ASSERT(pthread_create(&approval_thread, NULL,
+                                         test_agent_thinking_approval_thread,
+                                         &approval) == 0);
+        test_agent_wait_for_approval(&approval_worker, true);
+        pthread_mutex_lock(&approval_worker.mu);
+        approval_worker.interrupt = true;
+        pthread_cond_broadcast(&approval_worker.cond);
+        pthread_mutex_unlock(&approval_worker.mu);
+        pthread_join(approval_thread, NULL);
+        AGENT_TEST_ASSERT(!approval.ok);
+        AGENT_TEST_ASSERT(!strcmp(approval.err, "interrupted"));
+        AGENT_TEST_ASSERT(approval_worker.working_directories.len == roots_before);
+        worker_clear_interrupt(&approval_worker);
+        rmdir(denied_dir);
+        rmdir(approved_dir);
+    }
+    agent_worker_free(&sibling_worker);
+    agent_worker_free(&approval_worker);
+}
+
 static void test_agent_fake_worker_init(agent_worker *w, agent_config *cfg);
 
 typedef struct {
@@ -12458,7 +12917,7 @@ static void test_agent_skills(void) {
     agent_buf escaped_controls = {0};
     char controls[0x20];
     for (size_t i = 0; i < sizeof(controls); i++) controls[i] = (char)i;
-    agent_json_escape(&escaped_controls, (const char *) controls);
+    agent_json_escape_n(&escaped_controls, controls, sizeof(controls));
     char *escaped_control_text = agent_buf_take(&escaped_controls);
     AGENT_TEST_ASSERT(strstr(escaped_control_text, "\\u0000") != NULL);
     AGENT_TEST_ASSERT(strstr(escaped_control_text, "\\u0001") != NULL);
@@ -12827,6 +13286,7 @@ static void ds4_agent_unit_tests_run(void) {
     test_agent_tool_policy_session_mutation();
     test_agent_tool_policy_subagent_persistence();
     test_agent_tool_policy_dispatch_enforcement();
+    test_agent_thinking_tool_access();
     test_agent_ask_question_stream_preview();
     test_agent_ask_question_interactive_flow();
     test_agent_ask_question_prompt_options();
@@ -14882,12 +15342,10 @@ static char *agent_tool_ask_question(agent_worker *w,
 }
 
 /* --- skill_list tool handler --- */
-static void agent_json_escape(agent_buf *out, const char *text) {
-    if (!text) return;
-    size_t text_len = strlen(text);
-    if (!text_len) return;
+static void agent_json_escape_n(agent_buf *out, const char *text,
+                                size_t text_len) {
     static const char hex[] = "0123456789abcdef";
-    if (!out || !text) return;
+    if (!out || !text || !text_len) return;
     for (size_t i = 0; i < text_len; i++) {
         unsigned char c = text[i];
         switch (c) {
@@ -14910,6 +15368,11 @@ static void agent_json_escape(agent_buf *out, const char *text) {
             break;
         }
     }
+}
+
+static void agent_json_escape(agent_buf *out, const char *text) {
+    if (!text) return;
+    agent_json_escape_n(out, text, strlen(text));
 }
 
 static char *agent_tool_skill_list(agent_worker *w,
@@ -15079,9 +15542,19 @@ static char *agent_execute_tool_call(agent_worker *w, const agent_tool_call *cal
 
 /* Execute all tool calls from one DSML block, preserving per-call labels in the
  * combined result so the model can associate observations with calls. */
-static char *agent_execute_tool_calls(agent_worker *w, const agent_tool_calls *calls) {
+static char *agent_execute_tool_calls_ordered(agent_worker *w,
+                                              const agent_tool_calls *calls,
+                                              bool stop_on_interrupt,
+                                              bool *interrupted) {
     agent_buf all = {0};
+    if (interrupted) *interrupted = false;
     for (int i = 0; i < calls->len; i++) {
+        if (stop_on_interrupt && worker_should_interrupt(w)) {
+            agent_buf_puts(&all,
+                "Tool result interrupted:\nTool error: interrupted by user\n");
+            if (interrupted) *interrupted = true;
+            break;
+        }
         char *res = agent_execute_tool_call(w, &calls->v[i]);
         char hdr[128];
         snprintf(hdr, sizeof(hdr), "Tool result %d (%s):\n", i + 1,
@@ -15090,9 +15563,20 @@ static char *agent_execute_tool_calls(agent_worker *w, const agent_tool_calls *c
         agent_buf_puts(&all, res);
         if (res[0] && res[strlen(res) - 1] != '\n') agent_buf_puts(&all, "\n");
         free(res);
+        if (stop_on_interrupt && worker_should_interrupt(w)) {
+            agent_buf_puts(&all,
+                "Tool result interrupted:\nTool error: interrupted by user\n");
+            if (interrupted) *interrupted = true;
+            break;
+        }
     }
     if (calls->len == 0) agent_buf_puts(&all, "Tool error: empty tool call block\n");
     return agent_buf_take(&all);
+}
+
+static char *agent_execute_tool_calls(agent_worker *w,
+                                      const agent_tool_calls *calls) {
+    return agent_execute_tool_calls_ordered(w, calls, false, NULL);
 }
 
 /* If compaction happens while a bash process is still alive, inject a small
@@ -15731,6 +16215,7 @@ static int worker_run_turn(agent_worker *w, const char *user_text) {
         bool got_tool = false;
         bool malformed_tool = false;
         bool early_tool_error = false;
+        bool tool_execution_interrupted = false;
         int generated = 0;
         double t0 = now_sec();
 
@@ -15754,7 +16239,8 @@ static int worker_run_turn(agent_worker *w, const char *user_text) {
 
             size_t text_len = 0;
             char *text = ds4_token_text(w->engine, token, &text_len);
-            if (agent_edit_upto_forcer_should_replace(w, &upto_forcer, &dsml,
+            if (!stream.dsml_origin_in_think &&
+                agent_edit_upto_forcer_should_replace(w, &upto_forcer, &dsml,
                                                        text, text_len))
             {
                 agent_trace(w, "edit old auto-upto replaced token=%d text=%.*s",
@@ -15817,12 +16303,19 @@ static int worker_run_turn(agent_worker *w, const char *user_text) {
             agent_set_status(w, AGENT_WORKER_IDLE);
             return 0;
         }
+        bool in_thinking_block = stream.dsml_origin_in_think;
         if (stream.dsml_in_think) {
             got_tool = false;
             malformed_tool = true;
             early_tool_error = false;
             snprintf(dsml.error, sizeof(dsml.error),
-                     "tool calling is not allowed inside <think></think>");
+                     "malformed DSML tool call inside <think></think>");
+        } else if (got_tool && in_thinking_block &&
+                   !agent_thinking_tool_block_validate(
+                       &dsml, dsml.error, sizeof(dsml.error))) {
+            got_tool = false;
+            malformed_tool = true;
+            early_tool_error = false;
         } else if (!malformed_tool && dsml.state == AGENT_DSML_ERROR) {
             malformed_tool = true;
         } else if (!got_tool && !malformed_tool && !early_tool_error &&
@@ -15864,6 +16357,10 @@ static int worker_run_turn(agent_worker *w, const char *user_text) {
             agent_buf_puts(&b, "\n");
             agent_buf_puts(&b, agent_dsml_syntax_reminder);
             tool_result = agent_buf_take(&b);
+        } else if (in_thinking_block) {
+            tool_result = agent_execute_tool_calls_ordered(
+                w, &dsml.calls, true, &tool_execution_interrupted);
+            if (tool_execution_interrupted) worker_clear_interrupt(w);
         } else {
             tool_result = agent_execute_tool_calls(w, &dsml.calls);
         }
@@ -15911,6 +16408,16 @@ static int worker_run_turn(agent_worker *w, const char *user_text) {
         ds4_chat_append_message(w->engine, &w->transcript, "tool", tool_result);
         free(tool_result);
         agent_dsml_parser_free(&dsml);
+
+        if (tool_execution_interrupted) {
+            agent_publish_system_status(w, "Stopped by user");
+            pthread_mutex_lock(&w->mu);
+            snprintf(w->autonomy_stop_reason, sizeof(w->autonomy_stop_reason),
+                     "interrupted");
+            pthread_mutex_unlock(&w->mu);
+            agent_set_status(w, AGENT_WORKER_IDLE);
+            return 0;
+        }
 
         char *queued_user = worker_request_queued_user_drain(w);
         if (queued_user && queued_user[0]) {
