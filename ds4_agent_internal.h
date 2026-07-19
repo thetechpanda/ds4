@@ -430,6 +430,17 @@ bool agent_skill_name_valid(const char *name);
 int agent_skill_parse_file(const char *path, char *name_out, size_t name_size,
                            char *desc_out, size_t desc_size);
 
+/* Shared think-mode icon mapping for footer badges and subagent status.
+ * Returns "🚫" for DS4_THINK_NONE, "🧠" for DS4_THINK_HIGH, "⚡️" for DS4_THINK_MAX. */
+static inline const char *agent_think_mode_icon(ds4_think_mode mode) {
+    switch (mode) {
+    case DS4_THINK_NONE: return "\xf0\x9f\x9a\xab";      /* 🚫 */
+    case DS4_THINK_HIGH: return "\xf0\x9f\xa7\xa0";      /* 🧠 */
+    case DS4_THINK_MAX:  return "\xe2\x9a\xa1\xef\xb8\x8f"; /* ⚡️ + VS16 */
+    default:             return ds4_think_mode_name(mode);
+    }
+}
+
 #ifdef DS4_AGENT_TEST
 extern int agent_test_failures;
 void agent_test_assert(bool cond, const char *expr,

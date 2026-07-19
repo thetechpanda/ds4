@@ -55,14 +55,7 @@ static const char *ds4_agent_subagent_autonomy_name(ds4_agent_subagent_autonomy 
     }
 }
 
-static const char *ds4_agent_subagent_think_mode_name(ds4_think_mode mode) {
-    switch (mode) {
-    case DS4_THINK_NONE: return "off";
-    case DS4_THINK_HIGH: return "def";
-    case DS4_THINK_MAX: return "max";
-    default: return ds4_think_mode_name(mode);
-    }
-}
+/* Replaced by shared agent_think_mode_icon() in ds4_agent_internal.h */
 
 static bool ds4_agent_subagent_parse_think_mode(const char *text,
                                                ds4_think_mode *out) {
@@ -681,20 +674,32 @@ int ds4_agent_subagent_list(ds4_agent_subagents *mgr,
         snprintf(out[i].stop_reason, sizeof(out[i].stop_reason), "%s",
                  slot->stop_reason[0] ? slot->stop_reason :
                  (slot->has_worker ? slot->worker.autonomy_stop_reason : ""));
-        /* Format tool_permissions in RWBX format: R=read, W=write, B=browse, X=bash.
-         * Replicate the logic from worker_update_status_tool_policy_locked in ds4_agent.c. */
-        const ds4_agent_tool_policy *pol = &slot->tool_policy;
-        bool none = !pol || pol->allow_none;
-        bool all = pol && pol->allow_all;
-        out[i].tool_permissions[0] = none ? '-' : (all ? 'R' :
-            ds4_agent_tool_policy_allows(pol, "read")   ? 'R' : '-');
-        out[i].tool_permissions[1] = none ? '-' : (all ? 'W' :
-            ds4_agent_tool_policy_allows(pol, "write")  ? 'W' : '-');
-        out[i].tool_permissions[2] = none ? '-' : (all ? 'B' :
-            ds4_agent_tool_policy_allows(pol, "web_browse") ? 'B' : '-');
-        out[i].tool_permissions[3] = none ? '-' : (all ? 'X' :
-            ds4_agent_tool_policy_allows(pol, "bash")   ? 'X' : '-');
-        out[i].tool_permissions[4] = '\0';
+        /* Worker metrics for footer display */
+        out[i].prefill_done   = st.prefill_done;
+        out[i].prefill_total  = st.prefill_total;
+        out[i].prefill_tps    = st.prefill_tps;
+        out[i].gen_tps        = st.gen_tps;
+        /* Use current worker tool_permissions (updated by /allow, /disallow)
+         * when the worker is active.  Without a worker, fall back to the
+         * slot's creation-time tool_policy so a configured policy is still
+         * visible before the worker starts. */
+        if (slot->has_worker) {
+            memcpy(out[i].tool_permissions, st.tool_permissions,
+                   sizeof(st.tool_permissions));
+        } else {
+            const ds4_agent_tool_policy *pol = &slot->tool_policy;
+            bool none = pol->allow_none;
+            bool all  = pol->allow_all;
+            out[i].tool_permissions[0] = none ? '-' : (all ? 'R' :
+                ds4_agent_tool_policy_allows(pol, "read")       ? 'R' : '-');
+            out[i].tool_permissions[1] = none ? '-' : (all ? 'W' :
+                ds4_agent_tool_policy_allows(pol, "write")      ? 'W' : '-');
+            out[i].tool_permissions[2] = none ? '-' : (all ? 'B' :
+                ds4_agent_tool_policy_allows(pol, "web_browse") ? 'B' : '-');
+            out[i].tool_permissions[3] = none ? '-' : (all ? 'X' :
+                ds4_agent_tool_policy_allows(pol, "bash")       ? 'X' : '-');
+            out[i].tool_permissions[4] = '\0';
+        }
     }
     return 0;
 }
@@ -1038,7 +1043,7 @@ static void ds4_agent_subagent_print_list(ds4_agent_subagents *mgr) {
             items[i].report_available ? " report" : "");
         ds4_agent_subagents_active_printf(
             mgr, " thinking %s",
-            ds4_agent_subagent_think_mode_name(items[i].think_mode));
+            agent_think_mode_icon(items[i].think_mode));
         if (items[i].budget_limit > 0)
             ds4_agent_subagents_active_printf(
                 mgr, " budget %d/%d",

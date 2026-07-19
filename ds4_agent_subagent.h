@@ -78,6 +78,11 @@ typedef struct {
     bool report_available;
     char stop_reason[DS4_AGENT_SUBAGENT_TEXT_MAX];
     char tool_permissions[5];
+    /* Worker metrics for footer display */
+    int prefill_done;
+    int prefill_total;
+    double prefill_tps;
+    double gen_tps;
 } ds4_agent_subagent_status;
 
 typedef struct {
