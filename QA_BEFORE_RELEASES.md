@@ -210,6 +210,15 @@ The agent is the most stateful component.  Test it manually, not only by build.
 - Bash tools:
   test short output, large output truncation, non-zero exit output, long-running
   jobs, `bash_status`, and `bash_stop`.
+- Working-directory jail:
+  launch with one and then multiple `--workspace` roots. Verify read,
+  write, edit, list, search, and more check all roots, reject unapproved `..`,
+  absolute outside paths, and symlink escapes, and ask before adding a new root
+  with numbered exact/parent/grandparent choices and a visible 30-second
+  countdown. Verify bash starts in the first workspace, and on macOS cannot read
+  outside configured/approved roots. Verify the prompt shows the first workspace
+  and `/workspace`, `/workspace +/path`, and `/workspace -/path` list, add, and
+  remove roots while preserving root order.
 - Web tools:
   `google_search` and `visit_page` should ask for visible Chrome approval with
   timeout, open pages without stealing focus when possible, extract Markdown,

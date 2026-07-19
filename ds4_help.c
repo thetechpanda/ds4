@@ -278,9 +278,20 @@ static void print_agent_specific(FILE *fp, const help_colors *c) {
     title(fp, c, "Agent Options");
     opt(fp, c, "-p, --prompt TEXT", "Submit an initial prompt after startup.");
     opt(fp, c, "--non-interactive", "Run without TUI. With -p: one turn; without -p: repeated stdin prompts.");
+    opt(fp, c, "--no-strict-sandbox", "Allow tools to run without a selected Docker sandbox (default is strict).");
     opt(fp, c, "-sys, --system TEXT", "Extra system prompt. Empty disables extra text.");
     opt(fp, c, "--trace FILE", "Write prompt, token, and DSML debug trace.");
+    opt(fp, c, "--recover SHA", "Load a saved session by SHA prefix at startup.");
     opt(fp, c, "--chdir DIR", "Change working directory before loading runtime assets.");
+    opt(fp, c, "--docker-command PATH", "Use this Docker executable instead of resolving docker from PATH.");
+    opt(fp, c, "--no-docker-auto", "Disables automatic selection of the first tagged Docker sandbox at startup if --docker-container is not defined.");
+    opt(fp, c, "--docker-container NAME", "Run bash tools in an existing Docker container.");
+    opt(fp, c, "--workspace DIR", "Add a jailed workspace root. Repeatable; defaults to the launch directory.");
+    opt(fp, c, "--skill-dir DIR", "Add a directory of skill .md files. Repeatable; files are scanned at startup.");
+    opt(fp, c, "--temp-directory DIR", "Temporary file directory (default: /tmp).");
+    opt(fp, c, "--web-cdp-host HOST", "Use an existing Chrome DevTools Protocol host instead of starting Chrome.");
+    opt(fp, c, "--web-cdp-port N", "Use an existing Chrome DevTools Protocol port instead of starting Chrome.");
+    opt(fp, c, "--tools POLICY", "Default tool-access policy at boot. Accepts: all, none, or comma-separated tool names (read, write, web, bash). Default: none.");
     fputc('\n', fp);
 }
 
@@ -294,6 +305,13 @@ static void print_agent_sessions(FILE *fp, const help_colors *c) {
     opt(fp, c, "/strip ID", "Remove KV payload; the text history can be rebuilt later.");
     opt(fp, c, "/history [N]", "Show N recent user turns from the current session.");
     opt(fp, c, "/power N", "Set GPU duty cycle percentage, 1..100.");
+    opt(fp, c, "/thinking off|default|max", "Set thinking effort level.");
+    opt(fp, c, "/docker create IMAGE NAME COMMAND", "Create and switch to a tagged Docker sandbox.");
+    opt(fp, c, "/docker list", "List Docker containers tagged ds4:sandbox.");
+    opt(fp, c, "/workspace [+-DIR]", "List workspace roots; +DIR adds, -DIR removes. The first root is active.");
+    opt(fp, c, "/skills add <path>", "Register a skill file or directory at runtime.");
+    opt(fp, c, "/skills list", "List all registered skills with name, description, and path.");
+    opt(fp, c, "/skills del <name>", "Remove a registered skill by name.");
     opt(fp, c, "/new", "Start a fresh session from the system prompt.");
     opt(fp, c, "/quit, /exit", "Exit.");
     fputc('\n', fp);

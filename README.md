@@ -532,11 +532,27 @@ stripped session rebuilds the KV cache by prefilling the saved text.
 
 Use `--chdir /path/to/ds4` when launching `ds4-agent` from another directory,
 so relative runtime files such as `metal/*.metal` resolve from the project tree.
+Use `--workspace /path/to/workspace` to add a workspace root for local
+file tools. If you do not pass it, the initial workspace root is the directory
+where `ds4-agent` was launched from. The option is repeatable; path checks are
+made against every configured root. Relative tool paths resolve from the first
+root, and bash commands start there. If an interactive tool call targets
+another directory, ds4-agent asks before adding another root, offering the
+exact target directory, its parent, or the next parent up, plus deny. If no
+answer arrives in 30 seconds, it selects the exact target directory. When a
+Docker sandbox is selected, bash tools run through that container. With strict
+sandboxing enabled by default, tool calls are rejected unless a Docker sandbox
+is currently selected; pass `--no-strict-sandbox` to allow tools without one.
+File tools are still jailed by canonical path checks. The prompt shows the first
+workspace root. Use `/workspace` to list roots, `/workspace +/path/to` to add a
+root, and `/workspace -/path/to` to remove one.
 
 However while the system already works, there is a lot of work to do
 in order to make it ready for prime time. When finally the agent will reach
 the wanted shape, we will *likely* split the server and the client creating a stateful
 session-based protocol that can recreate all that in a client-server way.
+
+Dedicated documentation is available [here](DS4_AGENT.md).
 
 ## Benchmarking
 
