@@ -5589,6 +5589,13 @@ static void agent_worker_model_gate_lock(agent_worker *w,
 
     pthread_mutex_lock(w->model_gate);
 
+    /* Publish this worker's session id as the engine owner while the gate
+     * is held.  The manager samples this id for footer snapshots.
+     * The model_gate mutex provides full ordering; a volatile store
+     * suffices for the single-word write. */
+    if (w->engine_owner_ptr)
+        *w->engine_owner_ptr = w->session_slot_id;
+
     pthread_mutex_lock(&w->mu);
     if (w->status.state == AGENT_WORKER_WAITING_MODEL)
         w->status.state = resume_state;
@@ -5597,7 +5604,13 @@ static void agent_worker_model_gate_lock(agent_worker *w,
 }
 
 static void agent_worker_model_gate_unlock(agent_worker *w) {
-    if (w && w->model_gate) pthread_mutex_unlock(w->model_gate);
+    if (!w || !w->model_gate) return;
+    /* Clear engine owner before releasing the gate so the next gate
+     * acquirer publishes its own id.  A brief window with no owner is
+     * allowed; the next footer snapshot will observe the new owner. */
+    if (w->engine_owner_ptr)
+        *w->engine_owner_ptr = 0;
+    pthread_mutex_unlock(w->model_gate);
 }
 
 static int agent_worker_session_sync(agent_worker *w,
@@ -10202,7 +10215,7 @@ static void test_badge_set_item(ds4_agent_subagent_status *item, uint64_t id,
                                  bool approval_blocked, bool queued_output,
                                  int prefill_done, int prefill_total,
                                  double prefill_tps, double gen_tps,
-                                 const char *perms) {
+                                 const char *perms, bool engine_owner) {
     memset(item, 0, sizeof(*item));
     item->id.value = id;
     snprintf(item->name, sizeof(item->name), "%s", name);
@@ -10214,6 +10227,7 @@ static void test_badge_set_item(ds4_agent_subagent_status *item, uint64_t id,
     item->prefill_total = prefill_total;
     item->prefill_tps = prefill_tps;
     item->gen_tps = gen_tps;
+    item->engine_owner = engine_owner;
     if (perms)
         snprintf(item->tool_permissions, sizeof(item->tool_permissions), "%s", perms);
     else
@@ -10266,11 +10280,10 @@ static void test_agent_footer_policy_change_reflects(void) {
     ds4_agent_subagent_status items[2];
     test_badge_set_item(&items[0], 1, "main", true,
                         DS4_AGENT_SUBAGENT_STATE_RUNNING,
-                        false, false, 0, 0, 0.0, 0.0, "RWBX");
+                        false, false, 0, 0, 0.0, 0.0, "RWBX", true);
     test_badge_set_item(&items[1], 2, "sub1", false,
                         DS4_AGENT_SUBAGENT_STATE_RUNNING,
-                        false, false, 0, 0, 0.0, 0.0, "RW-X");
-
+                        false, false, 0, 0, 0.0, 0.0, "RW-X", false);
     char v1[256], s1[256];
     agent_format_badge(&items[0], v1, sizeof(v1), s1, sizeof(s1));
     AGENT_TEST_ASSERT(strstr(v1, "RWBX") != NULL);
@@ -10292,25 +10305,25 @@ static void test_agent_footer_policy_change_reflects(void) {
  * active approval, background attention, and main error states. */
 static void test_agent_footer_attention_focus_matrix(void) {
     ds4_agent_subagent_status items[5];
-    /* Active, no attention flags → ▶ */
+    /* Engine-owner, no attention flags → ▶ */
     test_badge_set_item(&items[0], 1, "main", true,
                         DS4_AGENT_SUBAGENT_STATE_RUNNING,
-                        false, false, 0, 0, 0.0, 0.0, "RWBX");
+                        false, false, 0, 0, 0.0, 0.0, "RWBX", true);
     /* Active with error → ! with magenta brackets */
     test_badge_set_item(&items[2], 3, "active_err", true,
                         DS4_AGENT_SUBAGENT_STATE_ERROR,
-                        false, false, 0, 0, 0.0, 0.0, "RWBX");
+                        false, false, 0, 0, 0.0, 0.0, "RWBX", false);
     /* Active with approval blocked → ! with magenta brackets */
     test_badge_set_item(&items[3], 4, "active_appr", true,
                         DS4_AGENT_SUBAGENT_STATE_RUNNING,
-                        true, false, 0, 0, 0.0, 0.0, "RWBX");
+                        true, false, 0, 0, 0.0, 0.0, "RWBX", false);
     /* Background with error → ! without brackets (background) */
     test_badge_set_item(&items[4], 5, "bg_err", false,
                         DS4_AGENT_SUBAGENT_STATE_ERROR,
-                        false, false, 0, 0, 0.0, 0.0, "RWBX");
+                        false, false, 0, 0, 0.0, 0.0, "RWBX", false);
 
     char v[256], s[256];
-    /* Item 0: active no attention → ▶ with magenta brackets */
+    /* Item 0: engine-owner no attention → ▶ with magenta brackets */
     agent_format_badge(&items[0], v, sizeof(v), s, sizeof(s));
     AGENT_TEST_ASSERT(strstr(v, "▶") != NULL);
     AGENT_TEST_ASSERT(strstr(s, "\x1b[35m[") != NULL);  /* magenta brackets */
@@ -10368,21 +10381,21 @@ static void test_agent_footer_wrapping_oversized(void) {
  * and final-field permissions. */
 static void test_agent_footer_grammar_assertions(void) {
     ds4_agent_subagent_status items[2];
-    /* Active agent with prefill metrics */
+    /* Engine-owner agent with prefill metrics */
     test_badge_set_item(&items[0], 1, "main", true,
                         DS4_AGENT_SUBAGENT_STATE_RUNNING,
-                        false, false, 452, 1000, 128.5, 0.0, "RWBX");
-    /* Background agent (no active, no attention) */
+                        false, false, 452, 1000, 128.5, 0.0, "RWBX", true);
+    /* Background agent (no engine-owner, no attention) */
     test_badge_set_item(&items[1], 2, "bg_agent", false,
                         DS4_AGENT_SUBAGENT_STATE_RUNNING,
-                        false, false, 0, 0, 0.0, 0.0, "RW-X");
+                        false, false, 0, 0, 0.0, 0.0, "RW-X", false);
 
     char v[256], s[256];
 
     /* Item 0: active, prefill active */
     agent_format_badge(&items[0], v, sizeof(v), s, sizeof(s));
     AGENT_TEST_ASSERT(strstr(v, "1:main") != NULL);          /* <id>:<name> */
-    AGENT_TEST_ASSERT(strstr(v, "▶") != NULL);               /* active indicator */
+    AGENT_TEST_ASSERT(strstr(v, "▶") != NULL);               /* engine-owner indicator */
     AGENT_TEST_ASSERT(strstr(v, "pp") != NULL);              /* prefill field */
     AGENT_TEST_ASSERT(strstr(v, "pp  45.2%  128 t/s") != NULL); /* fixed-width metrics */
     AGENT_TEST_ASSERT(strstr(v, "RWBX") != NULL);            /* permissions final field */
@@ -10411,15 +10424,15 @@ static void test_agent_footer_think_mode_icons(void) {
     ds4_agent_subagent_status items[3];
     test_badge_set_item(&items[0], 1, "main", true,
                         DS4_AGENT_SUBAGENT_STATE_RUNNING,
-                        false, false, 0, 0, 0.0, 0.0, "RWBX");
+                        false, false, 0, 0, 0.0, 0.0, "RWBX", true);
     items[0].think_mode = DS4_THINK_NONE;
     test_badge_set_item(&items[1], 2, "sub1", false,
                         DS4_AGENT_SUBAGENT_STATE_RUNNING,
-                        false, false, 0, 0, 0.0, 0.0, "RWBX");
+                        false, false, 0, 0, 0.0, 0.0, "RWBX", false);
     items[1].think_mode = DS4_THINK_HIGH;
     test_badge_set_item(&items[2], 3, "sub2", false,
                         DS4_AGENT_SUBAGENT_STATE_RUNNING,
-                        false, false, 0, 0, 0.0, 0.0, "RWBX");
+                        false, false, 0, 0, 0.0, 0.0, "RWBX", false);
     items[2].think_mode = DS4_THINK_MAX;
 
     char v[256], s[256];
@@ -10441,22 +10454,22 @@ static void test_agent_footer_think_mode_icons(void) {
  * badges contain only the neutral activity placeholder. */
 static void test_agent_footer_mutually_exclusive_activity(void) {
     ds4_agent_subagent_status items[4];
-    /* Prefill active */
+    /* Prefill engine-owner */
     test_badge_set_item(&items[0], 1, "prefill", true,
                         DS4_AGENT_SUBAGENT_STATE_RUNNING,
-                        false, false, 452, 1000, 128.5, 0.0, "RWBX");
-    /* Generation active */
+                        false, false, 452, 1000, 128.5, 0.0, "RWBX", true);
+    /* Generation active (non-owner) */
     test_badge_set_item(&items[1], 2, "generation", false,
                         DS4_AGENT_SUBAGENT_STATE_RUNNING,
-                        false, false, 0, 0, 0.0, 24.5, "RWBX");
+                        false, false, 0, 0, 0.0, 24.5, "RWBX", false);
     /* Inactive/background with no live metrics */
     test_badge_set_item(&items[2], 3, "idle", false,
                         DS4_AGENT_SUBAGENT_STATE_WAITING_MODEL,
-                        false, false, 0, 0, 0.0, 0.0, "RWBX");
+                        false, false, 0, 0, 0.0, 0.0, "RWBX", false);
     /* Error state */
     test_badge_set_item(&items[3], 4, "error", false,
                         DS4_AGENT_SUBAGENT_STATE_ERROR,
-                        false, false, 0, 0, 0.0, 0.0, "RWBX");
+                        false, false, 0, 0, 0.0, 0.0, "RWBX", false);
 
     char v[256], s[256];
 
@@ -10572,6 +10585,206 @@ static void test_agent_footer_no_writable_paths(void) {
     AGENT_TEST_ASSERT(strstr(buf, "writable") == NULL);
     AGENT_TEST_ASSERT(strstr(buf, "/tmp") == NULL);
     ds4_agent_subagents_destroy(mgr);
+}
+
+/* 3.1: Badge tests for owner, non-owner, no-owner, focus-different-from-owner,
+ * and attention-overrides-owner cases. */
+static void test_agent_footer_ownership_badge(void) {
+    ds4_agent_subagent_status items[5];
+
+    /* Engine-owner, no attention → ▶ with magenta brackets (active & owner) */
+    test_badge_set_item(&items[0], 1, "main", true,
+                        DS4_AGENT_SUBAGENT_STATE_RUNNING,
+                        false, false, 0, 0, 0.0, 0.0, "RWBX", true);
+    /* Non-owner, no attention → ■ */
+    test_badge_set_item(&items[1], 2, "sub1", false,
+                        DS4_AGENT_SUBAGENT_STATE_RUNNING,
+                        false, false, 0, 0, 0.0, 0.0, "RW-X", false);
+    /* No owner (engine_owner=false, not active) → ■ */
+    test_badge_set_item(&items[2], 3, "sub2", false,
+                        DS4_AGENT_SUBAGENT_STATE_IDLE,
+                        false, false, 0, 0, 0.0, 0.0, "RWBX", false);
+    /* Focus differs from owner: active=true but not engine_owner → ■ with magenta brackets */
+    test_badge_set_item(&items[3], 4, "focused", true,
+                        DS4_AGENT_SUBAGENT_STATE_RUNNING,
+                        false, false, 0, 0, 0.0, 0.0, "RWBX", false);
+    /* Attention overrides owner: engine_owner=true but needs attention → ! */
+    test_badge_set_item(&items[4], 5, "attn_owner", false,
+                        DS4_AGENT_SUBAGENT_STATE_RUNNING,
+                        true, false, 0, 0, 0.0, 0.0, "RWBX", true);
+
+    char v[256], s[256];
+
+    /* Item 0: engine-owner → ▶ */
+    agent_format_badge(&items[0], v, sizeof(v), s, sizeof(s));
+    AGENT_TEST_ASSERT(strstr(v, "▶") != NULL);
+    AGENT_TEST_ASSERT(strstr(s, "\x1b[35m[") != NULL);  /* active → magenta brackets */
+
+    /* Item 1: non-owner → ■ */
+    agent_format_badge(&items[1], v, sizeof(v), s, sizeof(s));
+    AGENT_TEST_ASSERT(strstr(v, "■") != NULL);
+    AGENT_TEST_ASSERT(strstr(v, "▶") == NULL);
+    AGENT_TEST_ASSERT(strstr(v, "!") == NULL);
+
+    /* Item 2: no owner → ■ (no attention, no ownership) */
+    agent_format_badge(&items[2], v, sizeof(v), s, sizeof(s));
+    AGENT_TEST_ASSERT(strstr(v, "■") != NULL);
+
+    /* Item 3: focused but not owner → ■ with magenta brackets */
+    agent_format_badge(&items[3], v, sizeof(v), s, sizeof(s));
+    AGENT_TEST_ASSERT(strstr(v, "■") != NULL);
+    AGENT_TEST_ASSERT(strstr(s, "\x1b[35m[") != NULL);
+
+    /* Item 4: attention overrides owner → ! */
+    agent_format_badge(&items[4], v, sizeof(v), s, sizeof(s));
+    AGENT_TEST_ASSERT(strstr(v, "!") != NULL);
+    AGENT_TEST_ASSERT(strstr(v, "▶") == NULL);
+}
+
+/* 3.2: Manager-backed test proving one sampled owner id yields at most one
+ * engine_owner item and that owner id 0 yields none. */
+static void test_agent_footer_ownership_manager_sampling(void) {
+    ds4_agent_subagents *mgr = NULL;
+    AGENT_TEST_ASSERT(ds4_agent_subagents_create(&mgr, NULL, NULL) == 0);
+
+    ds4_agent_subagent_id ids[3];
+    const char *names[] = {"main", "alpha", "beta"};
+    for (int i = 0; i < 3; i++) {
+        ds4_agent_subagent_create_request req = {
+            .name = names[i],
+            .autonomy = i == 0 ? DS4_AGENT_SUBAGENT_AUTONOMY_TAB :
+                                 DS4_AGENT_SUBAGENT_AUTONOMY_BACKGROUND,
+        };
+        AGENT_TEST_ASSERT(ds4_agent_subagent_create(mgr, &req, &ids[i]) == 0);
+    }
+
+    size_t n = 0;
+    ds4_agent_subagent_status items[4];
+    AGENT_TEST_ASSERT(ds4_agent_subagent_list(mgr, items, 4, &n) == 0);
+    AGENT_TEST_ASSERT(n == 3);
+
+    /* With owner_id still 0, no item should be engine_owner */
+    int owner_count = 0;
+    for (size_t i = 0; i < n; i++) {
+        if (items[i].engine_owner) owner_count++;
+    }
+    AGENT_TEST_ASSERT(owner_count == 0);
+
+    /* Simulate setting engine_owner_id to alpha's id (ids[1].value) */
+    ds4_agent_subagents_set_engine_owner(mgr, ids[1].value);
+    AGENT_TEST_ASSERT(ds4_agent_subagent_list(mgr, items, 4, &n) == 0);
+    owner_count = 0;
+    for (size_t i = 0; i < n; i++) {
+        if (items[i].engine_owner) {
+            owner_count++;
+            AGENT_TEST_ASSERT(items[i].id.value == ids[1].value);
+        }
+    }
+    AGENT_TEST_ASSERT(owner_count == 1);
+
+    /* Reset to 0, verify no owner again */
+    ds4_agent_subagents_set_engine_owner(mgr, 0);
+    AGENT_TEST_ASSERT(ds4_agent_subagent_list(mgr, items, 4, &n) == 0);
+    owner_count = 0;
+    for (size_t i = 0; i < n; i++) {
+        if (items[i].engine_owner) owner_count++;
+    }
+    AGENT_TEST_ASSERT(owner_count == 0);
+
+    ds4_agent_subagents_destroy(mgr);
+}
+
+/* 3.3: Handoff test proving a later resident-list snapshot reflects the new
+ * owner without requiring every intermediate gate transition to render. */
+static void test_agent_footer_ownership_handoff(void) {
+    ds4_agent_subagents *mgr = NULL;
+    AGENT_TEST_ASSERT(ds4_agent_subagents_create(&mgr, NULL, NULL) == 0);
+
+    ds4_agent_subagent_id ids[2];
+    ds4_agent_subagent_create_request req_main = {
+        .name = "main",
+        .autonomy = DS4_AGENT_SUBAGENT_AUTONOMY_TAB,
+    };
+    AGENT_TEST_ASSERT(ds4_agent_subagent_create(mgr, &req_main, &ids[0]) == 0);
+    ds4_agent_subagent_create_request req_sub = {
+        .name = "sub1",
+        .autonomy = DS4_AGENT_SUBAGENT_AUTONOMY_BACKGROUND,
+    };
+    AGENT_TEST_ASSERT(ds4_agent_subagent_create(mgr, &req_sub, &ids[1]) == 0);
+
+    size_t n = 0;
+    ds4_agent_subagent_status items[3];
+
+    /* Snapshot 1: main is owner */
+    ds4_agent_subagents_set_engine_owner(mgr, ids[0].value);
+    AGENT_TEST_ASSERT(ds4_agent_subagent_list(mgr, items, 3, &n) == 0);
+    AGENT_TEST_ASSERT(n == 2);
+    AGENT_TEST_ASSERT(items[0].engine_owner);  /* main */
+    AGENT_TEST_ASSERT(!items[1].engine_owner); /* sub1 */
+
+    /* Snapshot 2: sub1 is owner (handoff occurred) */
+    ds4_agent_subagents_set_engine_owner(mgr, ids[1].value);
+    AGENT_TEST_ASSERT(ds4_agent_subagent_list(mgr, items, 3, &n) == 0);
+    AGENT_TEST_ASSERT(!items[0].engine_owner); /* main */
+    AGENT_TEST_ASSERT(items[1].engine_owner);  /* sub1 */
+
+    /* Snapshot 3: no owner (gate released) */
+    ds4_agent_subagents_set_engine_owner(mgr, 0);
+    AGENT_TEST_ASSERT(ds4_agent_subagent_list(mgr, items, 3, &n) == 0);
+    AGENT_TEST_ASSERT(!items[0].engine_owner);
+    AGENT_TEST_ASSERT(!items[1].engine_owner);
+
+    ds4_agent_subagents_destroy(mgr);
+}
+
+/* 3.4: Regression assertions that queued output still selects !, focus still
+ * controls brackets, and waiting sessions can retain generation metrics
+ * independently of ownership. */
+static void test_agent_footer_ownership_regression(void) {
+    ds4_agent_subagent_status items[4];
+
+    /* Queued output → ! even when engine_owner */
+    test_badge_set_item(&items[0], 1, "main", true,
+                        DS4_AGENT_SUBAGENT_STATE_RUNNING,
+                        false, true, 0, 0, 0.0, 0.0, "RWBX", true);
+    /* Focus controls brackets independently: active=true, not owner */
+    test_badge_set_item(&items[1], 2, "focused", true,
+                        DS4_AGENT_SUBAGENT_STATE_RUNNING,
+                        false, false, 0, 0, 0.0, 0.0, "RWBX", false);
+    /* Waiting session retains gen_tps independently of ownership */
+    test_badge_set_item(&items[2], 3, "waiting", false,
+                        DS4_AGENT_SUBAGENT_STATE_WAITING_MODEL,
+                        false, false, 0, 0, 0.0, 24.5, "RWBX", false);
+    /* Non-owner, no attention → ■ */
+    test_badge_set_item(&items[3], 4, "bg", false,
+                        DS4_AGENT_SUBAGENT_STATE_RUNNING,
+                        false, false, 0, 0, 0.0, 0.0, "RWBX", false);
+
+    char v[256], s[256];
+
+    /* Item 0: queued output overrides owner → ! with magenta brackets */
+    agent_format_badge(&items[0], v, sizeof(v), s, sizeof(s));
+    AGENT_TEST_ASSERT(strstr(v, "!") != NULL);
+    AGENT_TEST_ASSERT(strstr(v, "▶") == NULL);
+    AGENT_TEST_ASSERT(strstr(s, "\x1b[35m[") != NULL);
+
+    /* Item 1: focused non-owner → ■ with magenta brackets */
+    agent_format_badge(&items[1], v, sizeof(v), s, sizeof(s));
+    AGENT_TEST_ASSERT(strstr(v, "■") != NULL);
+    AGENT_TEST_ASSERT(strstr(v, "▶") == NULL);
+    AGENT_TEST_ASSERT(strstr(v, "!") == NULL);
+    AGENT_TEST_ASSERT(strstr(s, "\x1b[35m[") != NULL);
+
+    /* Item 2: waiting with gen_tps → gen field, no ownership influence */
+    agent_format_badge(&items[2], v, sizeof(v), s, sizeof(s));
+    AGENT_TEST_ASSERT(strstr(v, "gen") != NULL);
+    AGENT_TEST_ASSERT(strstr(v, "■") != NULL);  /* non-owner indicator */
+
+    /* Item 3: plain non-owner → ■ */
+    agent_format_badge(&items[3], v, sizeof(v), s, sizeof(s));
+    AGENT_TEST_ASSERT(strstr(v, "■") != NULL);
+    AGENT_TEST_ASSERT(strstr(v, "▶") == NULL);
+    AGENT_TEST_ASSERT(strstr(v, "!") == NULL);
 }
 
 static void test_agent_alt_tab_sequence_is_consumed(void) {
@@ -13389,48 +13602,10 @@ static void ds4_agent_unit_tests_run(void) {
     test_agent_footer_mutually_exclusive_activity();
     test_agent_footer_multi_agent_80col();
     test_agent_footer_no_writable_paths();
-    test_agent_alt_tab_sequence_is_consumed();
-    test_agent_docker_exec_rejects_invalid_input();
-    test_agent_docker_exec_no_capture();
-    test_agent_docker_exec_debug_stdout();
-    test_agent_docker_exec_zero_length_stdin();
-    test_agent_docker_exec_large_stdin_poll_loop();
-    test_agent_docker_capture_wrapper_rejects_null_cfg();
-    test_agent_docker_capture_wrapper_rejects_null_docker_command();
-    test_agent_docker_capture_wrapper_rejects_null_argv();
-    test_agent_docker_capture_wrapper_rejects_empty_argv();
-    test_agent_docker_shell_start_rejects_missing_container();
-    test_agent_docker_shell_start_rejects_unavailable_docker();
-    test_agent_startup_docker_prompt_skip_leaves_no_active_sandbox();
-    test_agent_startup_docker_noninteractive_autoloads_first_sandbox();
-    test_agent_startup_docker_prompt_selects_running_sandbox();
-    test_agent_startup_docker_prompt_starts_stopped_sandbox();
-    test_agent_startup_docker_activation_failure_leaves_no_sandbox();
-    test_agent_startup_docker_prompt_selects_two_digit_choice();
-    test_agent_startup_docker_prompt_rejects_partial_numeric_token();
-    test_agent_startup_docker_prompt_rejects_out_of_range_number();
-    test_agent_docker_shell_exec_rejects_inactive_shell();
-    test_agent_docker_shell_parses_output_and_exit_code();
-    test_agent_docker_shell_command_output_skips_blank_only();
-    test_agent_docker_shell_sentinel_tail_survives_split();
-    test_agent_docker_shell_sentinel_skips_invalid_candidates();
-    test_agent_docker_shell_argv_conversion();
-    test_agent_docker_shell_exec_argv_debug_publish();
-    test_agent_docker_shell_unbounded_output();
-    test_agent_docker_read_range_uses_shell_slice();
-    test_agent_docker_refresh_mounts_skips_unchanged_fingerprint();
-    test_agent_docker_effective_working_directory_prefers_primary_root();
-    test_agent_bash_publish_observation_command_output_on();
-    test_agent_bash_publish_observation_command_output_off();
-    test_agent_bash_publish_observation_skips_nonempty_body();
-    test_agent_docker_bash_publishes_command_output();
-    test_agent_docker_shell_debug_argv_includes_docker_exec();
-    test_agent_docker_shell_stop_is_idempotent();
-    test_agent_tool_list_with_fake_shell();
-    test_agent_tool_search_with_fake_shell();
-    test_agent_tool_list_fails_when_shell_inactive();
-    test_agent_tool_search_fails_when_shell_inactive();
-    test_agent_tool_list_shell_argv_quoting();
+    test_agent_footer_ownership_badge();
+    test_agent_footer_ownership_manager_sampling();
+    test_agent_footer_ownership_handoff();
+    test_agent_footer_ownership_regression();
     test_agent_subagent_api_lifecycle();
     test_agent_subagent_slash_command_recognition();
     test_agent_tool_policy_parse();
@@ -17239,7 +17414,8 @@ static void agent_format_badge(const ds4_agent_subagent_status *item,
     agent_format_ctx_size(item->ctx_used, used, sizeof(used));
     agent_format_ctx_size(item->ctx_size, total_ctx, sizeof(total_ctx));
 
-    /* Indicator: attention (!) overrides active (▶), else background (■) */
+    /* Indicator: attention (!) overrides engine-owner (▶), else non-owner (■).
+     * Focus brackets (magenta) are selected by item->active independently. */
     const char *indicator;
     const char *indicator_color;
     const char *bracket_color;
@@ -17250,14 +17426,14 @@ static void agent_format_badge(const ds4_agent_subagent_status *item,
         indicator = "!";
         indicator_color = "\x1b[33m";
         bracket_color = item->active ? "\x1b[35m" : "";
-    } else if (item->active) {
+    } else if (item->engine_owner) {
         indicator = "▶";  /* ▶ U+25B6 */
         indicator_color = "\x1b[32m";
-        bracket_color = "\x1b[35m";
+        bracket_color = item->active ? "\x1b[35m" : "";
     } else {
         indicator = "■";  /* U+25A0 */
         indicator_color = "\x1b[35m";
-        bracket_color = "";
+        bracket_color = item->active ? "\x1b[35m" : "";
     }
 
     /* Mutually exclusive fixed-width activity field.

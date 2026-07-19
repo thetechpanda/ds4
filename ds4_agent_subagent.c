@@ -44,6 +44,7 @@ struct ds4_agent_subagents {
     char last_error[DS4_AGENT_SUBAGENT_ERROR_MAX];
     int default_ctx_size;
     int default_round_budget;
+    volatile uint64_t engine_owner_id;
 };
 
 static const char *ds4_agent_subagent_autonomy_name(ds4_agent_subagent_autonomy mode) {
@@ -397,6 +398,7 @@ int ds4_agent_subagents_create_for_agent(ds4_agent_subagents **out,
     slot->has_worker = true;
     slot->worker.tool_policy = slot->tool_policy;
     slot->worker.model_gate = &mgr->model_gate;
+    slot->worker.engine_owner_ptr = &mgr->engine_owner_id;
     slot->worker.model_tool_round_budget = 0;
     mgr->active_id = slot->id.value;
     id = slot->id;
@@ -414,6 +416,12 @@ void ds4_agent_subagents_destroy(ds4_agent_subagents *mgr) {
     free(mgr->events);
     pthread_mutex_destroy(&mgr->model_gate);
     free(mgr);
+}
+
+void ds4_agent_subagents_set_engine_owner(ds4_agent_subagents *mgr,
+                                          uint64_t session_id) {
+    if (!mgr) return;
+    mgr->engine_owner_id = session_id;
 }
 
 static void ds4_agent_subagent_make_default_name(ds4_agent_subagents *mgr,
@@ -532,6 +540,7 @@ int ds4_agent_subagent_create(ds4_agent_subagents *mgr,
         }
         slot->has_worker = true;
         slot->worker.model_gate = &mgr->model_gate;
+        slot->worker.engine_owner_ptr = &mgr->engine_owner_id;
         slot->worker.model_tool_round_budget =
             slot->autonomy == DS4_AGENT_SUBAGENT_AUTONOMY_AUTONOMOUS ?
             slot->budget_limit : 0;
@@ -647,6 +656,9 @@ int ds4_agent_subagent_list(ds4_agent_subagents *mgr,
     if (!mgr) return -1;
     if (len) *len = mgr->len;
     size_t n = out && cap < mgr->len ? cap : mgr->len;
+    /* Sample engine owner id once before iterating slots so every badge
+     * in this snapshot derives ownership from the same observation. */
+    uint64_t owner_id = mgr->engine_owner_id;
     for (size_t i = 0; out && i < n; i++) {
         agent_session_slot *slot = &mgr->slots[i];
         agent_status st = {0};
@@ -679,6 +691,8 @@ int ds4_agent_subagent_list(ds4_agent_subagents *mgr,
         out[i].prefill_total  = st.prefill_total;
         out[i].prefill_tps    = st.prefill_tps;
         out[i].gen_tps        = st.gen_tps;
+        /* Engine ownership derived from one sampled owner id */
+        out[i].engine_owner = owner_id != 0 && slot->id.value == owner_id;
         /* Use current worker tool_permissions (updated by /allow, /disallow)
          * when the worker is active.  Without a worker, fall back to the
          * slot's creation-time tool_policy so a configured policy is still

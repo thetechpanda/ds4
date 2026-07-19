@@ -279,6 +279,7 @@ struct agent_worker {
     bool raw_mode_needs_restore;
     agent_docker_shell docker_shell;
     pthread_mutex_t *model_gate;
+    volatile uint64_t *engine_owner_ptr;
     int model_tool_round_budget;
     int model_tool_round_used;
     bool subagents_disabled;

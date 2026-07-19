@@ -83,6 +83,7 @@ typedef struct {
     int prefill_total;
     double prefill_tps;
     double gen_tps;
+    bool engine_owner;
 } ds4_agent_subagent_status;
 
 typedef struct {
@@ -96,13 +97,15 @@ int ds4_agent_subagents_create(ds4_agent_subagents **out,
                               ds4_engine *engine,
                               const ds4_agent_subagent_options *opt);
 void ds4_agent_subagents_destroy(ds4_agent_subagents *mgr);
+void ds4_agent_subagents_set_engine_owner(ds4_agent_subagents *mgr,
+                                          uint64_t session_id);
 
 int ds4_agent_subagent_create(ds4_agent_subagents *mgr,
                              const ds4_agent_subagent_create_request *req,
                              ds4_agent_subagent_id *out);
 int ds4_agent_subagent_send(ds4_agent_subagents *mgr,
-                           ds4_agent_subagent_id id,
-                           const char *prompt);
+                            ds4_agent_subagent_id id,
+                            const char *prompt);
 int ds4_agent_subagent_stop(ds4_agent_subagents *mgr, ds4_agent_subagent_id id);
 int ds4_agent_subagent_close(ds4_agent_subagents *mgr, ds4_agent_subagent_id id);
 int ds4_agent_subagent_switch(ds4_agent_subagents *mgr, ds4_agent_subagent_id id);
@@ -111,14 +114,14 @@ int ds4_agent_subagent_list(ds4_agent_subagents *mgr,
                            size_t cap,
                            size_t *len);
 int ds4_agent_subagent_poll_event(ds4_agent_subagents *mgr,
-                                 ds4_agent_subagent_event *out);
+                                  ds4_agent_subagent_event *out);
 int ds4_agent_subagent_report(ds4_agent_subagents *mgr,
-                             ds4_agent_subagent_id id,
-                             char *buf,
-                             size_t len);
+                              ds4_agent_subagent_id id,
+                              char *buf,
+                              size_t len);
 int ds4_agent_subagent_import_report(ds4_agent_subagents *mgr,
-                                    ds4_agent_subagent_id from,
-                                    ds4_agent_subagent_id into);
+                                     ds4_agent_subagent_id from,
+                                     ds4_agent_subagent_id into);
 const char *ds4_agent_subagents_last_error(const ds4_agent_subagents *mgr);
 
 #endif
