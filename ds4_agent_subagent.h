@@ -69,8 +69,6 @@ typedef struct {
     int ctx_used;
     int ctx_size;
     bool dirty;
-    bool queued_output;
-    size_t queued_output_bytes;
     bool approval_blocked;
     int budget_used;
     int budget_limit;

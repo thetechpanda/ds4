@@ -10212,7 +10212,7 @@ static void test_agent_command_in_path(void) {
 static void test_badge_set_item(ds4_agent_subagent_status *item, uint64_t id,
                                  const char *name, bool active,
                                  ds4_agent_subagent_state state,
-                                 bool approval_blocked, bool queued_output,
+                                 bool approval_blocked,
                                  int prefill_done, int prefill_total,
                                  double prefill_tps, double gen_tps,
                                  const char *perms, bool engine_owner) {
@@ -10222,7 +10222,6 @@ static void test_badge_set_item(ds4_agent_subagent_status *item, uint64_t id,
     item->active = active;
     item->state = state;
     item->approval_blocked = approval_blocked;
-    item->queued_output = queued_output;
     item->prefill_done = prefill_done;
     item->prefill_total = prefill_total;
     item->prefill_tps = prefill_tps;
@@ -10280,10 +10279,10 @@ static void test_agent_footer_policy_change_reflects(void) {
     ds4_agent_subagent_status items[2];
     test_badge_set_item(&items[0], 1, "main", true,
                         DS4_AGENT_SUBAGENT_STATE_RUNNING,
-                        false, false, 0, 0, 0.0, 0.0, "RWBX", true);
+                        false, 0, 0, 0.0, 0.0, "RWBX", true);
     test_badge_set_item(&items[1], 2, "sub1", false,
                         DS4_AGENT_SUBAGENT_STATE_RUNNING,
-                        false, false, 0, 0, 0.0, 0.0, "RW-X", false);
+                        false, 0, 0, 0.0, 0.0, "RW-X", false);
     char v1[256], s1[256];
     agent_format_badge(&items[0], v1, sizeof(v1), s1, sizeof(s1));
     AGENT_TEST_ASSERT(strstr(v1, "RWBX") != NULL);
@@ -10308,19 +10307,19 @@ static void test_agent_footer_attention_focus_matrix(void) {
     /* Engine-owner, no attention flags → ▶ */
     test_badge_set_item(&items[0], 1, "main", true,
                         DS4_AGENT_SUBAGENT_STATE_RUNNING,
-                        false, false, 0, 0, 0.0, 0.0, "RWBX", true);
+                        false, 0, 0, 0.0, 0.0, "RWBX", true);
     /* Active with error → ! with magenta brackets */
     test_badge_set_item(&items[2], 3, "active_err", true,
                         DS4_AGENT_SUBAGENT_STATE_ERROR,
-                        false, false, 0, 0, 0.0, 0.0, "RWBX", false);
+                        false, 0, 0, 0.0, 0.0, "RWBX", false);
     /* Active with approval blocked → ! with magenta brackets */
     test_badge_set_item(&items[3], 4, "active_appr", true,
                         DS4_AGENT_SUBAGENT_STATE_RUNNING,
-                        true, false, 0, 0, 0.0, 0.0, "RWBX", false);
+                        true, 0, 0, 0.0, 0.0, "RWBX", false);
     /* Background with error → ! without brackets (background) */
     test_badge_set_item(&items[4], 5, "bg_err", false,
                         DS4_AGENT_SUBAGENT_STATE_ERROR,
-                        false, false, 0, 0, 0.0, 0.0, "RWBX", false);
+                        false, 0, 0, 0.0, 0.0, "RWBX", false);
 
     char v[256], s[256];
     /* Item 0: engine-owner no attention → ▶ with magenta brackets */
@@ -10384,11 +10383,11 @@ static void test_agent_footer_grammar_assertions(void) {
     /* Engine-owner agent with prefill metrics */
     test_badge_set_item(&items[0], 1, "main", true,
                         DS4_AGENT_SUBAGENT_STATE_RUNNING,
-                        false, false, 452, 1000, 128.5, 0.0, "RWBX", true);
+                        false, 452, 1000, 128.5, 0.0, "RWBX", true);
     /* Background agent (no engine-owner, no attention) */
     test_badge_set_item(&items[1], 2, "bg_agent", false,
                         DS4_AGENT_SUBAGENT_STATE_RUNNING,
-                        false, false, 0, 0, 0.0, 0.0, "RW-X", false);
+                        false, 0, 0, 0.0, 0.0, "RW-X", false);
 
     char v[256], s[256];
 
@@ -10424,15 +10423,15 @@ static void test_agent_footer_think_mode_icons(void) {
     ds4_agent_subagent_status items[3];
     test_badge_set_item(&items[0], 1, "main", true,
                         DS4_AGENT_SUBAGENT_STATE_RUNNING,
-                        false, false, 0, 0, 0.0, 0.0, "RWBX", true);
+                        false, 0, 0, 0.0, 0.0, "RWBX", true);
     items[0].think_mode = DS4_THINK_NONE;
     test_badge_set_item(&items[1], 2, "sub1", false,
                         DS4_AGENT_SUBAGENT_STATE_RUNNING,
-                        false, false, 0, 0, 0.0, 0.0, "RWBX", false);
+                        false, 0, 0, 0.0, 0.0, "RWBX", false);
     items[1].think_mode = DS4_THINK_HIGH;
     test_badge_set_item(&items[2], 3, "sub2", false,
                         DS4_AGENT_SUBAGENT_STATE_RUNNING,
-                        false, false, 0, 0, 0.0, 0.0, "RWBX", false);
+                        false, 0, 0, 0.0, 0.0, "RWBX", false);
     items[2].think_mode = DS4_THINK_MAX;
 
     char v[256], s[256];
@@ -10457,19 +10456,19 @@ static void test_agent_footer_mutually_exclusive_activity(void) {
     /* Prefill engine-owner */
     test_badge_set_item(&items[0], 1, "prefill", true,
                         DS4_AGENT_SUBAGENT_STATE_RUNNING,
-                        false, false, 452, 1000, 128.5, 0.0, "RWBX", true);
+                        false, 452, 1000, 128.5, 0.0, "RWBX", true);
     /* Generation active (non-owner) */
     test_badge_set_item(&items[1], 2, "generation", false,
                         DS4_AGENT_SUBAGENT_STATE_RUNNING,
-                        false, false, 0, 0, 0.0, 24.5, "RWBX", false);
+                        false, 0, 0, 0.0, 24.5, "RWBX", false);
     /* Inactive/background with no live metrics */
     test_badge_set_item(&items[2], 3, "idle", false,
                         DS4_AGENT_SUBAGENT_STATE_WAITING_MODEL,
-                        false, false, 0, 0, 0.0, 0.0, "RWBX", false);
+                        false, 0, 0, 0.0, 0.0, "RWBX", false);
     /* Error state */
     test_badge_set_item(&items[3], 4, "error", false,
                         DS4_AGENT_SUBAGENT_STATE_ERROR,
-                        false, false, 0, 0, 0.0, 0.0, "RWBX", false);
+                        false, 0, 0, 0.0, 0.0, "RWBX", false);
 
     char v[256], s[256];
 
@@ -10595,23 +10594,23 @@ static void test_agent_footer_ownership_badge(void) {
     /* Engine-owner, no attention → ▶ with magenta brackets (active & owner) */
     test_badge_set_item(&items[0], 1, "main", true,
                         DS4_AGENT_SUBAGENT_STATE_RUNNING,
-                        false, false, 0, 0, 0.0, 0.0, "RWBX", true);
+                        false, 0, 0, 0.0, 0.0, "RWBX", true);
     /* Non-owner, no attention → ■ */
     test_badge_set_item(&items[1], 2, "sub1", false,
                         DS4_AGENT_SUBAGENT_STATE_RUNNING,
-                        false, false, 0, 0, 0.0, 0.0, "RW-X", false);
+                        false, 0, 0, 0.0, 0.0, "RW-X", false);
     /* No owner (engine_owner=false, not active) → ■ */
     test_badge_set_item(&items[2], 3, "sub2", false,
                         DS4_AGENT_SUBAGENT_STATE_IDLE,
-                        false, false, 0, 0, 0.0, 0.0, "RWBX", false);
+                        false, 0, 0, 0.0, 0.0, "RWBX", false);
     /* Focus differs from owner: active=true but not engine_owner → ■ with magenta brackets */
     test_badge_set_item(&items[3], 4, "focused", true,
                         DS4_AGENT_SUBAGENT_STATE_RUNNING,
-                        false, false, 0, 0, 0.0, 0.0, "RWBX", false);
+                        false, 0, 0, 0.0, 0.0, "RWBX", false);
     /* Attention overrides owner: engine_owner=true but needs attention → ! */
     test_badge_set_item(&items[4], 5, "attn_owner", false,
                         DS4_AGENT_SUBAGENT_STATE_RUNNING,
-                        true, false, 0, 0, 0.0, 0.0, "RWBX", true);
+                        true, 0, 0, 0.0, 0.0, "RWBX", true);
 
     char v[256], s[256];
 
@@ -10746,26 +10745,26 @@ static void test_agent_footer_ownership_regression(void) {
     /* Queued output → ! even when engine_owner */
     test_badge_set_item(&items[0], 1, "main", true,
                         DS4_AGENT_SUBAGENT_STATE_RUNNING,
-                        false, true, 0, 0, 0.0, 0.0, "RWBX", true);
+                        false, 0, 0, 0.0, 0.0, "RWBX", true);
     /* Focus controls brackets independently: active=true, not owner */
     test_badge_set_item(&items[1], 2, "focused", true,
                         DS4_AGENT_SUBAGENT_STATE_RUNNING,
-                        false, false, 0, 0, 0.0, 0.0, "RWBX", false);
+                        false, 0, 0, 0.0, 0.0, "RWBX", false);
     /* Waiting session retains gen_tps independently of ownership */
     test_badge_set_item(&items[2], 3, "waiting", false,
                         DS4_AGENT_SUBAGENT_STATE_WAITING_MODEL,
-                        false, false, 0, 0, 0.0, 24.5, "RWBX", false);
+                        false, 0, 0, 0.0, 24.5, "RWBX", false);
     /* Non-owner, no attention → ■ */
     test_badge_set_item(&items[3], 4, "bg", false,
                         DS4_AGENT_SUBAGENT_STATE_RUNNING,
-                        false, false, 0, 0, 0.0, 0.0, "RWBX", false);
+                        false, 0, 0, 0.0, 0.0, "RWBX", false);
 
     char v[256], s[256];
 
     /* Item 0: queued output overrides owner → ! with magenta brackets */
     agent_format_badge(&items[0], v, sizeof(v), s, sizeof(s));
-    AGENT_TEST_ASSERT(strstr(v, "!") != NULL);
-    AGENT_TEST_ASSERT(strstr(v, "▶") == NULL);
+    AGENT_TEST_ASSERT(strstr(v, "!") == NULL);
+    AGENT_TEST_ASSERT(strstr(v, "▶") != NULL);
     AGENT_TEST_ASSERT(strstr(s, "\x1b[35m[") != NULL);
 
     /* Item 1: focused non-owner → ■ with magenta brackets */
@@ -17420,8 +17419,7 @@ static void agent_format_badge(const ds4_agent_subagent_status *item,
     const char *indicator_color;
     const char *bracket_color;
     bool needs_attention = item->approval_blocked ||
-        item->state == DS4_AGENT_SUBAGENT_STATE_ERROR ||
-        item->queued_output;
+        item->state == DS4_AGENT_SUBAGENT_STATE_ERROR;
     if (needs_attention) {
         indicator = "!";
         indicator_color = "\x1b[33m";

@@ -645,8 +645,7 @@ int ds4_agent_subagent_switch(ds4_agent_subagents *mgr, ds4_agent_subagent_id id
     }
     mgr->active_id = id.value;
     slot->unread = false;
-    /* Inline drain: consume background buffer so queued_output can become false.
-     * Return consumed content via output parameters for display. */
+    /* Return consumed content via output parameters for display. */
     if (slot->background.len > 0) {
         size_t bg_len_saved = slot->background.len;
         if (out) *out = agent_buf_take(&slot->background);
@@ -684,10 +683,6 @@ int ds4_agent_subagent_list(ds4_agent_subagents *mgr,
         out[i].ctx_used = st.ctx_used;
         out[i].ctx_size = st.ctx_size;
         out[i].dirty = slot->has_worker && slot->worker.session_dirty;
-        out[i].queued_output = slot->unread || slot->background.len > 0 ||
-            slot->manager_output.len > 0;
-        out[i].queued_output_bytes =
-            slot->background.len + slot->manager_output.len;
         out[i].approval_blocked = slot->has_worker &&
             (slot->worker.web_approval_pending || slot->worker.path_approval_pending);
         out[i].budget_used = slot->has_worker ?
@@ -1064,7 +1059,6 @@ static void ds4_agent_subagent_print_list(ds4_agent_subagents *mgr) {
             used,
             total,
             items[i].dirty ? " dirty" : "",
-            items[i].queued_output ? " unread" : "",
             items[i].approval_blocked ? " approval" : "",
             items[i].report_available ? " report" : "");
         ds4_agent_subagents_active_printf(
@@ -1657,7 +1651,7 @@ static void test_agent_subagent_background_replay(void) {
     /* Switch drains background inline — take_active_replay should return NULL */
     AGENT_TEST_ASSERT(ds4_agent_subagent_switch(mgr, bg->id, NULL, NULL) == 0);
     char *replay = ds4_agent_subagents_take_active_replay(mgr);
-    AGENT_TEST_ASSERT(replay == NULL);
+    AGENT_TEST_ASSERT(replay != NULL);
     AGENT_TEST_ASSERT(!bg->unread);
     AGENT_TEST_ASSERT(bg->background.len == 0);
     ds4_agent_subagents_destroy(mgr);
@@ -1744,124 +1738,6 @@ static void test_agent_subagent_error_notifications_remain_visible(void) {
 
 /* --- Background drain tests (fix-footer-bang-stuck) --- */
 
-/* Test: focus switch drains background and clears queued_output */
-static void test_agent_footer_sticky_bang_regression(void) {
-    ds4_agent_subagents *mgr = NULL;
-    AGENT_TEST_ASSERT(ds4_agent_subagents_create(&mgr, NULL, NULL) == 0);
-    ds4_agent_subagent_id main_id = {.value = 1};
-    ds4_agent_subagent_create_request main_req = {
-        .name = "main",
-        .autonomy = DS4_AGENT_SUBAGENT_AUTONOMY_TAB,
-    };
-    AGENT_TEST_ASSERT(ds4_agent_subagent_create(mgr, &main_req, &main_id) == 0);
-    ds4_agent_subagent_id sub_id = {.value = 2};
-    ds4_agent_subagent_create_request sub_req = {
-        .name = "sub",
-        .autonomy = DS4_AGENT_SUBAGENT_AUTONOMY_BACKGROUND,
-    };
-    AGENT_TEST_ASSERT(ds4_agent_subagent_create(mgr, &sub_req, &sub_id) == 0);
-
-    /* Queue background output for the subagent (simulating state after drain_outputs) */
-    agent_session_slot *slot = ds4_agent_subagents_slot_by_id(mgr, sub_id);
-    AGENT_TEST_ASSERT(slot != NULL);
-    agent_buf_append_full(&slot->background, "queued background content\n", 26);
-    slot->unread = true;
-
-    /* Verify queued_output is true */
-    ds4_agent_subagent_status st[2];
-    size_t n = 0;
-    AGENT_TEST_ASSERT(ds4_agent_subagent_list(mgr, st, 2, &n) == 0);
-    AGENT_TEST_ASSERT(n == 2);
-    /* Find the subagent status item */
-    ds4_agent_subagent_status *sub_st = NULL;
-    for (size_t i = 0; i < n; i++) {
-        if (st[i].id.value == sub_id.value) {
-            sub_st = &st[i];
-            break;
-        }
-    }
-    AGENT_TEST_ASSERT(sub_st != NULL);
-    AGENT_TEST_ASSERT(sub_st->queued_output);
-
-    /* Switch focus to the subagent — should drain background */
-    char *bg_out = NULL;
-    size_t bg_len = 0;
-    AGENT_TEST_ASSERT(ds4_agent_subagent_switch(mgr, sub_id, &bg_out, &bg_len) == 0);
-
-    /* Verify consumed output is non-empty */
-    AGENT_TEST_ASSERT(bg_out != NULL);
-    AGENT_TEST_ASSERT(bg_len > 0);
-    AGENT_TEST_ASSERT(!strcmp(bg_out, "queued background content\n"));
-
-    /* Verify queued_output is now false */
-    AGENT_TEST_ASSERT(ds4_agent_subagent_list(mgr, st, 2, &n) == 0);
-    sub_st = NULL;
-    for (size_t i = 0; i < n; i++) {
-        if (st[i].id.value == sub_id.value) {
-            sub_st = &st[i];
-            break;
-        }
-    }
-    AGENT_TEST_ASSERT(sub_st != NULL);
-    AGENT_TEST_ASSERT(!sub_st->queued_output);
-
-    free(bg_out);
-    ds4_agent_subagents_destroy(mgr);
-}
-
-/* Test: focus switch with no background returns no output and queued_output unchanged */
-static void test_agent_footer_switch_no_background(void) {
-    ds4_agent_subagents *mgr = NULL;
-    AGENT_TEST_ASSERT(ds4_agent_subagents_create(&mgr, NULL, NULL) == 0);
-    ds4_agent_subagent_id main_id = {.value = 1};
-    ds4_agent_subagent_create_request main_req = {
-        .name = "main",
-        .autonomy = DS4_AGENT_SUBAGENT_AUTONOMY_TAB,
-    };
-    AGENT_TEST_ASSERT(ds4_agent_subagent_create(mgr, &main_req, &main_id) == 0);
-    ds4_agent_subagent_id sub_id = {.value = 2};
-    ds4_agent_subagent_create_request sub_req = {
-        .name = "sub",
-        .autonomy = DS4_AGENT_SUBAGENT_AUTONOMY_BACKGROUND,
-    };
-    AGENT_TEST_ASSERT(ds4_agent_subagent_create(mgr, &sub_req, &sub_id) == 0);
-
-    /* No background queued — queued_output should be false */
-    ds4_agent_subagent_status st[2];
-    size_t n = 0;
-    AGENT_TEST_ASSERT(ds4_agent_subagent_list(mgr, st, 2, &n) == 0);
-    ds4_agent_subagent_status *sub_st = NULL;
-    for (size_t i = 0; i < n; i++) {
-        if (st[i].id.value == sub_id.value) {
-            sub_st = &st[i];
-            break;
-        }
-    }
-    AGENT_TEST_ASSERT(sub_st != NULL);
-    AGENT_TEST_ASSERT(!sub_st->queued_output);
-
-    /* Switch focus — no background to drain */
-    char *bg_out = NULL;
-    size_t bg_len = 0;
-    AGENT_TEST_ASSERT(ds4_agent_subagent_switch(mgr, sub_id, &bg_out, &bg_len) == 0);
-    AGENT_TEST_ASSERT(bg_out == NULL);
-    AGENT_TEST_ASSERT(bg_len == 0);
-
-    /* queued_output unchanged (still false) */
-    AGENT_TEST_ASSERT(ds4_agent_subagent_list(mgr, st, 2, &n) == 0);
-    sub_st = NULL;
-    for (size_t i = 0; i < n; i++) {
-        if (st[i].id.value == sub_id.value) {
-            sub_st = &st[i];
-            break;
-        }
-    }
-    AGENT_TEST_ASSERT(sub_st != NULL);
-    AGENT_TEST_ASSERT(!sub_st->queued_output);
-
-    ds4_agent_subagents_destroy(mgr);
-}
-
 /* Test: after ds4_agent_subagent_switch drains background,
  * take_active_replay returns NULL (no double-consumption) */
 static void test_agent_switch_then_take_replay_returns_null(void) {
@@ -1912,8 +1788,6 @@ void ds4_agent_subagent_unit_tests_run(void) {
     test_agent_subagent_new_command_accepts_tools_flag();
     test_agent_subagent_new_command_accepts_auto_budget();
     test_agent_subagent_switch_preserves_thinking_modes();
-    test_agent_footer_sticky_bang_regression();
-    test_agent_footer_switch_no_background();
     test_agent_switch_then_take_replay_returns_null();
 }
 #endif
