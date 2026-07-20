@@ -7909,65 +7909,48 @@ static char *agent_read_range(agent_worker *w, const char *path, int start_line,
     size_t len = 0;
     const char *display_path = path;
     if (!path || !path[0]) return xstrdup("Tool error: read requires path\n");
-    char *file_path = NULL;
+    char *file_path = agent_resolve_tool_path(w, path, AGENT_PATH_EXISTING,
+                                                err, sizeof(err));
+    if (!file_path) {
+        agent_buf b = {0};
+        agent_buf_puts(&b, "Tool error: ");
+        agent_buf_puts(&b, err);
+        agent_buf_puts(&b, "\n");
+        return agent_buf_take(&b);
+    }
     agent_buf stderr_out = {0};
-    if (agent_tool_use_docker_filesystem(w) && !whole_file) {
-        file_path = agent_resolve_tool_path(w, path, AGENT_PATH_EXISTING,
-                                            err, sizeof(err));
-        if (!file_path) {
-            agent_buf b = {0};
-            agent_buf_puts(&b, "Tool error: ");
-            agent_buf_puts(&b, err);
-            agent_buf_puts(&b, "\n");
-            return agent_buf_take(&b);
-        }
-        char *result = agent_docker_read_range(w, file_path, start_line,
-                                               max_lines, bare, set_more,
-                                               &stderr_out);
-        if (result && strncmp(result, "Tool error:", 11) != 0)
-            agent_temp_files_note_read(w, file_path);
-        free(file_path);
-        if (stderr_out.ptr && result && strncmp(result, "Tool error:", 11) != 0) {
-            agent_buf b = {0};
-            agent_buf_puts(&b, result);
-            free(result);
-            agent_tool_append_stderr_warning(&b, &stderr_out);
-            free(stderr_out.ptr);
-            return agent_buf_take(&b);
-        }
-        free(stderr_out.ptr);
-        return result;
-    } else if (agent_tool_use_docker_filesystem(w)) {
-        file_path = agent_resolve_tool_path(w, path, AGENT_PATH_EXISTING,
-                                            err, sizeof(err));
-        if (!file_path) {
-            agent_buf b = {0};
-            agent_buf_puts(&b, "Tool error: ");
-            agent_buf_puts(&b, err);
-            agent_buf_puts(&b, "\n");
-            return agent_buf_take(&b);
-        }
-        display_path = file_path;
-        if (!agent_docker_read_file_bytes(w, file_path, &data, &len, err,
-                                          sizeof(err), &stderr_out)) {
-            agent_buf b = {0};
-            agent_buf_puts(&b, "Tool error: ");
-            agent_buf_puts(&b, err);
-            agent_buf_puts(&b, "\n");
+    if (agent_tool_use_docker_filesystem(w)) {
+        if (!whole_file) {
+            char *result = agent_docker_read_range(w, file_path, start_line,
+                                                max_lines, bare, set_more,
+                                                &stderr_out);
+            if (result && strncmp(result, "Tool error:", 11) != 0)
+                agent_temp_files_note_read(w, file_path);
             free(file_path);
-            return agent_buf_take(&b);
+            if (stderr_out.ptr && result && strncmp(result, "Tool error:", 11) != 0) {
+                agent_buf b = {0};
+                agent_buf_puts(&b, result);
+                free(result);
+                agent_tool_append_stderr_warning(&b, &stderr_out);
+                free(stderr_out.ptr);
+                return agent_buf_take(&b);
+            }
+            free(stderr_out.ptr);
+            return result;
+        } else  {
+            display_path = file_path;
+            if (!agent_docker_read_file_bytes(w, file_path, &data, &len, err,
+                                            sizeof(err), &stderr_out)) {
+                agent_buf b = {0};
+                agent_buf_puts(&b, "Tool error: ");
+                agent_buf_puts(&b, err);
+                agent_buf_puts(&b, "\n");
+                free(file_path);
+                return agent_buf_take(&b);
+            }
+            agent_temp_files_note_read(w, file_path);
         }
-        agent_temp_files_note_read(w, file_path);
     } else {
-        file_path = agent_resolve_tool_path(w, path, AGENT_PATH_EXISTING,
-                                            err, sizeof(err));
-        if (!file_path) {
-            agent_buf b = {0};
-            agent_buf_puts(&b, "Tool error: ");
-            agent_buf_puts(&b, err);
-            agent_buf_puts(&b, "\n");
-            return agent_buf_take(&b);
-        }
         display_path = file_path;
         if (agent_read_file_bytes(file_path, &data, &len, err, sizeof(err)) != 0) {
             agent_buf b = {0};
