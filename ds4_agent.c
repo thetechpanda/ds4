@@ -17022,12 +17022,14 @@ static void worker_update_status_workspace_locked(agent_worker *w) {
 }
 
 /* What: copy the currently selected Docker container name into the status
- * snapshot while the worker mutex is held.
+ * snapshot while the worker mutex is held.  When Docker is not available the
+ * container field is cleared so the footer never shows a stale sandbox name.
  * Why: the footer needs an immutable status copy so UI redraws do not read
  * mutable config while commands switch sandboxes.
  * Callers: worker_consume(), worker_get_status(), and worker_is_initialized(). */
 static void worker_update_status_docker_locked(agent_worker *w) {
-    const char *name = (w && w->cfg && w->cfg->docker_container) ?
+    bool avail = w && w->cfg && w->cfg->docker_available;
+    const char *name = avail && w->cfg && w->cfg->docker_container ?
         w->cfg->docker_container : "";
     snprintf(w->status.docker_container,
              sizeof(w->status.docker_container), "%s", name);
@@ -21544,6 +21546,7 @@ int main(int argc, char **argv) {
     char docker_version[128] = {0};
     const char *docker_command = cfg.docker_command ? cfg.docker_command : "docker";
     cfg.docker_available = false;
+    cfg.strict_sandbox = false;
     bool color = isatty(STDOUT_FILENO) != 0;
 
     if ((agent_command_in_path(docker_command) || 
@@ -21551,17 +21554,21 @@ int main(int argc, char **argv) {
         agent_read_docker_version(docker_command, docker_version,
                                   sizeof(docker_version))) {
         cfg.docker_available = true;
+        cfg.strict_sandbox = true;
         fprintf(stdout, "ds4-agent: sandboxing via docker is available ");
         if (color) fprintf(stdout, "\x1b[38;5;81m");
         fprintf(stdout, "(docker %s)", docker_version);
         if (color) fprintf(stdout, "\x1b[0m");
         fputc('\n', stdout);
     } else {
-        fprintf(stdout, "ds4-agent: docker sandbox feature is not available");
+        if (color) fprintf(stdout, "\x1b[31m");
+        fprintf(stdout, "ds4-agent: strict sandbox disabled\n");
+        fprintf(stdout, "ds4-agent: docker sandbox feature is not available\n");
         if (cfg.docker_command && !agent_executable_exists(cfg.docker_command))
             fprintf(stdout, " (%s is not executable)", cfg.docker_command);
         else
             fprintf(stdout, " (%s unavailable)", docker_command);
+        if (color) fprintf(stdout, "\x1b[0m");
         fputc('\n', stdout);
     }
     if (cfg.chdir_path && chdir(cfg.chdir_path) != 0) {
