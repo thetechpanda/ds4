@@ -108,7 +108,8 @@ int ds4_agent_subagent_send(ds4_agent_subagents *mgr,
                             const char *prompt);
 int ds4_agent_subagent_stop(ds4_agent_subagents *mgr, ds4_agent_subagent_id id);
 int ds4_agent_subagent_close(ds4_agent_subagents *mgr, ds4_agent_subagent_id id);
-int ds4_agent_subagent_switch(ds4_agent_subagents *mgr, ds4_agent_subagent_id id);
+int ds4_agent_subagent_switch(ds4_agent_subagents *mgr, ds4_agent_subagent_id id,
+                             char **out, size_t *out_len);
 int ds4_agent_subagent_list(ds4_agent_subagents *mgr,
                            ds4_agent_subagent_status *out,
                            size_t cap,

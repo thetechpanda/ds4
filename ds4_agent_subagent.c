@@ -636,7 +636,8 @@ int ds4_agent_subagent_close(ds4_agent_subagents *mgr, ds4_agent_subagent_id id)
     return 0;
 }
 
-int ds4_agent_subagent_switch(ds4_agent_subagents *mgr, ds4_agent_subagent_id id) {
+int ds4_agent_subagent_switch(ds4_agent_subagents *mgr, ds4_agent_subagent_id id,
+                             char **out, size_t *out_len) {
     agent_session_slot *slot = ds4_agent_subagents_slot_by_id(mgr, id);
     if (!slot) {
         ds4_agent_subagents_set_error(mgr, "unknown subagent id");
@@ -644,6 +645,17 @@ int ds4_agent_subagent_switch(ds4_agent_subagents *mgr, ds4_agent_subagent_id id
     }
     mgr->active_id = id.value;
     slot->unread = false;
+    /* Inline drain: consume background buffer so queued_output can become false.
+     * Return consumed content via output parameters for display. */
+    if (slot->background.len > 0) {
+        size_t bg_len_saved = slot->background.len;
+        if (out) *out = agent_buf_take(&slot->background);
+        if (out_len) *out_len = bg_len_saved;
+        /* agent_buf_take zeroes the struct, so background.len is already 0. */
+    } else {
+        if (out) *out = NULL;
+        if (out_len) *out_len = 0;
+    }
     ds4_agent_subagents_push_event(mgr, DS4_AGENT_SUBAGENT_EVENT_STATUS,
                                   slot, "switched active session");
     return 0;
@@ -1246,13 +1258,25 @@ bool ds4_agent_subagents_handle_command(ds4_agent_subagents *mgr,
             ds4_agent_subagents_active_printf(
                 mgr, "subagent switch failed: unknown session %s\n",
                 which ? which : "");
-        } else if (ds4_agent_subagent_switch(mgr, slot->id) != 0) {
-            ds4_agent_subagents_active_printf(
-                mgr, "subagent switch failed: %s\n",
-                ds4_agent_subagents_last_error(mgr));
         } else {
-            ds4_agent_subagent_slot_printf(slot, "switched to subagent %s\n",
-                                          slot->name);
+            char *bg_out = NULL;
+            size_t bg_len = 0;
+            int rc = ds4_agent_subagent_switch(mgr, slot->id, &bg_out, &bg_len);
+            if (rc != 0) {
+                ds4_agent_subagents_active_printf(
+                    mgr, "subagent switch failed: %s\n",
+                    ds4_agent_subagents_last_error(mgr));
+                free(bg_out);
+            } else {
+                ds4_agent_subagent_slot_printf(slot, "switched to subagent %s\n",
+                                              slot->name);
+                /* Append consumed background to manager_output so the next
+                 * drain_outputs cycle flushes it to the interactive display. */
+                if (bg_out && bg_len) {
+                    agent_buf_append_full(&slot->manager_output, bg_out, bg_len);
+                    free(bg_out);
+                }
+            }
         }
         return true;
     }
@@ -1556,7 +1580,7 @@ static void test_agent_subagent_switch_preserves_thinking_modes(void) {
     beta->cfg.gen.think_mode = DS4_THINK_NONE;
     beta->worker.status.think_mode = DS4_THINK_NONE;
 
-    AGENT_TEST_ASSERT(ds4_agent_subagent_switch(mgr, beta->id) == 0);
+    AGENT_TEST_ASSERT(ds4_agent_subagent_switch(mgr, beta->id, NULL, NULL) == 0);
 
     ds4_agent_subagent_status st[2];
     size_t n = 0;
@@ -1623,19 +1647,19 @@ static void test_agent_subagent_background_replay(void) {
     agent_status st = {0};
     char *notes = NULL;
     ds4_agent_subagents_drain_outputs(mgr, &active_out, &active_out_len,
-                                     &st, &notes);
+                                      &st, &notes);
     AGENT_TEST_ASSERT(active_out == NULL || active_out_len == 0);
     AGENT_TEST_ASSERT(notes == NULL || notes[0] == '\0');
     AGENT_TEST_ASSERT(bg->unread);
     free(active_out);
     free(notes);
 
-    AGENT_TEST_ASSERT(ds4_agent_subagent_switch(mgr, bg->id) == 0);
+    /* Switch drains background inline — take_active_replay should return NULL */
+    AGENT_TEST_ASSERT(ds4_agent_subagent_switch(mgr, bg->id, NULL, NULL) == 0);
     char *replay = ds4_agent_subagents_take_active_replay(mgr);
-    AGENT_TEST_ASSERT(replay != NULL);
-    AGENT_TEST_ASSERT(!strcmp(replay, "background chunk\n"));
+    AGENT_TEST_ASSERT(replay == NULL);
     AGENT_TEST_ASSERT(!bg->unread);
-    free(replay);
+    AGENT_TEST_ASSERT(bg->background.len == 0);
     ds4_agent_subagents_destroy(mgr);
 }
 
@@ -1718,6 +1742,165 @@ static void test_agent_subagent_error_notifications_remain_visible(void) {
     ds4_agent_subagents_destroy(mgr);
 }
 
+/* --- Background drain tests (fix-footer-bang-stuck) --- */
+
+/* Test: focus switch drains background and clears queued_output */
+static void test_agent_footer_sticky_bang_regression(void) {
+    ds4_agent_subagents *mgr = NULL;
+    AGENT_TEST_ASSERT(ds4_agent_subagents_create(&mgr, NULL, NULL) == 0);
+    ds4_agent_subagent_id main_id = {.value = 1};
+    ds4_agent_subagent_create_request main_req = {
+        .name = "main",
+        .autonomy = DS4_AGENT_SUBAGENT_AUTONOMY_TAB,
+    };
+    AGENT_TEST_ASSERT(ds4_agent_subagent_create(mgr, &main_req, &main_id) == 0);
+    ds4_agent_subagent_id sub_id = {.value = 2};
+    ds4_agent_subagent_create_request sub_req = {
+        .name = "sub",
+        .autonomy = DS4_AGENT_SUBAGENT_AUTONOMY_BACKGROUND,
+    };
+    AGENT_TEST_ASSERT(ds4_agent_subagent_create(mgr, &sub_req, &sub_id) == 0);
+
+    /* Queue background output for the subagent (simulating state after drain_outputs) */
+    agent_session_slot *slot = ds4_agent_subagents_slot_by_id(mgr, sub_id);
+    AGENT_TEST_ASSERT(slot != NULL);
+    agent_buf_append_full(&slot->background, "queued background content\n", 26);
+    slot->unread = true;
+
+    /* Verify queued_output is true */
+    ds4_agent_subagent_status st[2];
+    size_t n = 0;
+    AGENT_TEST_ASSERT(ds4_agent_subagent_list(mgr, st, 2, &n) == 0);
+    AGENT_TEST_ASSERT(n == 2);
+    /* Find the subagent status item */
+    ds4_agent_subagent_status *sub_st = NULL;
+    for (size_t i = 0; i < n; i++) {
+        if (st[i].id.value == sub_id.value) {
+            sub_st = &st[i];
+            break;
+        }
+    }
+    AGENT_TEST_ASSERT(sub_st != NULL);
+    AGENT_TEST_ASSERT(sub_st->queued_output);
+
+    /* Switch focus to the subagent — should drain background */
+    char *bg_out = NULL;
+    size_t bg_len = 0;
+    AGENT_TEST_ASSERT(ds4_agent_subagent_switch(mgr, sub_id, &bg_out, &bg_len) == 0);
+
+    /* Verify consumed output is non-empty */
+    AGENT_TEST_ASSERT(bg_out != NULL);
+    AGENT_TEST_ASSERT(bg_len > 0);
+    AGENT_TEST_ASSERT(!strcmp(bg_out, "queued background content\n"));
+
+    /* Verify queued_output is now false */
+    AGENT_TEST_ASSERT(ds4_agent_subagent_list(mgr, st, 2, &n) == 0);
+    sub_st = NULL;
+    for (size_t i = 0; i < n; i++) {
+        if (st[i].id.value == sub_id.value) {
+            sub_st = &st[i];
+            break;
+        }
+    }
+    AGENT_TEST_ASSERT(sub_st != NULL);
+    AGENT_TEST_ASSERT(!sub_st->queued_output);
+
+    free(bg_out);
+    ds4_agent_subagents_destroy(mgr);
+}
+
+/* Test: focus switch with no background returns no output and queued_output unchanged */
+static void test_agent_footer_switch_no_background(void) {
+    ds4_agent_subagents *mgr = NULL;
+    AGENT_TEST_ASSERT(ds4_agent_subagents_create(&mgr, NULL, NULL) == 0);
+    ds4_agent_subagent_id main_id = {.value = 1};
+    ds4_agent_subagent_create_request main_req = {
+        .name = "main",
+        .autonomy = DS4_AGENT_SUBAGENT_AUTONOMY_TAB,
+    };
+    AGENT_TEST_ASSERT(ds4_agent_subagent_create(mgr, &main_req, &main_id) == 0);
+    ds4_agent_subagent_id sub_id = {.value = 2};
+    ds4_agent_subagent_create_request sub_req = {
+        .name = "sub",
+        .autonomy = DS4_AGENT_SUBAGENT_AUTONOMY_BACKGROUND,
+    };
+    AGENT_TEST_ASSERT(ds4_agent_subagent_create(mgr, &sub_req, &sub_id) == 0);
+
+    /* No background queued — queued_output should be false */
+    ds4_agent_subagent_status st[2];
+    size_t n = 0;
+    AGENT_TEST_ASSERT(ds4_agent_subagent_list(mgr, st, 2, &n) == 0);
+    ds4_agent_subagent_status *sub_st = NULL;
+    for (size_t i = 0; i < n; i++) {
+        if (st[i].id.value == sub_id.value) {
+            sub_st = &st[i];
+            break;
+        }
+    }
+    AGENT_TEST_ASSERT(sub_st != NULL);
+    AGENT_TEST_ASSERT(!sub_st->queued_output);
+
+    /* Switch focus — no background to drain */
+    char *bg_out = NULL;
+    size_t bg_len = 0;
+    AGENT_TEST_ASSERT(ds4_agent_subagent_switch(mgr, sub_id, &bg_out, &bg_len) == 0);
+    AGENT_TEST_ASSERT(bg_out == NULL);
+    AGENT_TEST_ASSERT(bg_len == 0);
+
+    /* queued_output unchanged (still false) */
+    AGENT_TEST_ASSERT(ds4_agent_subagent_list(mgr, st, 2, &n) == 0);
+    sub_st = NULL;
+    for (size_t i = 0; i < n; i++) {
+        if (st[i].id.value == sub_id.value) {
+            sub_st = &st[i];
+            break;
+        }
+    }
+    AGENT_TEST_ASSERT(sub_st != NULL);
+    AGENT_TEST_ASSERT(!sub_st->queued_output);
+
+    ds4_agent_subagents_destroy(mgr);
+}
+
+/* Test: after ds4_agent_subagent_switch drains background,
+ * take_active_replay returns NULL (no double-consumption) */
+static void test_agent_switch_then_take_replay_returns_null(void) {
+    ds4_agent_subagents *mgr = NULL;
+    AGENT_TEST_ASSERT(ds4_agent_subagents_create(&mgr, NULL, NULL) == 0);
+    ds4_agent_subagent_id main_id = {.value = 1};
+    ds4_agent_subagent_create_request main_req = {
+        .name = "main",
+        .autonomy = DS4_AGENT_SUBAGENT_AUTONOMY_TAB,
+    };
+    AGENT_TEST_ASSERT(ds4_agent_subagent_create(mgr, &main_req, &main_id) == 0);
+    ds4_agent_subagent_id sub_id = {.value = 2};
+    ds4_agent_subagent_create_request sub_req = {
+        .name = "sub",
+        .autonomy = DS4_AGENT_SUBAGENT_AUTONOMY_BACKGROUND,
+    };
+    AGENT_TEST_ASSERT(ds4_agent_subagent_create(mgr, &sub_req, &sub_id) == 0);
+
+    /* Queue background for subagent */
+    agent_session_slot *slot = ds4_agent_subagents_slot_by_id(mgr, sub_id);
+    AGENT_TEST_ASSERT(slot != NULL);
+    agent_buf_append_full(&slot->background, "some output\n", 12);
+    slot->unread = true;
+
+    /* Switch to subagent — drains background */
+    char *bg_out = NULL;
+    size_t bg_len = 0;
+    AGENT_TEST_ASSERT(ds4_agent_subagent_switch(mgr, sub_id, &bg_out, &bg_len) == 0);
+    AGENT_TEST_ASSERT(bg_out != NULL);
+    AGENT_TEST_ASSERT(bg_len > 0);
+    free(bg_out);
+
+    /* Now take_active_replay should return NULL (background already consumed) */
+    char *replay = ds4_agent_subagents_take_active_replay(mgr);
+    AGENT_TEST_ASSERT(replay == NULL);
+
+    ds4_agent_subagents_destroy(mgr);
+}
+
 void ds4_agent_subagent_unit_tests_run(void) {
     test_agent_subagent_slot_isolation();
     test_agent_subagent_background_replay();
@@ -1729,5 +1912,8 @@ void ds4_agent_subagent_unit_tests_run(void) {
     test_agent_subagent_new_command_accepts_tools_flag();
     test_agent_subagent_new_command_accepts_auto_budget();
     test_agent_subagent_switch_preserves_thinking_modes();
+    test_agent_footer_sticky_bang_regression();
+    test_agent_footer_switch_no_background();
+    test_agent_switch_then_take_replay_returns_null();
 }
 #endif

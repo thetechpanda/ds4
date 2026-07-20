@@ -10261,7 +10261,7 @@ static void test_agent_footer_main_subagents_stable_order(void) {
     AGENT_TEST_ASSERT(strstr(buf, "2:sub1") != NULL);
 
     /* After switching focus, both badges remain and order is stable */
-    ds4_agent_subagent_switch(mgr, sub_id);
+    ds4_agent_subagent_switch(mgr, sub_id, NULL, NULL);
     char buf2[4096];
     build_footer_text(&st, mgr, NULL, 200, buf2, sizeof(buf2));
     AGENT_TEST_ASSERT(strstr(buf2, "1:main") != NULL);
@@ -10535,7 +10535,7 @@ static void test_agent_footer_multi_agent_80col(void) {
     }
 
     /* Switch focus to beta (id=3) */
-    ds4_agent_subagent_switch(mgr, ids[2]);  /* beta is index 2, id=3 */
+    ds4_agent_subagent_switch(mgr, ids[2], NULL, NULL);  /* beta is index 2, id=3 */
     char buf2[8192];
     build_footer_text(&st, mgr, NULL, 80, buf2, sizeof(buf2));
 
@@ -12177,7 +12177,7 @@ static void test_agent_subagent_api_lifecycle(void) {
     AGENT_TEST_ASSERT(st[0].think_mode == DS4_THINK_MAX);
     AGENT_TEST_ASSERT(st[1].think_mode == DS4_THINK_MAX);
 
-    AGENT_TEST_ASSERT(ds4_agent_subagent_switch(mgr, beta) == 0);
+    AGENT_TEST_ASSERT(ds4_agent_subagent_switch(mgr, beta, NULL, NULL) == 0);
     AGENT_TEST_ASSERT(ds4_agent_subagent_send(mgr, beta, "queued prompt") == 0);
     AGENT_TEST_ASSERT(ds4_agent_subagent_stop(mgr, alpha) == 0);
 
