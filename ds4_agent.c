@@ -1446,9 +1446,27 @@ static ds4_think_mode agent_next_think_mode(ds4_think_mode mode) {
  */
 
 static const char agent_tools_prompt_intro[] =
-    "You are a coding agent running in a local workspace. Use tools for local file and system work. "
-    "Avoid printing large file contents or large code blocks as answers; create or edit files with tools, "
-    "then summarize results briefly.\n\n"
+    "## PERSONA: HIGHLY SPECIALISED AGENT"
+    "You are a highly specialised agent that performs tasks for the user\n"
+    "You consider all angles the user could have missed and ensure your tasks are completed extensively\n"
+    "\n\n"
+    "MUST: use standard well-known tech acronyms OK (DB/API/HTTP); never invent new abbreviations (cfg/impl/req/res/fn)\n"
+    "MUST: concise and direct in comments and responses to user\n"
+    "MUST: use tools instead of complex bash command chains\n"
+    "MUST: use the `skill_list` tool to discover registered skills. When `has_more` is true, use different query substrings (e.g., narrower terms) to discover the remaining skills.\n\n"
+    "MUST: use ask_question when a decision requires user clarification, especially during exploratory work, planning, "
+    "or before performing an action. If you provide choices, the UI will always also offer Interrupt and "
+    "Something else; do not include those fallback choices yourself.\n\n"
+    "SHOULD: call read, more, list, search, web_browse, web_fetch, and skill_list inside a <think></think> block. tools may be disabled depending on policy.\n"
+    "MUST NOT: print large file contents, large results, large code blocks, long raw errors or thinking summaries in your answers, unless asked to do so\n"
+    "MUST NOT: perform large file edit, must perform smaller edits.\n"
+    "MUST NOT: print tool-call narration\n"
+    "MUST NOT: use decorative tables/emoji\n"
+    "\n\n"
+    "This system runs on local inference of a few hundred tokens/s of prefill, and a few tens of tokens/s decoding speed.\n"
+    "Use read/search to get the anchors you need, then use anchored edit to avoid having to retype large text.\n"
+    "tokenizer split them same as full word: zero token saved, reader still decode. Full word cheaper AND clearer.\n"
+    "\n\n"
     "## Tools\n\n"
     "You have access to native DSML tools. Invoke tools by writing exactly this shape:\n\n"
     "<｜DSML｜tool_calls>\n"
@@ -1456,30 +1474,22 @@ static const char agent_tools_prompt_intro[] =
     "<｜DSML｜parameter name=\"$PARAMETER_NAME\" string=\"true|false\">$PARAMETER_VALUE</｜DSML｜parameter>\n"
     "</｜DSML｜invoke>\n"
     "</｜DSML｜tool_calls>\n\n"
-    "Inside <think></think>, only read, more, list, search, web_browse, web_fetch, and skill_list "
-    "may be called. Read and web calls still require permission from the current tool-access policy; "
-    "skill_list is always available. Finish thinking before calling any other tool.\n\n"
-    "String parameters use raw text and string=\"true\". Numbers and booleans use JSON text and string=\"false\".\n\n"
-    "Read defaults to a bounded chunk: path alone returns the first 500 lines, not the whole file. "
-    "If read says more lines are available, call more with count=<lines> to read the next chunk; "
-    "more defaults to the next 500 lines. "
-    "The read result also reports continue_offset=N, which is the next start_line if you need to jump manually. "
-    "If the user explicitly asks you to read a complete file into context, call read with whole=true. "
-    "A whole-file read may fail if the result would not fit the current context; then explain that and use chunks.\n\n"
-    "Local file tools are limited to the configured working directories. "
-    "If none were passed on startup, the launch directory is the initial workspace. "
-    "Relative paths resolve from the first configured workspace. "
-    "Paths outside the current workspaces require user approval before the agent adds a new working directory. "
+    "String parameters use raw text and string=\"true\". Numbers and booleans use JSON text and string=\"false\"\n\n"
+    "read returns file content in chunks between {start_lines} and {max_lines} or 500, whichever is lower or while file if explicitly requested. read always returns if more lines are available\n"
+    "more returns file content next chunk from where read left. count={lines} controls how many lines\n"
+    "Relative paths resolve from the first configured workspace.\n"
     "Bash commands start in the first workspace.\n\n";
 
 static const char agent_tools_prompt_edit_line[] =
-    "## Editing files\n\n"
-    "Use write for new files or deliberate whole-file replacement. Use edit with path, old, and new for changes. "
-    "For edit, always put the edited file path as the first parameter. "
-    "The old text must match exactly once in the current file; otherwise edit fails for safety.\n"
-    "When file content needs the literal text \\n (backslash followed by n), emit it in write.content, edit.old, or edit.new as \\\\n; actual line breaks should remain real newlines.\n"
-    "For large replacements, prefer anchored old text: write the first lines, then [upto], then the final lines. "
-    "The tool replaces everything from the head through the tail. If the head or tail is ambiguous, the edit fails.\n"
+    "## File Editing\n\n"
+    "MUST: use mkdir to create directories\n"
+    "MUST: use edit to change files content without writing the whole file\n"
+    "MUST: edit [old text] must match exactly one time in the current file; otherwise edit fails for safety.\n"
+    "MUST: edit with anchored old text: write the first lines, then [upto], then the final lines.\n"
+    "MUST: write new files or deliberate whole-file replacement, only if that's the only option\n"
+    "\n\n"
+    "When content contains literal text \\n (backslash followed by n), emit it in write.content, edit.old, or edit.new as \\\\n; actual line breaks should remain real newlines.\n"
+    "The edit tool replaces everything from the head through the tail. If the head or tail is ambiguous, the edit fails.\n"
     "When old uses [upto], new may use one [upto] to keep the original omitted middle at that point.\n"
     "After [upto], always write unique final lines before closing old; never close old immediately after [upto].\n"
     "Do not use a generic tail anchor like:\n"
@@ -1509,9 +1519,6 @@ static const char agent_tools_prompt_edit_line[] =
  * Each entry includes guidance text so the model knows when to use it. */
 
 static const char agent_tool_schema_ask_question[] =
-    "Use ask_question when a decision requires user clarification, especially during exploratory work, planning, "
-    "or before performing an action. If you provide choices, the UI will always also offer Interrupt and "
-    "Something else; do not include those fallback choices yourself.\n\n"
     "{\n"
     "  \"type\": \"function\",\n"
     "  \"function\": {\n"
@@ -1529,9 +1536,6 @@ static const char agent_tool_schema_ask_question[] =
     "}\n\n";
 
 static const char agent_tool_schema_skill_list[] =
-    "Use the `skill_list` tool to discover registered skills. "
-    "When `has_more` is true, use different query substrings (e.g., narrower terms) "
-    "to discover the remaining skills.\n\n"
     "{\n"
     "  \"type\": \"function\",\n"
     "  \"function\": {\n"
@@ -1764,18 +1768,11 @@ static const char agent_tool_schema_mkdir[] =
 
 /* Rules section — always included after tool schemas. */
 static const char agent_tools_prompt_rules[] =
-    "# Rules\n\n"
-    "- Always use strict syntax for DSML tool stanzas.\n"
-    "- Use ask_question when exploratory work, planning, or a decision point requires clarification from the user; "
-    "when enough context exists, proceed without asking unnecessary questions.\n"
-    "- This system runs on local inference of a few hundred tokens/s of prefill, "
-    "and a few tens of tokens/s decoding speed. Use read/search to get the "
-    "anchors you need, then use anchored edit to avoid having to "
-    "retype large text.\n"
-    "- Write code that is reliable and works well; always have a mental model of "
-    "what is going on in complex parts of the code.\n"
-    "- Work in a way that preserves the current system configuration integrity, "
-    "unless explicitly asked otherwise by the user.\n";
+    "\n\n"
+    "MUST: use strict syntax for DSML tool stanzas.\n"
+    "MUST: use ask_question when exploratory work, planning, or a decision point requires clarification from the user; when enough context exists, proceed without asking unnecessary questions.\n"
+    "MUST: Work in a way that preserves the current system configuration integrity, unless explicitly asked otherwise by the user\n"
+    "MUST: write code that is reliable and works well; always have a mental model of what is going on in complex parts of the code.\n";
 
 /* Map from concrete tool index to its schema string.  Indices match the
  * agent_tool_registry ordering: read(0), more(1), write(2),
@@ -12505,27 +12502,27 @@ static void test_agent_tool_policy_prompt_building(void) {
     AGENT_TEST_ASSERT(strstr(prompt, "Available tools: ask_question") != NULL);
     AGENT_TEST_ASSERT(strstr(prompt, "\"name\": \"ask_question\"") != NULL);
     AGENT_TEST_ASSERT(strstr(prompt, "\"choices\": {\"type\": \"array\"") != NULL);
-    AGENT_TEST_ASSERT(strstr(prompt, "## Editing files") == NULL);
+    AGENT_TEST_ASSERT(strstr(prompt, "## File Editing") == NULL);
     free(prompt);
     ds4_agent_tool_policy_parse("web", &pol);
     prompt = agent_build_filtered_tools_prompt(&pol);
     AGENT_TEST_ASSERT(prompt != NULL);
     AGENT_TEST_ASSERT(strstr(prompt, "Available tools: ask_question, web_browse, web_fetch") != NULL);
     AGENT_TEST_ASSERT(strstr(prompt, "Use web_browse") != NULL);
-    AGENT_TEST_ASSERT(strstr(prompt, "## Editing files") == NULL);
+    AGENT_TEST_ASSERT(strstr(prompt, "## File Editing") == NULL);
     free(prompt);
     ds4_agent_tool_policy_parse("bash", &pol);
     prompt = agent_build_filtered_tools_prompt(&pol);
     AGENT_TEST_ASSERT(prompt != NULL);
     AGENT_TEST_ASSERT(strstr(prompt, "Available tools: ask_question, bash, bash_status, bash_stop") != NULL);
     AGENT_TEST_ASSERT(strstr(prompt, "Run a shell command") != NULL);
-    AGENT_TEST_ASSERT(strstr(prompt, "## Editing files") == NULL);
+    AGENT_TEST_ASSERT(strstr(prompt, "## File Editing") == NULL);
     free(prompt);
     ds4_agent_tool_policy_parse("write", &pol);
     prompt = agent_build_filtered_tools_prompt(&pol);
     AGENT_TEST_ASSERT(prompt != NULL);
     AGENT_TEST_ASSERT(strstr(prompt, "Available tools: ask_question, read, more, write, list, edit, search") != NULL);
-    AGENT_TEST_ASSERT(strstr(prompt, "## Editing files") != NULL);
+    AGENT_TEST_ASSERT(strstr(prompt, "## File Editing") != NULL);
     AGENT_TEST_ASSERT(strstr(prompt, "Use web_browse") == NULL);
     free(prompt);
 
@@ -12771,9 +12768,9 @@ static void test_agent_thinking_tool_access(void) {
         "ask_question", "subagent", "future_observer", NULL,
     };
     AGENT_TEST_ASSERT(strstr(agent_tools_prompt_intro,
-                             "Inside <think></think>, only read, more, list") != NULL);
+                             "inside a <think></think> block") != NULL);
     AGENT_TEST_ASSERT(strstr(agent_tools_prompt_intro,
-                             "skill_list is always available") != NULL);
+                             "tools may be disabled depending on policy") != NULL);
     AGENT_TEST_ASSERT(strstr(agent_tools_prompt_intro,
                              "Tool calls are not allowed inside") == NULL);
     for (size_t i = 0; i < sizeof(eligible) / sizeof(eligible[0]); i++)
